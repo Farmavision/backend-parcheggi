@@ -1,0 +1,43 @@
+name: Compila APK Android ParkAdvisor
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Scarica il codice sorgente
+        uses: actions/checkout@v4
+
+      - name: Configura Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configura Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Scarica le dipendenze Flutter
+        run: |
+          cd parkadvisor_app
+          flutter pub get
+
+      - name: Compila il file APK
+        run: |
+          cd parkadvisor_app
+          flutter build apk --release
+
+      - name: Rendi disponibile il file APK scaricabile
+        uses: actions/upload-artifact@v4
+        with:
+          name: parkadvisor-release-apk
+          path: parkadvisor_app/build/app/outputs/flutter-apk/app-release.apk
