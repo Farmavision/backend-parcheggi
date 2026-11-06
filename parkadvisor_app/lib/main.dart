@@ -1,3 +1,4 @@
+cat << 'EOF' > /workspaces/backend-parcheggi/parkadvisor_app/lib/main.dart
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -223,3 +224,4 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
+EOF
