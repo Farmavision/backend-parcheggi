@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const ParkAdvisorApp());
@@ -31,10 +33,20 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  static const String _backendBaseUrl = 'https://bug-free-space-couscous-7vgr7pjj9grqcpw4p-3000.app.github.dev';
+
   String _gpsStatus = 'In attesa di rilevamento...';
   String _bleStatus = 'Pronto per la scansione';
+  String _apiStatus = 'Nessuna richiesta effettuata';
+  
   bool _isLoadingGps = false;
   bool _isScanningBle = false;
+  bool _isLoadingApi = false;
+
+  double? _currentLat;
+  double? _currentLon;
+
+  List<dynamic> _nearbySpots = [];
   List<ScanResult> _scanResults = [];
 
   Future<void> _getCurrentLocation() async {
@@ -47,7 +59,7 @@ class _HomeScreenState extends State<HomeScreen> {
       bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
         setState(() {
-          _gpsStatus = 'I servizi di localizzazione GPS sono disattivati.';
+          _gpsStatus = 'I servizi GPS sono disattivati.';
           _isLoadingGps = false;
         });
         return;
@@ -67,7 +79,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (permission == LocationPermission.deniedForever) {
         setState(() {
-          _gpsStatus = 'Permessi negati permanentemente. Abilitali dalle impostazioni.';
+          _gpsStatus = 'Permessi negati permanentemente.';
           _isLoadingGps = false;
         });
         return;
@@ -78,9 +90,14 @@ class _HomeScreenState extends State<HomeScreen> {
       );
 
       setState(() {
+        _currentLat = position.latitude;
+        _currentLon = position.longitude;
         _gpsStatus = 'Lat: ${position.latitude.toStringAsFixed(5)}, Lon: ${position.longitude.toStringAsFixed(5)}';
         _isLoadingGps = false;
       });
+
+      // Interroga automaticamente il server dopo aver rilevato la posizione
+      await _fetchNearbyParkings(position.latitude, position.longitude);
     } catch (e) {
       setState(() {
         _gpsStatus = 'Errore GPS: $e';
@@ -89,10 +106,42 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _fetchNearbyParkings(double lat, double lon) async {
+    setState(() {
+      _isLoadingApi = true;
+      _apiStatus = 'Interrogazione backend in corso...';
+      _nearbySpots.clear();
+    });
+
+    try {
+      final url = Uri.parse('$_backendBaseUrl/api/parking/nearby?lat=$lat&lon=$lon');
+      final response = await http.get(url).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        setState(() {
+          _nearbySpots = data['spots'] ?? [];
+          _apiStatus = 'Trovati ${_nearbySpots.length} stalli disponibili';
+          _isLoadingApi = false;
+        });
+      } else {
+        setState(() {
+          _apiStatus = 'Errore server: codice HTTP ${response.statusCode}';
+          _isLoadingApi = false;
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _apiStatus = 'Connessione fallita: $e';
+        _isLoadingApi = false;
+      });
+    }
+  }
+
   Future<void> _scanBleDevices() async {
     setState(() {
       _isScanningBle = true;
-      _bleStatus = 'Scansione sensori nelle vicinanze...';
+      _bleStatus = 'Scansione sensori in corso...';
       _scanResults.clear();
     });
 
@@ -105,6 +154,11 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
+      // Richiede all'utente di abilitare il Bluetooth se spento
+      if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+        await FlutterBluePlus.turnOn();
+      }
+
       var subscription = FlutterBluePlus.onScanResults.listen((results) {
         setState(() {
           _scanResults = results;
@@ -115,7 +169,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await FlutterBluePlus.isScanning.where((val) => val == false).first;
 
       setState(() {
-        _bleStatus = 'Scansione completata (${_scanResults.length} dispositivi trovati)';
+        _bleStatus = 'Scansione terminata (${_scanResults.length} dispositivi)';
         _isScanningBle = false;
       });
 
@@ -141,6 +195,7 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // Scheda GPS
             Card(
               elevation: 3,
               child: Padding(
@@ -163,13 +218,60 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: _isLoadingGps
                           ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                           : const Icon(Icons.my_location),
-                      label: const Text('Rileva la mia posizione'),
+                      label: const Text('Rileva posizione e cerca parcheggi'),
                     ),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 16),
+
+            // Scheda Parcheggi Disponibili da Backend
+            Card(
+              elevation: 3,
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: const [
+                        Icon(Icons.local_parking, color: Colors.green),
+                        SizedBox(width: 8),
+                        Text('Stalli Liberi (Backend)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Text(_apiStatus, style: const TextStyle(fontSize: 15)),
+                    if (_isLoadingApi)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8.0),
+                        child: LinearProgressIndicator(),
+                      ),
+                    if (_nearbySpots.isNotEmpty) ...[
+                      const Divider(height: 24),
+                      ListView.builder(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        itemCount: _nearbySpots.length,
+                        itemBuilder: (context, index) {
+                          final spot = _nearbySpots[index];
+                          return ListTile(
+                            dense: true,
+                            leading: const Icon(Icons.check_circle, color: Colors.green),
+                            title: Text(spot['name'] ?? 'Stallo sconosciuto', style: const TextStyle(fontWeight: FontWeight.bold)),
+                            subtitle: Text('ID: ${spot['id']} - Sensore: ${spot['sensorBleId']}'),
+                          );
+                        },
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Scheda Sensori BLE
             Card(
               elevation: 3,
               child: Padding(
