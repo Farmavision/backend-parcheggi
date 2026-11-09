@@ -43,9 +43,6 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isScanningBle = false;
   bool _isLoadingApi = false;
 
-  double? _currentLat;
-  double? _currentLon;
-
   List<dynamic> _nearbySpots = [];
   List<ScanResult> _scanResults = [];
 
@@ -90,13 +87,10 @@ class _HomeScreenState extends State<HomeScreen> {
       );
 
       setState(() {
-        _currentLat = position.latitude;
-        _currentLon = position.longitude;
         _gpsStatus = 'Lat: ${position.latitude.toStringAsFixed(5)}, Lon: ${position.longitude.toStringAsFixed(5)}';
         _isLoadingGps = false;
       });
 
-      // Interroga automaticamente il server dopo aver rilevato la posizione
       await _fetchNearbyParkings(position.latitude, position.longitude);
     } catch (e) {
       setState(() {
@@ -115,7 +109,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       final url = Uri.parse('$_backendBaseUrl/api/parking/nearby?lat=$lat&lon=$lon');
-      final response = await http.get(url).timeout(const Duration(seconds: 10));
+      final response = await http.get(
+        url,
+        headers: {
+          'Accept': 'application/json',
+          'X-Github-Token': '',
+          'bypass-tunnel-reminder': 'true',
+        },
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -126,7 +127,7 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       } else {
         setState(() {
-          _apiStatus = 'Errore server: codice HTTP ${response.statusCode}';
+          _apiStatus = 'Errore server (HTTP ${response.statusCode})';
           _isLoadingApi = false;
         });
       }
@@ -154,7 +155,6 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      // Richiede all'utente di abilitare il Bluetooth se spento
       if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
         await FlutterBluePlus.turnOn();
       }
@@ -195,7 +195,6 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Scheda GPS
             Card(
               elevation: 3,
               child: Padding(
@@ -225,8 +224,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 16),
-
-            // Scheda Parcheggi Disponibili da Backend
             Card(
               elevation: 3,
               child: Padding(
@@ -270,8 +267,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 16),
-
-            // Scheda Sensori BLE
             Card(
               elevation: 3,
               child: Padding(
