@@ -166,7 +166,7 @@ class SensorFusionEngine extends ChangeNotifier {
     }
   }
 
-  Future<List>> getPairedClassicBluetoothDevices() async {
+  Future<List<dynamic>> getPairedClassicBluetoothDevices() async {
     try {
       final List<dynamic>? res = await _classicBtChannel.invokeMethod('getBondedDevices');
       if (res == null) return [];
