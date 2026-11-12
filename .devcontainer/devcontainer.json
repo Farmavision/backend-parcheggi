@@ -1,0 +1,9 @@
+{
+  "name": "ParkAdvisor Environment",
+  "portsAttributes": {
+    "3000": {
+      "label": "ParkAdvisor Backend",
+      "visibility": "public"
+    }
+  }
+}
