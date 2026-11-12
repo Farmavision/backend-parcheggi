@@ -12,11 +12,11 @@ import 'package:network_info_plus/network_info_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 
 enum VehicleState {
-  stayAtHome,   // Connesso al Wi-Fi Casa o Lavoro: GPS ad alta frequenza sospeso, nessuna pubblicazione stallo
+  stayAtHome,   // Connesso al Wi-Fi Casa o Lavoro
   driving,      // Velocità > 12 km/h o connesso al BT dell'auto
-  stopping,     // Velocità ~ 0 (possibile semaforo o sosta)
-  parked,       // Velocità 0 + BT auto disconnesso (fuori Wi-Fi Casa/Lavoro) O giroscopio + passi
-  leavingSoon,  // Utente in cammino entro 100m dall'auto parcheggiata
+  stopping,     // Velocità ~ 0
+  parked,       // Sosta confermata su strada pubblica
+  leavingSoon,  // Utente in cammino entro 100m dall'auto
 }
 
 class SensorFusionEngine extends ChangeNotifier {
@@ -33,12 +33,17 @@ class SensorFusionEngine extends ChangeNotifier {
   double? parkedLon;
   double? distanceFromCarMeters;
 
-  // Profilo connettività account utente (BT Auto + Wi-Fi Casa/Lavoro)
+  // Profilo connettività account utente
   String? targetCarBluetoothMac;
   String? targetCarBluetoothName;
   String? homeWifiSsid;
   String? workWifiSsid;
   String? currentConnectedWifiSsid;
+
+  List<String> _ignoredWifis = [];
+  List<String> _ignoredBtMacs = [];
+  String? _lastPromptedWifi;
+  String? _lastPromptedBtMac;
 
   // Telemetria sensori in tempo reale
   double currentSpeedKmh = 0.0;
@@ -48,10 +53,12 @@ class SensorFusionEngine extends ChangeNotifier {
   int? _initialStepCount;
   bool isCarBtConnected = false;
 
-  // Callback verso il backend
+  // Callback verso UI e backend
   final Future<void> Function(double lat, double lon, String method) onCarParked;
   final Future<void> Function(int estimatedMinutes) onApproachingCar100m;
   final Future<void> Function() onCarReleased;
+  final void Function(String ssid)? onUnknownWifiDetected;
+  final void Function(String mac, String name)? onUnknownBluetoothDetected;
 
   StreamSubscription<Position>? _posSub;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
@@ -67,6 +74,8 @@ class SensorFusionEngine extends ChangeNotifier {
     required this.onCarParked,
     required this.onApproachingCar100m,
     required this.onCarReleased,
+    this.onUnknownWifiDetected,
+    this.onUnknownBluetoothDetected,
   });
 
   bool get isOnKnownPrivateWifi {
@@ -90,13 +99,15 @@ class SensorFusionEngine extends ChangeNotifier {
     targetCarBluetoothName = prefs.getString('car_bt_name');
     homeWifiSsid = prefs.getString('home_wifi_ssid');
     workWifiSsid = prefs.getString('work_wifi_ssid');
+    _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
+    _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
 
     if (parkedLat != null && parkedLon != null) {
       currentState = VehicleState.parked;
     }
 
     _setupClassicBluetoothListener();
-    await _checkCurrentWifi();
+    await _checkCurrentWifi(promptIfUnknown: true);
     _startWifiMonitor();
     _startGpsStream();
     _startGyroscopeStream();
@@ -105,34 +116,54 @@ class SensorFusionEngine extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Salvataggio dispositivi sul profilo locale (pronto per sync API)
   Future<void> setCarBluetoothDevice(String mac, String name) async {
     targetCarBluetoothMac = mac.toUpperCase();
     targetCarBluetoothName = name;
+    isCarBtConnected = true;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('car_bt_mac', targetCarBluetoothMac!);
     await prefs.setString('car_bt_name', name);
+
+    if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
+      await _triggerCarReleased();
+    } else {
+      currentState = VehicleState.driving;
+    }
     notifyListeners();
   }
 
-  Future<void> saveCurrentWifiAsHome() async {
-    await _checkCurrentWifi();
-    if (currentConnectedWifiSsid == null) return;
-    homeWifiSsid = currentConnectedWifiSsid!.replaceAll('"', '').trim();
+  Future<void> ignoreBluetoothDevice(String mac) async {
+    final upper = mac.toUpperCase();
+    if (!_ignoredBtMacs.contains(upper)) {
+      _ignoredBtMacs.add(upper);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList('ignored_bt_macs', _ignoredBtMacs);
+    }
+  }
+
+  Future<void> saveWifiAsHome(String ssid) async {
+    homeWifiSsid = ssid.replaceAll('"', '').trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('home_wifi_ssid', homeWifiSsid!);
     _evaluateWifiStateTransition();
     notifyListeners();
   }
 
-  Future<void> saveCurrentWifiAsWork() async {
-    await _checkCurrentWifi();
-    if (currentConnectedWifiSsid == null) return;
-    workWifiSsid = currentConnectedWifiSsid!.replaceAll('"', '').trim();
+  Future<void> saveWifiAsWork(String ssid) async {
+    workWifiSsid = ssid.replaceAll('"', '').trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('work_wifi_ssid', workWifiSsid!);
     _evaluateWifiStateTransition();
     notifyListeners();
+  }
+
+  Future<void> ignoreWifi(String ssid) async {
+    final clean = ssid.replaceAll('"', '').trim();
+    if (!_ignoredWifis.contains(clean)) {
+      _ignoredWifis.add(clean);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList('ignored_wifis', _ignoredWifis);
+    }
   }
 
   Future<List>> getPairedClassicBluetoothDevices() async {
@@ -145,48 +176,76 @@ class SensorFusionEngine extends ChangeNotifier {
     }
   }
 
-  // Listener eventi Bluetooth Classico (A2DP / HFP vivavoce auto)
   void _setupClassicBluetoothListener() {
     _classicBtChannel.setMethodCallHandler((call) async {
-      final String mac = (call.arguments as String? ?? '').toUpperCase();
-      if (targetCarBluetoothMac == null || mac != targetCarBluetoothMac) return;
+      final Map<dynamic, dynamic> data = (call.arguments as Map?) ?? {};
+      final String mac = (data['mac'] as String? ?? '').toUpperCase();
+      final String name = data['name'] as String? ?? 'Dispositivo Bluetooth';
+      if (mac.isEmpty) return;
 
       if (call.method == 'onBtConnected') {
-        isCarBtConnected = true;
-        // Transizione immediata STAY_AT_HOME / PARKED -> DRIVING
-        if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
-          await _triggerCarReleased();
-        } else {
-          currentState = VehicleState.driving;
-          notifyListeners();
+        // Se non abbiamo ancora associato un'auto e il dispositivo non è tra gli ignorati, chiedi conferma
+        if (targetCarBluetoothMac == null &&
+            !_ignoredBtMacs.contains(mac) &&
+            _lastPromptedBtMac != mac) {
+          _lastPromptedBtMac = mac;
+          onUnknownBluetoothDetected?.call(mac, name);
+          return;
+        }
+
+        if (targetCarBluetoothMac != null && mac == targetCarBluetoothMac) {
+          isCarBtConnected = true;
+          if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
+            await _triggerCarReleased();
+          } else {
+            currentState = VehicleState.driving;
+            notifyListeners();
+          }
         }
       } else if (call.method == 'onBtDisconnected') {
-        isCarBtConnected = false;
-        await _checkCurrentWifi();
-        // Se non siamo agganciati al Wi-Fi di Casa/Lavoro, conferma subito la sosta pubblica
-        if (!isOnKnownPrivateWifi && currentSpeedKmh < 5.0) {
-          final pos = await Geolocator.getCurrentPosition();
-          await _confirmParked(pos.latitude, pos.longitude, 'CLASSIC_BT_DISCONNECT');
+        if (targetCarBluetoothMac != null && mac == targetCarBluetoothMac) {
+          isCarBtConnected = false;
+          await _checkCurrentWifi(promptIfUnknown: false);
+          if (!isOnKnownPrivateWifi && currentSpeedKmh < 5.0) {
+            final pos = await Geolocator.getCurrentPosition();
+            await _confirmParked(pos.latitude, pos.longitude, 'CLASSIC_BT_DISCONNECT');
+          }
+          notifyListeners();
         }
-        notifyListeners();
       }
     });
   }
 
-  // Monitoraggio Wi-Fi Casa / Lavoro
   void _startWifiMonitor() {
     _connectivitySub = Connectivity().onConnectivityChanged.listen((_) async {
-      await _checkCurrentWifi();
+      await _checkCurrentWifi(promptIfUnknown: true);
       _evaluateWifiStateTransition();
       notifyListeners();
     });
   }
 
-  Future<void> _checkCurrentWifi() async {
+  Future<void> _checkCurrentWifi({required bool promptIfUnknown}) async {
     try {
       final info = NetworkInfo();
-      final ssid = await info.getWifiName();
-      currentConnectedWifiSsid = ssid?.replaceAll('"', '').trim();
+      final rawSsid = await info.getWifiName();
+      final clean = rawSsid?.replaceAll('"', '').trim();
+
+      if (clean == null || clean.isEmpty || clean == '<unknown ssid>') {
+        currentConnectedWifiSsid = null;
+        return;
+      }
+
+      currentConnectedWifiSsid = clean;
+
+      // Se è una nuova rete Wi-Fi non ancora classificata né ignorata, chiedi all'utente
+      if (promptIfUnknown &&
+          clean != homeWifiSsid &&
+          clean != workWifiSsid &&
+          !_ignoredWifis.contains(clean) &&
+          _lastPromptedWifi != clean) {
+        _lastPromptedWifi = clean;
+        onUnknownWifiDetected?.call(clean);
+      }
     } catch (_) {
       currentConnectedWifiSsid = null;
     }
@@ -194,17 +253,14 @@ class SensorFusionEngine extends ChangeNotifier {
 
   void _evaluateWifiStateTransition() {
     if (isOnKnownPrivateWifi && !isCarBtConnected) {
-      // Arrivato a Casa o al Lavoro: sospende stato guida e non pubblica stalli privati
       if (currentState != VehicleState.parked) {
         currentState = VehicleState.stayAtHome;
       }
     } else if (!isOnKnownPrivateWifi && currentState == VehicleState.stayAtHome) {
-      // Uscito dal Wi-Fi Casa/Lavoro: riattiva rilevamento guida
       currentState = VehicleState.driving;
     }
   }
 
-  // 1. Stream GPS continuo
   void _startGpsStream() {
     const locationSettings = LocationSettings(
       accuracy: LocationAccuracy.bestForNavigation,
@@ -216,7 +272,6 @@ class SensorFusionEngine extends ChangeNotifier {
       currentUserLon = pos.longitude;
       currentSpeedKmh = (pos.speed < 0 ? 0 : pos.speed) * 3.6;
 
-      // Se l'utente è a casa/lavoro fermo, ignora il rumore GPS
       if (currentState == VehicleState.stayAtHome && currentSpeedKmh < 12.0) {
         notifyListeners();
         return;
@@ -244,7 +299,6 @@ class SensorFusionEngine extends ChangeNotifier {
           onApproachingCar100m(2);
         }
 
-        // Rilascio rapido: velocità > 12 km/h e distanza > 15 m dallo stallo
         if (currentSpeedKmh > 12.0 && distanceFromCarMeters! > 15.0) {
           _triggerCarReleased();
         }
@@ -265,7 +319,6 @@ class SensorFusionEngine extends ChangeNotifier {
     });
   }
 
-  // 2. Giroscopio
   void _startGyroscopeStream() {
     _gyroSub = gyroscopeEventStream().listen((GyroscopeEvent event) {
       if (currentState == VehicleState.stayAtHome) return;
@@ -276,7 +329,6 @@ class SensorFusionEngine extends ChangeNotifier {
     });
   }
 
-  // 3. Pedometro
   void _startPedometerStreams() {
     _pedStatusSub = Pedometer.pedestrianStatusStream.listen(
       (PedestrianStatus event) {
@@ -304,25 +356,28 @@ class SensorFusionEngine extends ChangeNotifier {
     );
   }
 
-  // 4. Fallback BLE per dispositivi Bluetooth Low Energy
   void _startBleBluetoothMonitor() {
     _btCheckTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      if (targetCarBluetoothMac == null || targetCarBluetoothMac!.isEmpty) return;
-
       try {
         final connectedDevices = FlutterBluePlus.connectedDevices;
-        final bool bleConnected = connectedDevices.any(
-          (d) => d.remoteId.str.toUpperCase() == targetCarBluetoothMac,
-        );
+        for (final d in connectedDevices) {
+          final mac = d.remoteId.str.toUpperCase();
+          final name = d.platformName.isNotEmpty ? d.platformName : 'Dispositivo BLE';
 
-        if (bleConnected && !isCarBtConnected) {
-          isCarBtConnected = true;
-          if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
-            await _triggerCarReleased();
-          } else {
-            currentState = VehicleState.driving;
+          if (targetCarBluetoothMac == null &&
+              !_ignoredBtMacs.contains(mac) &&
+              _lastPromptedBtMac != mac) {
+            _lastPromptedBtMac = mac;
+            onUnknownBluetoothDetected?.call(mac, name);
+          } else if (targetCarBluetoothMac == mac && !isCarBtConnected) {
+            isCarBtConnected = true;
+            if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
+              await _triggerCarReleased();
+            } else {
+              currentState = VehicleState.driving;
+            }
+            notifyListeners();
           }
-          notifyListeners();
         }
       } catch (_) {}
     });

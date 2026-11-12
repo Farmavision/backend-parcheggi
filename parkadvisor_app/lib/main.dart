@@ -61,6 +61,8 @@ class _HomeScreenState extends State<HomeScreen> {
       onCarParked: _handleCarParked,
       onApproachingCar100m: _handleApproachingCar100m,
       onCarReleased: _handleCarReleased,
+      onUnknownWifiDetected: _promptSaveUnknownWifi,
+      onUnknownBluetoothDetected: _promptSaveUnknownBluetooth,
     );
     _sensorEngine.addListener(() {
       if (!mounted) return;
@@ -77,6 +79,79 @@ class _HomeScreenState extends State<HomeScreen> {
     await Geolocator.requestPermission();
     await _sensorEngine.initialize();
     await _centerAndRefreshMap();
+  }
+
+  // Popup automatico al rilevamento di una nuova rete Wi-Fi
+  void _promptSaveUnknownWifi(String ssid) {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.wifi, color: Colors.indigo, size: 32),
+        title: const Text('Nuova rete Wi-Fi rilevata'),
+        content: Text(
+          'Sei connesso a "$ssid".\n\n'
+          'Vuoi registrarla come rete di Casa o Lavoro per attivare in automatico la modalità Stay at Home (senza pubblicare stalli in garage/cortile)?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              _sensorEngine.ignoreWifi(ssid);
+              Navigator.pop(ctx);
+            },
+            child: const Text('Ignora'),
+          ),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.work, size: 16),
+            label: const Text('Lavoro'),
+            onPressed: () async {
+              await _sensorEngine.saveWifiAsWork(ssid);
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+          ),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.home, size: 16),
+            label: const Text('Casa'),
+            onPressed: () async {
+              await _sensorEngine.saveWifiAsHome(ssid);
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Popup automatico al rilevamento di una nuova connessione Bluetooth
+  void _promptSaveUnknownBluetooth(String mac, String name) {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.directions_car, color: Colors.indigo, size: 32),
+        title: const Text('Nuovo dispositivo Bluetooth'),
+        content: Text(
+          'Il telefono si è collegato a "$name" ($mac).\n\n'
+          'È il sistema Bluetooth della tua auto? Se confermi, ParkNow! rileverà automaticamente quando sali e scendi.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              _sensorEngine.ignoreBluetoothDevice(mac);
+              Navigator.pop(ctx);
+            },
+            child: const Text('No, ignora'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              await _sensorEngine.setCarBluetoothDevice(mac, name);
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('Sì, è la mia auto'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _handleCarParked(double lat, double lon, String method) async {
@@ -196,30 +271,85 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _selectCarBluetoothDialog() async {
-    final connected = FlutterBluePlus.connectedDevices;
+  Future<void> _openConnectivityProfileDialog() async {
+    final classicPaired = await _sensorEngine.getPairedClassicBluetoothDevices();
+    final bleConnected = FlutterBluePlus.connectedDevices;
+
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Associa Bluetooth Auto'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Seleziona il vivavoce/autoradio attualmente connesso per il rilevamento automatico della sosta:'),
-            const SizedBox(height: 12),
-            if (connected.isEmpty)
-              const Text('Nessun dispositivo Bluetooth connesso al momento.', style: TextStyle(color: Colors.grey))
-            else
-              ...connected.map((d) => ListTile(
-                    leading: const Icon(Icons.directions_car),
-                    title: Text(d.platformName.isNotEmpty ? d.platformName : 'Dispositivo BT'),
-                    subtitle: Text(d.remoteId.str),
-                    onTap: () {
-                      _sensorEngine.setCarBluetoothMac(d.remoteId.str);
-                      Navigator.pop(ctx);
-                    },
-                  )),
-          ],
+        title: const Text('Profilo Connettività Account'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('1. Reti Wi-Fi Private (Stay at Home / Work):', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text('Wi-Fi attuale: ${_sensorEngine.currentConnectedWifiSsid ?? "Non connesso"}', style: const TextStyle(fontSize: 12)),
+              Text('Casa: ${_sensorEngine.homeWifiSsid ?? "Non impostato"} | Lavoro: ${_sensorEngine.workWifiSsid ?? "Non impostato"}',
+                  style: const TextStyle(fontSize: 12, color: Colors.indigo)),
+              if (_sensorEngine.currentConnectedWifiSsid != null) ...[
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.home, size: 16),
+                        label: const Text('Salva Casa', style: TextStyle(fontSize: 11)),
+                        onPressed: () async {
+                          await _sensorEngine.saveWifiAsHome(_sensorEngine.currentConnectedWifiSsid!);
+                          if (ctx.mounted) Navigator.pop(ctx);
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.work, size: 16),
+                        label: const Text('Salva Lavoro', style: TextStyle(fontSize: 11)),
+                        onPressed: () async {
+                          await _sensorEngine.saveWifiAsWork(_sensorEngine.currentConnectedWifiSsid!);
+                          if (ctx.mounted) Navigator.pop(ctx);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              const Divider(height: 20),
+              const Text('2. Bluetooth Auto (Classico & BLE):', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              if (classicPaired.isEmpty && bleConnected.isEmpty)
+                const Text('Nessun dispositivo Bluetooth trovato.', style: TextStyle(color: Colors.grey, fontSize: 12))
+              else ...[
+                ...classicPaired.map((d) => ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.directions_car, color: Colors.indigo),
+                      title: Text(d['name'] ?? 'Auto BT'),
+                      subtitle: Text('${d['mac']} (BT Classico)'),
+                      onTap: () {
+                        _sensorEngine.setCarBluetoothDevice(d['mac']!, d['name'] ?? 'Auto BT');
+                        Navigator.pop(ctx);
+                      },
+                    )),
+                ...bleConnected.map((d) => ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.bluetooth, color: Colors.blue),
+                      title: Text(d.platformName.isNotEmpty ? d.platformName : 'Dispositivo BLE'),
+                      subtitle: Text('${d.remoteId.str} (BLE)'),
+                      onTap: () {
+                        _sensorEngine.setCarBluetoothDevice(
+                          d.remoteId.str,
+                          d.platformName.isNotEmpty ? d.platformName : 'Auto BLE',
+                        );
+                        Navigator.pop(ctx);
+                      },
+                    )),
+              ],
+            ],
+          ),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Chiudi')),
@@ -252,7 +382,6 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final List<Marker> markers = [];
 
-    // 1. Posizione live dell'utente
     if (_hasUserLocation) {
       markers.add(
         Marker(
@@ -264,7 +393,6 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // 2. Auto dell'utente parcheggiata (blu se PARKED, arancione se LEAVING_SOON)
     if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
       final bool isUserLeaving = _sensorEngine.currentState == VehicleState.leavingSoon;
       markers.add(
@@ -277,12 +405,10 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // 3. Stalli disponibili / in liberazione dal backend (evitando sovrapposizione con la propria auto)
     for (var spot in _availableSpots) {
       final double spotLat = (spot['latitude'] as num).toDouble();
       final double spotLon = (spot['longitude'] as num).toDouble();
 
-      // Se lo stallo corrisponde alla propria auto già disegnata al punto 2, non duplicare il marker
       if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
         final double distFromOwnCar = Geolocator.distanceBetween(
           spotLat,
@@ -323,9 +449,9 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
-            icon: const Icon(Icons.bluetooth_connected),
-            tooltip: 'Configura BT Auto',
-            onPressed: _selectCarBluetoothDialog,
+            icon: const Icon(Icons.settings_bluetooth),
+            tooltip: 'Configura BT Auto e Wi-Fi Casa/Lavoro',
+            onPressed: _openConnectivityProfileDialog,
           ),
         ],
       ),
@@ -386,7 +512,9 @@ class _HomeScreenState extends State<HomeScreen> {
                           _sensorEngine.currentState.name.toUpperCase(),
                           style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
                         ),
-                        backgroundColor: Colors.indigo,
+                        backgroundColor: _sensorEngine.currentState == VehicleState.stayAtHome
+                            ? Colors.teal
+                            : Colors.indigo,
                       ),
                     ],
                   ),
@@ -398,7 +526,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   Text(
                     'Pedometro: ${_sensorEngine.pedestrianStatus} (${_sensorEngine.sessionSteps} passi)  |  '
-                    'BT Auto: ${_sensorEngine.targetCarBluetoothMac ?? "Non associato"}',
+                    'Wi-Fi: ${_sensorEngine.currentConnectedWifiSsid ?? "Dati mobili"}',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                  Text(
+                    'BT Auto: ${_sensorEngine.targetCarBluetoothName ?? _sensorEngine.targetCarBluetoothMac ?? "Non associato"}',
                     style: const TextStyle(fontSize: 13),
                   ),
                   if (_sensorEngine.distanceFromCarMeters != null)
