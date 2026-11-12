@@ -174,5 +174,5 @@ app.post('/api/parking/release', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server ParkAdvisor (Sensor Fusion Architecture) attivo sulla porta ${PORT}`);
+  console.log(`Server ParkNow! (Sensor Fusion Architecture) attivo sulla porta ${PORT}`);
 });

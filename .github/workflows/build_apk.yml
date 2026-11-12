@@ -39,5 +39,5 @@ jobs:
       - name: Rendi disponibile il file APK scaricabile
         uses: actions/upload-artifact@v4
         with:
-          name: parkadvisor-release-apk
+          name: parknow-release-apk
           path: parkadvisor_app/build/app/outputs/flutter-apk/app-release.apk

@@ -6,9 +6,10 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:pedometer/pedometer.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 enum VehicleState {
-  driving,      // Velocità > 15 km/h o connesso al BT dell'auto
+  driving,      // Velocità > 12 km/h o connesso al BT dell'auto
   stopping,     // Velocità ~ 0 (possibile semaforo o sosta)
   parked,       // Velocità 0 + (BT auto disconnesso O rotazione giroscopio + passi rilevati)
   leavingSoon,  // Utente in cammino entro 100m dall'auto parcheggiata
@@ -17,16 +18,20 @@ enum VehicleState {
 class SensorFusionEngine extends ChangeNotifier {
   VehicleState currentState = VehicleState.driving;
 
+  // Posizione live dell'utente (per aggiornamento fluido puntatore celeste)
+  double? currentUserLat;
+  double? currentUserLon;
+
   // Dati auto parcheggiata
   double? parkedLat;
   double? parkedLon;
   double? distanceFromCarMeters;
-  String? targetCarBluetoothMac; // MAC autoradio/vivavoce auto
+  String? targetCarBluetoothMac;
 
   // Telemetria sensori in tempo reale
   double currentSpeedKmh = 0.0;
-  double gyroscopeMagnitude = 0.0; // rad/s (passaggio da regime piano a movimento uscita)
-  String pedestrianStatus = 'unknown'; // 'walking' | 'stopped'
+  double gyroscopeMagnitude = 0.0;
+  String pedestrianStatus = 'unknown';
   int sessionSteps = 0;
   int? _initialStepCount;
   bool isCarBtConnected = false;
@@ -52,6 +57,9 @@ class SensorFusionEngine extends ChangeNotifier {
   });
 
   Future<void> initialize() async {
+    // Richiesta esplicita a runtime del permesso attività fisica per il pedometro Android
+    await Permission.activityRecognition.request();
+
     final prefs = await SharedPreferences.getInstance();
     parkedLat = prefs.getDouble('parked_lat');
     parkedLon = prefs.getDouble('parked_lon');
@@ -75,7 +83,7 @@ class SensorFusionEngine extends ChangeNotifier {
     notifyListeners();
   }
 
-  // 1. Stream GPS: velocità e geofencing 100m
+  // 1. Stream GPS continuo: posizione live, velocità, geofence 100m e rilascio rapido
   void _startGpsStream() {
     const locationSettings = LocationSettings(
       accuracy: LocationAccuracy.bestForNavigation,
@@ -83,9 +91,10 @@ class SensorFusionEngine extends ChangeNotifier {
     );
 
     _posSub = Geolocator.getPositionStream(locationSettings: locationSettings).listen((Position pos) {
+      currentUserLat = pos.latitude;
+      currentUserLon = pos.longitude;
       currentSpeedKmh = (pos.speed < 0 ? 0 : pos.speed) * 3.6;
 
-      // Se l'auto è parcheggiata, calcola la distanza continua dall'auto
       if ((currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) &&
           parkedLat != null &&
           parkedLon != null) {
@@ -96,9 +105,12 @@ class SensorFusionEngine extends ChangeNotifier {
           parkedLon!,
         );
 
-        // Raggio significativo di 100 metri + movimento pedonale (uscita di casa verso l'auto)
+        // Raggio 100m + movimento pedonale (pedometro o velocità camminata 1.5-7.5 km/h)
+        final bool isWalking = pedestrianStatus == 'walking' ||
+            (currentSpeedKmh >= 1.5 && currentSpeedKmh <= 7.5);
+
         if (distanceFromCarMeters! <= 100.0 &&
-            pedestrianStatus == 'walking' &&
+            isWalking &&
             !_notified100m &&
             currentState == VehicleState.parked) {
           _notified100m = true;
@@ -106,13 +118,12 @@ class SensorFusionEngine extends ChangeNotifier {
           onApproachingCar100m(2);
         }
 
-        // Ripartenza effettiva: velocità veicolare > 15 km/h dopo essere tornati all'auto
-        if (currentSpeedKmh > 15.0 && distanceFromCarMeters! > 25.0) {
+        // Rilascio rapido ottimizzato: velocità > 12 km/h e distanza > 15 m dallo stallo
+        if (currentSpeedKmh > 12.0 && distanceFromCarMeters! > 15.0) {
           _triggerCarReleased();
         }
       } else {
-        // Logica transizione marcia -> sosta
-        if (currentSpeedKmh > 15.0) {
+        if (currentSpeedKmh > 12.0) {
           currentState = VehicleState.driving;
           _gyroTransitionDetected = false;
           _initialStepCount = null;
@@ -128,26 +139,27 @@ class SensorFusionEngine extends ChangeNotifier {
     });
   }
 
-  // 2. Giroscopio: rileva l'uscita dal regime piano (abitacolo) alla rotazione di uscita/tasca
+  // 2. Giroscopio
   void _startGyroscopeStream() {
     _gyroSub = gyroscopeEventStream().listen((GyroscopeEvent event) {
       gyroscopeMagnitude = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
-
-      // Picco rotazionale > 1.8 rad/s a velocità nulla indica movimento utente (non veicolo fermo)
       if (currentSpeedKmh < 1.5 && gyroscopeMagnitude > 1.8) {
         _gyroTransitionDetected = true;
       }
     });
   }
 
-  // 3. Pedometro: passaggio a rilevamento del passo umano
+  // 3. Pedometro
   void _startPedometerStreams() {
     _pedStatusSub = Pedometer.pedestrianStatusStream.listen(
       (PedestrianStatus event) {
-        pedestrianStatus = event.status; // 'walking' o 'stopped'
+        pedestrianStatus = event.status;
         notifyListeners();
       },
-      onError: (_) => pedestrianStatus = 'unavailable',
+      onError: (_) {
+        pedestrianStatus = 'unavailable';
+        notifyListeners();
+      },
     );
 
     _stepCountSub = Pedometer.stepCountStream.listen(
@@ -165,7 +177,7 @@ class SensorFusionEngine extends ChangeNotifier {
     );
   }
 
-  // 4. Monitoraggio connessione Bluetooth dell'auto
+  // 4. Monitoraggio connessione Bluetooth auto
   void _startCarBluetoothMonitor() {
     _btCheckTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
       if (targetCarBluetoothMac == null || targetCarBluetoothMac!.isEmpty) return;
@@ -177,13 +189,11 @@ class SensorFusionEngine extends ChangeNotifier {
           (d) => d.remoteId.str.toUpperCase() == targetCarBluetoothMac,
         );
 
-        // Evento chiave: distacco dal Bluetooth dell'auto a velocità nulla
         if (wasConnected && !isCarBtConnected && currentSpeedKmh < 2.0) {
           final pos = await Geolocator.getCurrentPosition();
           await _confirmParked(pos.latitude, pos.longitude, 'BT_DISCONNECT+GPS_ZERO');
         }
 
-        // Riconnessione al BT dell'auto mentre era parcheggiata -> utente salito in auto
         if (!wasConnected && isCarBtConnected &&
             (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon)) {
           await _triggerCarReleased();
@@ -193,12 +203,11 @@ class SensorFusionEngine extends ChangeNotifier {
     });
   }
 
-  // Valutazione Sensor Fusion per confermare il parcheggio
   Future<void> _evaluateParkingCondition(Position pos) async {
     if (currentState != VehicleState.stopping) return;
 
-    // Criterio: Velocità ~ 0 + (Rotazione giroscopio + almeno 6 passi rilevati)
-    final bool inertialWalkConfirmed = _gyroTransitionDetected && (sessionSteps >= 6 || pedestrianStatus == 'walking');
+    final bool inertialWalkConfirmed = _gyroTransitionDetected &&
+        (sessionSteps >= 6 || pedestrianStatus == 'walking');
 
     if (inertialWalkConfirmed) {
       await _confirmParked(pos.latitude, pos.longitude, 'GYRO+PEDOMETER+GPS_ZERO');
@@ -237,7 +246,6 @@ class SensorFusionEngine extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Metodi di test manuale per forzare le transizioni durante i collaudi su strada/casa
   Future<void> forceParkHere() async {
     final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
     await _confirmParked(pos.latitude, pos.longitude, 'MANUAL_SENSOR_TEST');

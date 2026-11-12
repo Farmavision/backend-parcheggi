@@ -8,16 +8,16 @@ import 'package:latlong2/latlong.dart';
 import 'sensor_fusion_engine.dart';
 
 void main() {
-  runApp(const ParkAdvisorApp());
+  runApp(const ParkNowApp());
 }
 
-class ParkAdvisorApp extends StatelessWidget {
-  const ParkAdvisorApp({super.key});
+class ParkNowApp extends StatelessWidget {
+  const ParkNowApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ParkAdvisor',
+      title: 'ParkNow!',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
@@ -37,7 +37,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   static const String _backendBaseUrl = 'https://bug-free-space-couscous-7vgr7pjj9grqcpw4p-3000.app.github.dev';
-  static const String _userId = 'USER-001'; // Identificativo utente registrato
+  static const String _userId = 'USER-001';
 
   final MapController _mapController = MapController();
   LatLng _currentCenter = const LatLng(41.85784, 12.55860);
@@ -51,7 +51,6 @@ class _HomeScreenState extends State<HomeScreen> {
   Map<String, String> get _headers => {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'X-Github-Token': '',
         'bypass-tunnel-reminder': 'true',
       };
 
@@ -64,7 +63,12 @@ class _HomeScreenState extends State<HomeScreen> {
       onCarReleased: _handleCarReleased,
     );
     _sensorEngine.addListener(() {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      if (_sensorEngine.currentUserLat != null && _sensorEngine.currentUserLon != null) {
+        _currentCenter = LatLng(_sensorEngine.currentUserLat!, _sensorEngine.currentUserLon!);
+        _hasUserLocation = true;
+      }
+      setState(() {});
     });
     _initPermissionsAndEngine();
   }
@@ -75,7 +79,6 @@ class _HomeScreenState extends State<HomeScreen> {
     await _centerAndRefreshMap();
   }
 
-  // API 1: Registra auto parcheggiata (stato OCCUPIED -> invisibile agli altri)
   Future<void> _handleCarParked(double lat, double lon, String method) async {
     try {
       await http.post(
@@ -92,7 +95,6 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (_) {}
   }
 
-  // API 2: Utente entro 100m dall'auto -> Notifica conferma o invio automatico
   Future<void> _handleApproachingCar100m(int estimatedMinutes) async {
     if (!mounted) return;
     showDialog(
@@ -134,7 +136,6 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (_) {}
   }
 
-  // API 3: Utente ripartito -> Stallo ufficialmente FREE (pin verde per tutti)
   Future<void> _handleCarReleased() async {
     try {
       await http.post(
@@ -161,7 +162,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Recupera SOLO gli stalli FREE o LEAVING_SOON
   Future<void> _fetchAvailableSpots(double lat, double lon) async {
     setState(() {
       _isLoadingApi = true;
@@ -196,7 +196,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Selettore dispositivo Bluetooth dell'auto
   Future<void> _selectCarBluetoothDialog() async {
     final connected = FlutterBluePlus.connectedDevices;
     showDialog(
@@ -239,7 +238,6 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final List<Marker> markers = [];
 
-    // 1. Posizione attuale utente (punto blu)
     if (_hasUserLocation) {
       markers.add(
         Marker(
@@ -251,7 +249,6 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // 2. Posizione dell'auto parcheggiata dell'utente (visibile solo al proprietario)
     if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
       markers.add(
         Marker(
@@ -266,7 +263,6 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // 3. Stalli disponibili per chi cerca parcheggio (SOLO FREE = verde, LEAVING_SOON = arancione)
     for (var spot in _availableSpots) {
       final bool isLeavingSoon = spot['status'] == 'LEAVING_SOON';
       markers.add(
@@ -301,7 +297,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('ParkAdvisor', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text('ParkNow!', style: TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
@@ -352,7 +348,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-          // Pannello Telemetria Sensor Fusion e Stato Auto
           Expanded(
             flex: 48,
             child: SingleChildScrollView(
