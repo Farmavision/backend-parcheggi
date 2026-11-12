@@ -228,6 +228,20 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildCarSpotBadge(Color badgeColor) {
+    return Container(
+      decoration: BoxDecoration(
+        color: badgeColor,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 2.5),
+        boxShadow: const [
+          BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2)),
+        ],
+      ),
+      child: const Icon(Icons.directions_car, color: Colors.white, size: 22),
+    );
+  }
+
   @override
   void dispose() {
     _sensorEngine.dispose();
@@ -238,6 +252,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final List<Marker> markers = [];
 
+    // 1. Posizione live dell'utente
     if (_hasUserLocation) {
       markers.add(
         Marker(
@@ -249,30 +264,41 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
+    // 2. Auto dell'utente parcheggiata (blu se PARKED, arancione se LEAVING_SOON)
     if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
+      final bool isUserLeaving = _sensorEngine.currentState == VehicleState.leavingSoon;
       markers.add(
         Marker(
           point: LatLng(_sensorEngine.parkedLat!, _sensorEngine.parkedLon!),
           width: 44,
           height: 44,
-          child: Container(
-            decoration: const BoxDecoration(color: Colors.indigo, shape: BoxShape.circle),
-            child: const Icon(Icons.directions_car, color: Colors.white, size: 24),
-          ),
+          child: _buildCarSpotBadge(isUserLeaving ? Colors.orange : Colors.indigo),
         ),
       );
     }
 
+    // 3. Stalli disponibili / in liberazione dal backend (evitando sovrapposizione con la propria auto)
     for (var spot in _availableSpots) {
+      final double spotLat = (spot['latitude'] as num).toDouble();
+      final double spotLon = (spot['longitude'] as num).toDouble();
+
+      // Se lo stallo corrisponde alla propria auto già disegnata al punto 2, non duplicare il marker
+      if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
+        final double distFromOwnCar = Geolocator.distanceBetween(
+          spotLat,
+          spotLon,
+          _sensorEngine.parkedLat!,
+          _sensorEngine.parkedLon!,
+        );
+        if (distFromOwnCar < 3.0) continue;
+      }
+
       final bool isLeavingSoon = spot['status'] == 'LEAVING_SOON';
       markers.add(
         Marker(
-          point: LatLng(
-            (spot['latitude'] as num).toDouble(),
-            (spot['longitude'] as num).toDouble(),
-          ),
-          width: 46,
-          height: 46,
+          point: LatLng(spotLat, spotLon),
+          width: 44,
+          height: 44,
           child: GestureDetector(
             onTap: () {
               ScaffoldMessenger.of(context).showSnackBar(
@@ -285,11 +311,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               );
             },
-            child: Icon(
-              Icons.location_on,
-              color: isLeavingSoon ? Colors.orange : Colors.green,
-              size: 42,
-            ),
+            child: _buildCarSpotBadge(isLeavingSoon ? Colors.orange : Colors.green),
           ),
         ),
       );
