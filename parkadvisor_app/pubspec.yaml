@@ -15,9 +15,11 @@ dependencies:
   geolocator: ^11.0.0
   flutter_blue_plus: ^1.31.0
   socket_io_client: ^2.0.3+1
-  shared_preferences: ^2.2.2
+  shared_preferences: ^2.5.6
   flutter_map: ^8.3.2
   latlong2: ^0.10.1
+  sensors_plus: ^7.1.1
+  pedometer: ^4.2.0
 
 dev_dependencies:
   flutter_test:

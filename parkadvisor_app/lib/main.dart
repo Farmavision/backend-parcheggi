@@ -5,6 +5,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'sensor_fusion_engine.dart';
 
 void main() {
   runApp(const ParkAdvisorApp());
@@ -36,106 +37,149 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   static const String _backendBaseUrl = 'https://bug-free-space-couscous-7vgr7pjj9grqcpw4p-3000.app.github.dev';
+  static const String _userId = 'USER-001'; // Identificativo utente registrato
 
   final MapController _mapController = MapController();
-  LatLng _currentCenter = const LatLng(41.85790, 12.55858); // Posizione iniziale di default
+  LatLng _currentCenter = const LatLng(41.85784, 12.55860);
 
-  String _gpsStatus = 'In attesa di rilevamento...';
-  String _bleStatus = 'Pronto per la scansione';
-  String _apiStatus = 'Premi il pulsante per cercare stalli';
-  
-  bool _isLoadingGps = false;
-  bool _isScanningBle = false;
+  late SensorFusionEngine _sensorEngine;
+  List<dynamic> _availableSpots = [];
+  String _apiStatus = 'Sincronizzazione mappa...';
   bool _isLoadingApi = false;
   bool _hasUserLocation = false;
 
-  List<dynamic> _nearbySpots = [];
-  List<ScanResult> _scanResults = [];
+  Map<String, String> get _headers => {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Github-Token': '',
+        'bypass-tunnel-reminder': 'true',
+      };
 
-  Future<void> _getCurrentLocation() async {
-    setState(() {
-      _isLoadingGps = true;
-      _gpsStatus = 'Rilevamento GPS in corso...';
+  @override
+  void initState() {
+    super.initState();
+    _sensorEngine = SensorFusionEngine(
+      onCarParked: _handleCarParked,
+      onApproachingCar100m: _handleApproachingCar100m,
+      onCarReleased: _handleCarReleased,
+    );
+    _sensorEngine.addListener(() {
+      if (mounted) setState(() {});
     });
+    _initPermissionsAndEngine();
+  }
 
+  Future<void> _initPermissionsAndEngine() async {
+    await Geolocator.requestPermission();
+    await _sensorEngine.initialize();
+    await _centerAndRefreshMap();
+  }
+
+  // API 1: Registra auto parcheggiata (stato OCCUPIED -> invisibile agli altri)
+  Future<void> _handleCarParked(double lat, double lon, String method) async {
     try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        setState(() {
-          _gpsStatus = 'I servizi GPS sono disattivati.';
-          _isLoadingGps = false;
-        });
-        return;
-      }
-
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-        if (permission == LocationPermission.denied) {
-          setState(() {
-            _gpsStatus = 'Permesso posizione negato.';
-            _isLoadingGps = false;
-          });
-          return;
-        }
-      }
-
-      if (permission == LocationPermission.deniedForever) {
-        setState(() {
-          _gpsStatus = 'Permessi GPS negati permanentemente.';
-          _isLoadingGps = false;
-        });
-        return;
-      }
-
-      Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/park'),
+        headers: _headers,
+        body: json.encode({
+          'userId': _userId,
+          'latitude': lat,
+          'longitude': lon,
+          'detectionMethod': method,
+        }),
       );
+      await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
+    } catch (_) {}
+  }
 
-      final newLocation = LatLng(position.latitude, position.longitude);
+  // API 2: Utente entro 100m dall'auto -> Notifica conferma o invio automatico
+  Future<void> _handleApproachingCar100m(int estimatedMinutes) async {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Stai tornando all\'auto'),
+        content: Text(
+          'Sei entrato nel raggio di 100m dalla tua auto parcheggiata. '
+          'Vuoi segnalare che lo stallo si libererà tra $estimatedMinutes minuti?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Non ora'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await _sendLeavingSoonToServer(estimatedMinutes);
+            },
+            child: const Text('Conferma uscita'),
+          ),
+        ],
+      ),
+    );
+  }
 
+  Future<void> _sendLeavingSoonToServer(int minutes) async {
+    try {
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/leaving'),
+        headers: _headers,
+        body: json.encode({
+          'userId': _userId,
+          'availableInMinutes': minutes,
+        }),
+      );
+      await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
+    } catch (_) {}
+  }
+
+  // API 3: Utente ripartito -> Stallo ufficialmente FREE (pin verde per tutti)
+  Future<void> _handleCarReleased() async {
+    try {
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/release'),
+        headers: _headers,
+        body: json.encode({'userId': _userId}),
+      );
+      await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
+    } catch (_) {}
+  }
+
+  Future<void> _centerAndRefreshMap() async {
+    try {
+      Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+      final newPos = LatLng(pos.latitude, pos.longitude);
       setState(() {
-        _currentCenter = newLocation;
+        _currentCenter = newPos;
         _hasUserLocation = true;
-        _gpsStatus = 'Lat: ${position.latitude.toStringAsFixed(5)}, Lon: ${position.longitude.toStringAsFixed(5)}';
-        _isLoadingGps = false;
       });
-
-      // Sposta la visuale della mappa sulla posizione rilevata
-      _mapController.move(newLocation, 16.5);
-
-      await _fetchNearbyParkings(position.latitude, position.longitude);
+      _mapController.move(newPos, 17.0);
+      await _fetchAvailableSpots(pos.latitude, pos.longitude);
     } catch (e) {
-      setState(() {
-        _gpsStatus = 'Errore GPS: $e';
-        _isLoadingGps = false;
-      });
+      setState(() => _apiStatus = 'Errore GPS: $e');
     }
   }
 
-  Future<void> _fetchNearbyParkings(double lat, double lon) async {
+  // Recupera SOLO gli stalli FREE o LEAVING_SOON
+  Future<void> _fetchAvailableSpots(double lat, double lon) async {
     setState(() {
       _isLoadingApi = true;
-      _apiStatus = 'Ricerca stalli vicini...';
-      _nearbySpots.clear();
+      _apiStatus = 'Ricerca stalli disponibili...';
     });
 
     try {
       final url = Uri.parse('$_backendBaseUrl/api/parking/nearby?lat=$lat&lon=$lon');
-      final response = await http.get(
-        url,
-        headers: {
-          'Accept': 'application/json',
-          'X-Github-Token': '',
-          'bypass-tunnel-reminder': 'true',
-        },
-      ).timeout(const Duration(seconds: 10));
+      final response = await http.get(url, headers: _headers).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
+        final spots = data['spots'] as List<dynamic>? ?? [];
         setState(() {
-          _nearbySpots = data['spots'] ?? [];
-          _apiStatus = 'Trovati ${_nearbySpots.length} stalli liberi';
+          _availableSpots = spots;
+          _apiStatus = spots.isEmpty
+              ? 'Nessuno stallo libero in zona'
+              : '${spots.length} stalli disponibili in zona';
           _isLoadingApi = false;
         });
       } else {
@@ -146,168 +190,136 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     } catch (e) {
       setState(() {
-        _apiStatus = 'Connessione fallita: $e';
+        _apiStatus = 'Errore connessione: $e';
         _isLoadingApi = false;
       });
     }
   }
 
-  void _showSpotDetails(Map<String, dynamic> spot) {
-    showModalBottomSheet(
+  // Selettore dispositivo Bluetooth dell'auto
+  Future<void> _selectCarBluetoothDialog() async {
+    final connected = FlutterBluePlus.connectedDevices;
+    showDialog(
       context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      builder: (ctx) => AlertDialog(
+        title: const Text('Associa Bluetooth Auto'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Seleziona il vivavoce/autoradio attualmente connesso per il rilevamento automatico della sosta:'),
+            const SizedBox(height: 12),
+            if (connected.isEmpty)
+              const Text('Nessun dispositivo Bluetooth connesso al momento.', style: TextStyle(color: Colors.grey))
+            else
+              ...connected.map((d) => ListTile(
+                    leading: const Icon(Icons.directions_car),
+                    title: Text(d.platformName.isNotEmpty ? d.platformName : 'Dispositivo BT'),
+                    subtitle: Text(d.remoteId.str),
+                    onTap: () {
+                      _sensorEngine.setCarBluetoothMac(d.remoteId.str);
+                      Navigator.pop(ctx);
+                    },
+                  )),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Chiudi')),
+        ],
       ),
-      builder: (context) {
-        return Padding(
-          padding: const EdgeInsets.all(20.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.local_parking, color: Colors.green, size: 32),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      spot['name'] ?? 'Stallo Libero',
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Text('Codice Stallo: ${spot['id']}', style: const TextStyle(fontSize: 15)),
-              Text('Sensore BLE associato: ${spot['sensorBleId']}', style: const TextStyle(fontSize: 15)),
-              Text('Coordinate: ${spot['latitude']}, ${spot['longitude']}', style: const TextStyle(fontSize: 13, color: Colors.grey)),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: () => Navigator.pop(context),
-                  icon: const Icon(Icons.check),
-                  label: const Text('Chiudi scheda'),
-                ),
-              ),
-            ],
-          ),
-        );
-      },
     );
   }
 
-  Future<void> _scanBleDevices() async {
-    setState(() {
-      _isScanningBle = true;
-      _bleStatus = 'Scansione sensori in corso...';
-      _scanResults.clear();
-    });
-
-    try {
-      if (await FlutterBluePlus.isSupported == false) {
-        setState(() {
-          _bleStatus = 'Bluetooth non supportato.';
-          _isScanningBle = false;
-        });
-        return;
-      }
-
-      if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
-        await FlutterBluePlus.turnOn();
-      }
-
-      var subscription = FlutterBluePlus.onScanResults.listen((results) {
-        setState(() {
-          _scanResults = results;
-        });
-      });
-
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
-      await FlutterBluePlus.isScanning.where((val) => val == false).first;
-
-      setState(() {
-        _bleStatus = 'Trovati ${_scanResults.length} dispositivi BLE';
-        _isScanningBle = false;
-      });
-
-      subscription.cancel();
-    } catch (e) {
-      setState(() {
-        _bleStatus = 'Errore Bluetooth: $e';
-        _isScanningBle = false;
-      });
-    }
+  @override
+  void dispose() {
+    _sensorEngine.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // Costruzione dei marker per la mappa
     final List<Marker> markers = [];
 
-    // 1. Marker posizione utente (punto blu)
+    // 1. Posizione attuale utente (punto blu)
     if (_hasUserLocation) {
       markers.add(
         Marker(
           point: _currentCenter,
-          width: 40,
-          height: 40,
+          width: 36,
+          height: 36,
+          child: const Icon(Icons.my_location, color: Colors.blue, size: 26),
+        ),
+      );
+    }
+
+    // 2. Posizione dell'auto parcheggiata dell'utente (visibile solo al proprietario)
+    if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
+      markers.add(
+        Marker(
+          point: LatLng(_sensorEngine.parkedLat!, _sensorEngine.parkedLon!),
+          width: 44,
+          height: 44,
           child: Container(
-            decoration: BoxDecoration(
-              color: Colors.blue.withOpacity(0.25),
-              shape: BoxShape.circle,
-            ),
-            child: const Center(
-              child: Icon(Icons.my_location, color: Colors.blue, size: 24),
+            decoration: const BoxDecoration(color: Colors.indigo, shape: BoxShape.circle),
+            child: const Icon(Icons.directions_car, color: Colors.white, size: 24),
+          ),
+        ),
+      );
+    }
+
+    // 3. Stalli disponibili per chi cerca parcheggio (SOLO FREE = verde, LEAVING_SOON = arancione)
+    for (var spot in _availableSpots) {
+      final bool isLeavingSoon = spot['status'] == 'LEAVING_SOON';
+      markers.add(
+        Marker(
+          point: LatLng(
+            (spot['latitude'] as num).toDouble(),
+            (spot['longitude'] as num).toDouble(),
+          ),
+          width: 46,
+          height: 46,
+          child: GestureDetector(
+            onTap: () {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    isLeavingSoon
+                        ? 'Stallo in liberazione tra ${spot['availableInMinutes']} min (${spot['distanceMeters']}m)'
+                        : 'Stallo LIBERO (${spot['distanceMeters']}m)',
+                  ),
+                ),
+              );
+            },
+            child: Icon(
+              Icons.location_on,
+              color: isLeavingSoon ? Colors.orange : Colors.green,
+              size: 42,
             ),
           ),
         ),
       );
     }
 
-    // 2. Marker per ogni stallo libero restituito dal backend (pin verdi cliccabili)
-    for (var spot in _nearbySpots) {
-      if (spot['latitude'] != null && spot['longitude'] != null) {
-        markers.add(
-          Marker(
-            point: LatLng(
-              (spot['latitude'] as num).toDouble(),
-              (spot['longitude'] as num).toDouble(),
-            ),
-            width: 45,
-            height: 45,
-            child: GestureDetector(
-              onTap: () => _showSpotDetails(spot),
-              child: const Icon(
-                Icons.location_on,
-                color: Colors.green,
-                size: 40,
-              ),
-            ),
-          ),
-        );
-      }
-    }
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('ParkAdvisor', style: TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.bluetooth_connected),
+            tooltip: 'Configura BT Auto',
+            onPressed: _selectCarBluetoothDialog,
+          ),
+        ],
       ),
       body: Column(
         children: [
-          // Sezione superiore: Mappa interattiva (occupa il 55% dello schermo)
           Expanded(
-            flex: 55,
+            flex: 52,
             child: Stack(
               children: [
                 FlutterMap(
                   mapController: _mapController,
-                  options: MapOptions(
-                    initialCenter: _currentCenter,
-                    initialZoom: 15.0,
-                  ),
+                  options: MapOptions(initialCenter: _currentCenter, initialZoom: 17.0),
                   children: [
                     TileLayer(
                       urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -316,27 +328,21 @@ class _HomeScreenState extends State<HomeScreen> {
                     MarkerLayer(markers: markers),
                   ],
                 ),
-                // Badge informativo in alto sulla mappa
                 Positioned(
-                  top: 12,
-                  left: 12,
-                  right: 12,
+                  top: 10,
+                  left: 10,
+                  right: 10,
                   child: Card(
-                    elevation: 4,
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                       child: Row(
                         children: [
-                          Icon(
-                            _isLoadingApi ? Icons.sync : Icons.local_parking,
-                            color: Colors.green,
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(
-                              _apiStatus,
-                              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                            ),
+                          Icon(_isLoadingApi ? Icons.sync : Icons.local_parking, color: Colors.green),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(_apiStatus, style: const TextStyle(fontWeight: FontWeight.w600))),
+                          IconButton(
+                            icon: const Icon(Icons.refresh),
+                            onPressed: _centerAndRefreshMap,
                           ),
                         ],
                       ),
@@ -346,64 +352,73 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-
-          // Sezione inferiore: Pannello comandi GPS e BLE
+          // Pannello Telemetria Sensor Fusion e Stato Auto
           Expanded(
-            flex: 45,
+            flex: 48,
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(14.0),
+              padding: const EdgeInsets.all(14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      backgroundColor: Colors.indigo,
-                      foregroundColor: Colors.white,
-                    ),
-                    onPressed: _isLoadingGps ? null : _getCurrentLocation,
-                    icon: _isLoadingGps
-                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                        : const Icon(Icons.my_location),
-                    label: const Text('Centra posizione e cerca stalli', style: TextStyle(fontSize: 16)),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(_gpsStatus, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                  const Divider(height: 24),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text('Sensori BLE vicini', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                      ElevatedButton.icon(
-                        onPressed: _isScanningBle ? null : _scanBleDevices,
-                        icon: _isScanningBle
-                            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.bluetooth_searching, size: 18),
-                        label: const Text('Scansiona'),
+                      const Text('Stato Sensor Fusion:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                      Chip(
+                        label: Text(
+                          _sensorEngine.currentState.name.toUpperCase(),
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+                        ),
+                        backgroundColor: Colors.indigo,
                       ),
                     ],
                   ),
-                  Text(_bleStatus, style: const TextStyle(fontSize: 13, color: Colors.black54)),
-                  if (_scanResults.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    ListView.builder(
-                      shrinkWrap: true,
-                      physics: const NeverScrollableScrollPhysics(),
-                      itemCount: _scanResults.length > 3 ? 3 : _scanResults.length,
-                      itemBuilder: (context, index) {
-                        final device = _scanResults[index].device;
-                        final rssi = _scanResults[index].rssi;
-                        return ListTile(
-                          dense: true,
-                          contentPadding: EdgeInsets.zero,
-                          leading: const Icon(Icons.sensors, color: Colors.blue),
-                          title: Text(device.platformName.isNotEmpty ? device.platformName : 'Dispositivo sconosciuto'),
-                          subtitle: Text('ID: ${device.remoteId}'),
-                          trailing: Text('$rssi dBm'),
-                        );
-                      },
+                  const SizedBox(height: 6),
+                  Text(
+                    'Velocità: ${_sensorEngine.currentSpeedKmh.toStringAsFixed(1)} km/h  |  '
+                    'Giroscopio: ${_sensorEngine.gyroscopeMagnitude.toStringAsFixed(2)} rad/s',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                  Text(
+                    'Pedometro: ${_sensorEngine.pedestrianStatus} (${_sensorEngine.sessionSteps} passi)  |  '
+                    'BT Auto: ${_sensorEngine.targetCarBluetoothMac ?? "Non associato"}',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                  if (_sensorEngine.distanceFromCarMeters != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        'Distanza dall\'auto parcheggiata: ${_sensorEngine.distanceFromCarMeters!.toStringAsFixed(1)} m (Soglia: 100m)',
+                        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.indigo),
+                      ),
                     ),
-                  ],
+                  const Divider(height: 20),
+                  const Text('Simulazione Ciclo Sosta (Collaudo API + DB):', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _sensorEngine.forceParkHere(),
+                          child: const Text('1. Parcheggia qui', style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _sensorEngine.forceLeavingSoon(),
+                          child: const Text('2. Entro 100m', style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _sensorEngine.forceReleaseCar(),
+                          child: const Text('3. Ripartito', style: TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                    ],
+                  ),
                 ],
               ),
             ),

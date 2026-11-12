@@ -1,56 +1,178 @@
 const express = require('express');
 const cors = require('cors');
+const Database = require('better-sqlite3');
+const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 
 app.use(cors());
 app.use(express.json());
 
-// Dati mock con coordinate realistiche attorno alla tua posizione GPS rilevata
-let parkingSpots = [
-  {
-    id: 'PARK-001',
-    name: 'Stallo A - Via Roma',
-    latitude: 41.85795,
-    longitude: 12.55860,
-    isOccupied: false,
-    sensorBleId: 'AA:BB:CC:01'
-  },
-  {
-    id: 'PARK-002',
-    name: 'Stallo B - Via Roma',
-    latitude: 41.85820,
-    longitude: 12.55910,
-    isOccupied: true,
-    sensorBleId: 'AA:BB:CC:02'
-  },
-  {
-    id: 'PARK-003',
-    name: 'Stallo C - Piazza',
-    latitude: 41.85750,
-    longitude: 12.55800,
-    isOccupied: false,
-    sensorBleId: 'AA:BB:CC:03'
-  }
-];
+// 1. Inizializzazione Database SQLite con Macchina a Stati Reale
+const dbPath = path.join(__dirname, 'parkadvisor.db');
+const db = new Database(dbPath);
 
-// Endpoint verifica stato
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', serverTime: new Date().toISOString() });
-});
+db.exec(`
+  CREATE TABLE IF NOT EXISTS parking_spots (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OCCUPIED', -- 'OCCUPIED' | 'LEAVING_SOON' | 'FREE'
+    available_in_minutes INTEGER DEFAULT 0,
+    detection_method TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
 
-// Endpoint per recuperare i parcheggi disponibili
+// Calcolo distanza Haversine in metri
+function getDistanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371e3;
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// 2. GET /api/parking/nearby - Restituisce SOLO stalli FREE o LEAVING_SOON (non scaduti)
 app.get('/api/parking/nearby', (req, res) => {
-  const { lat, lon } = req.query;
-  const available = parkingSpots.filter(spot => !spot.isOccupied);
-  res.json({
-    userPosition: { lat: parseFloat(lat), lon: parseFloat(lon) },
-    totalAvailable: available.length,
-    spots: available
-  });
+  try {
+    const { lat, lon, radius = 1500 } = req.query;
+
+    // Pulizia automatica stalli FREE più vecchi di 15 minuti (TTL)
+    db.prepare(`
+      DELETE FROM parking_spots 
+      WHERE status = 'FREE' 
+      AND datetime(updated_at) < datetime('now', '-15 minutes')
+    `).run();
+
+    // Seleziona SOLO gli stalli in liberazione o liberi (mai gli OCCUPIED)
+    const rows = db.prepare(`
+      SELECT * FROM parking_spots 
+      WHERE status IN ('LEAVING_SOON', 'FREE')
+    `).all();
+
+    const formattedSpots = rows.map(row => {
+      const distance = (lat && lon)
+        ? Math.round(getDistanceMeters(parseFloat(lat), parseFloat(lon), row.latitude, row.longitude))
+        : null;
+
+      return {
+        id: row.id,
+        userId: row.user_id,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        status: row.status,
+        availableInMinutes: row.available_in_minutes,
+        distanceMeters: distance,
+        updatedAt: row.updated_at
+      };
+    });
+
+    const result = (lat && lon)
+      ? formattedSpots
+          .filter(s => s.distanceMeters <= parseFloat(radius))
+          .sort((a, b) => a.distanceMeters - b.distanceMeters)
+      : formattedSpots;
+
+    res.json({
+      count: result.length,
+      spots: result
+    });
+  } catch (err) {
+    console.error('Errore GET /nearby:', err);
+    res.status(500).json({ error: 'Errore interno del database' });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server ParkAdvisor attivo sulla porta ${PORT}`);
+// 3. POST /api/parking/park - L'utente ha parcheggiato (stato OCCUPIED, invisibile agli altri)
+app.post('/api/parking/park', (req, res) => {
+  try {
+    const { userId, latitude, longitude, detectionMethod = 'SENSOR_FUSION' } = req.body;
+
+    if (!userId || latitude == null || longitude == null) {
+      return res.status(400).json({ error: 'Parametri richiesti: userId, latitude, longitude' });
+    }
+
+    // Rimuove eventuali soste precedenti dello stesso utente
+    db.prepare('DELETE FROM parking_spots WHERE user_id = ?').run(userId);
+
+    const spotId = `SPOT-${userId}-${Date.now()}`;
+    db.prepare(`
+      INSERT INTO parking_spots (id, user_id, latitude, longitude, status, available_in_minutes, detection_method)
+      VALUES (?, ?, ?, ?, 'OCCUPIED', 0, ?)
+    `).run(spotId, userId, latitude, longitude, detectionMethod);
+
+    console.log(`[PARK] Utente ${userId} parcheggiato a (${latitude}, ${longitude}) via ${detectionMethod}`);
+    res.status(201).json({ success: true, spotId, status: 'OCCUPIED' });
+  } catch (err) {
+    console.error('Errore POST /park:', err);
+    res.status(500).json({ error: 'Errore registrazione parcheggio' });
+  }
+});
+
+// 4. POST /api/parking/leaving - Utente nel raggio di 100m dall'auto (stato LEAVING_SOON)
+app.post('/api/parking/leaving', (req, res) => {
+  try {
+    const { userId, availableInMinutes = 2 } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'Parametro richiesto: userId' });
+    }
+
+    const info = db.prepare(`
+      UPDATE parking_spots 
+      SET status = 'LEAVING_SOON', available_in_minutes = ?, updated_at = CURRENT_TIMESTAMP 
+      WHERE user_id = ?
+    `).run(availableInMinutes, userId);
+
+    if (info.changes === 0) {
+      return res.status(404).json({ error: 'Nessuna auto parcheggiata trovata per questo utente' });
+    }
+
+    console.log(`[LEAVING_SOON] Utente ${userId} entro 100m dall'auto. Libero tra ${availableInMinutes} min.`);
+    res.json({ success: true, status: 'LEAVING_SOON', availableInMinutes });
+  } catch (err) {
+    console.error('Errore POST /leaving:', err);
+    res.status(500).json({ error: 'Errore aggiornamento stato leaving' });
+  }
+});
+
+// 5. POST /api/parking/release - Utente ripartito con l'auto (stato FREE, pin verde per tutti)
+app.post('/api/parking/release', (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'Parametro richiesto: userId' });
+    }
+
+    const info = db.prepare(`
+      UPDATE parking_spots 
+      SET status = 'FREE', available_in_minutes = 0, updated_at = CURRENT_TIMESTAMP 
+      WHERE user_id = ?
+    `).run(userId);
+
+    if (info.changes === 0) {
+      return res.status(404).json({ error: 'Nessuno stallo da liberare per questo utente' });
+    }
+
+    console.log(`[FREE] Utente ${userId} ripartito. Stallo ora LIBERO sulla mappa.`);
+    res.json({ success: true, status: 'FREE' });
+  } catch (err) {
+    console.error('Errore POST /release:', err);
+    res.status(500).json({ error: 'Errore rilascio stallo' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server ParkAdvisor (Sensor Fusion Architecture) attivo sulla porta ${PORT}`);
 });
