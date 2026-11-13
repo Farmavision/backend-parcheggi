@@ -36,7 +36,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  static const String _backendBaseUrl = 'https://bug-free-space-couscous-7vgr7pjj9grqcpw4p-3000.app.github.dev';
+  static const String _backendBaseUrl = 'https://parknow-api.onrender.com';
   static const String _userId = 'USER-001';
 
   final MapController _mapController = MapController();
