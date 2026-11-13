@@ -1,33 +1,43 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
 const path = require('path');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
-// 1. Inizializzazione Database SQLite con Macchina a Stati Reale
-const dbPath = path.join(__dirname, 'parkadvisor.db');
-const db = new Database(dbPath);
+// Configurazione Storage: usa Supabase se configurato su Render, altrimenti SQLite locale
+const useSupabase = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY);
+let supabase = null;
+let db = null;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS parking_spots (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    latitude REAL NOT NULL,
-    longitude REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'OCCUPIED', -- 'OCCUPIED' | 'LEAVING_SOON' | 'FREE'
-    available_in_minutes INTEGER DEFAULT 0,
-    detection_method TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+if (useSupabase) {
+  const { createClient } = require('@supabase/supabase-js');
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+  console.log('Storage attivo: Supabase PostgreSQL');
+} else {
+  const Database = require('better-sqlite3');
+  const dbPath = path.join(__dirname, 'parkadvisor.db');
+  db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS parking_spots (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'OCCUPIED',
+      available_in_minutes INTEGER DEFAULT 0,
+      detection_method TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  console.log('Storage attivo: SQLite locale');
+}
 
-// Calcolo distanza Haversine in metri
 function getDistanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371e3;
   const φ1 = lat1 * Math.PI / 180;
@@ -42,23 +52,47 @@ function getDistanceMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+// 1. Health check per Render e monitoraggio uptime H24
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'ParkNow! API',
+    storage: useSupabase ? 'supabase' : 'sqlite'
+  });
+});
+
 // 2. GET /api/parking/nearby - Restituisce SOLO stalli FREE o LEAVING_SOON (non scaduti)
-app.get('/api/parking/nearby', (req, res) => {
+app.get('/api/parking/nearby', async (req, res) => {
   try {
     const { lat, lon, radius = 1500 } = req.query;
+    let rows = [];
 
-    // Pulizia automatica stalli FREE più vecchi di 15 minuti (TTL)
-    db.prepare(`
-      DELETE FROM parking_spots 
-      WHERE status = 'FREE' 
-      AND datetime(updated_at) < datetime('now', '-15 minutes')
-    `).run();
+    if (useSupabase) {
+      const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      await supabase
+        .from('parking_spots')
+        .delete()
+        .eq('status', 'FREE')
+        .lt('updated_at', fifteenMinAgo);
 
-    // Seleziona SOLO gli stalli in liberazione o liberi (mai gli OCCUPIED)
-    const rows = db.prepare(`
-      SELECT * FROM parking_spots 
-      WHERE status IN ('LEAVING_SOON', 'FREE')
-    `).all();
+      const { data, error } = await supabase
+        .from('parking_spots')
+        .select('*')
+        .in('status', ['LEAVING_SOON', 'FREE']);
+      if (error) throw error;
+      rows = data || [];
+    } else {
+      db.prepare(`
+        DELETE FROM parking_spots 
+        WHERE status = 'FREE' 
+        AND datetime(updated_at) < datetime('now', '-15 minutes')
+      `).run();
+
+      rows = db.prepare(`
+        SELECT * FROM parking_spots 
+        WHERE status IN ('LEAVING_SOON', 'FREE')
+      `).all();
+    }
 
     const formattedSpots = rows.map(row => {
       const distance = (lat && lon)
@@ -83,18 +117,15 @@ app.get('/api/parking/nearby', (req, res) => {
           .sort((a, b) => a.distanceMeters - b.distanceMeters)
       : formattedSpots;
 
-    res.json({
-      count: result.length,
-      spots: result
-    });
+    res.json({ count: result.length, spots: result });
   } catch (err) {
     console.error('Errore GET /nearby:', err);
     res.status(500).json({ error: 'Errore interno del database' });
   }
 });
 
-// 3. POST /api/parking/park - L'utente ha parcheggiato (stato OCCUPIED, invisibile agli altri)
-app.post('/api/parking/park', (req, res) => {
+// 3. POST /api/parking/park
+app.post('/api/parking/park', async (req, res) => {
   try {
     const { userId, latitude, longitude, detectionMethod = 'SENSOR_FUSION' } = req.body;
 
@@ -102,14 +133,30 @@ app.post('/api/parking/park', (req, res) => {
       return res.status(400).json({ error: 'Parametri richiesti: userId, latitude, longitude' });
     }
 
-    // Rimuove eventuali soste precedenti dello stesso utente
-    db.prepare('DELETE FROM parking_spots WHERE user_id = ?').run(userId);
-
     const spotId = `SPOT-${userId}-${Date.now()}`;
-    db.prepare(`
-      INSERT INTO parking_spots (id, user_id, latitude, longitude, status, available_in_minutes, detection_method)
-      VALUES (?, ?, ?, ?, 'OCCUPIED', 0, ?)
-    `).run(spotId, userId, latitude, longitude, detectionMethod);
+    const nowIso = new Date().toISOString();
+
+    if (useSupabase) {
+      await supabase.from('parking_spots').delete().eq('user_id', userId);
+      const { error } = await supabase.from('parking_spots').insert({
+        id: spotId,
+        user_id: userId,
+        latitude,
+        longitude,
+        status: 'OCCUPIED',
+        available_in_minutes: 0,
+        detection_method: detectionMethod,
+        created_at: nowIso,
+        updated_at: nowIso
+      });
+      if (error) throw error;
+    } else {
+      db.prepare('DELETE FROM parking_spots WHERE user_id = ?').run(userId);
+      db.prepare(`
+        INSERT INTO parking_spots (id, user_id, latitude, longitude, status, available_in_minutes, detection_method)
+        VALUES (?, ?, ?, ?, 'OCCUPIED', 0, ?)
+      `).run(spotId, userId, latitude, longitude, detectionMethod);
+    }
 
     console.log(`[PARK] Utente ${userId} parcheggiato a (${latitude}, ${longitude}) via ${detectionMethod}`);
     res.status(201).json({ success: true, spotId, status: 'OCCUPIED' });
@@ -119,8 +166,8 @@ app.post('/api/parking/park', (req, res) => {
   }
 });
 
-// 4. POST /api/parking/leaving - Utente nel raggio di 100m dall'auto (stato LEAVING_SOON)
-app.post('/api/parking/leaving', (req, res) => {
+// 4. POST /api/parking/leaving
+app.post('/api/parking/leaving', async (req, res) => {
   try {
     const { userId, availableInMinutes = 2 } = req.body;
 
@@ -128,14 +175,30 @@ app.post('/api/parking/leaving', (req, res) => {
       return res.status(400).json({ error: 'Parametro richiesto: userId' });
     }
 
-    const info = db.prepare(`
-      UPDATE parking_spots 
-      SET status = 'LEAVING_SOON', available_in_minutes = ?, updated_at = CURRENT_TIMESTAMP 
-      WHERE user_id = ?
-    `).run(availableInMinutes, userId);
+    if (useSupabase) {
+      const { data, error } = await supabase
+        .from('parking_spots')
+        .update({
+          status: 'LEAVING_SOON',
+          available_in_minutes: availableInMinutes,
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', userId)
+        .select();
+      if (error) throw error;
+      if (!data || data.length === 0) {
+        return res.status(404).json({ error: 'Nessuna auto parcheggiata trovata per questo utente' });
+      }
+    } else {
+      const info = db.prepare(`
+        UPDATE parking_spots 
+        SET status = 'LEAVING_SOON', available_in_minutes = ?, updated_at = CURRENT_TIMESTAMP 
+        WHERE user_id = ?
+      `).run(availableInMinutes, userId);
 
-    if (info.changes === 0) {
-      return res.status(404).json({ error: 'Nessuna auto parcheggiata trovata per questo utente' });
+      if (info.changes === 0) {
+        return res.status(404).json({ error: 'Nessuna auto parcheggiata trovata per questo utente' });
+      }
     }
 
     console.log(`[LEAVING_SOON] Utente ${userId} entro 100m dall'auto. Libero tra ${availableInMinutes} min.`);
@@ -146,8 +209,8 @@ app.post('/api/parking/leaving', (req, res) => {
   }
 });
 
-// 5. POST /api/parking/release - Utente ripartito con l'auto (stato FREE, pin verde per tutti)
-app.post('/api/parking/release', (req, res) => {
+// 5. POST /api/parking/release
+app.post('/api/parking/release', async (req, res) => {
   try {
     const { userId } = req.body;
 
@@ -155,14 +218,30 @@ app.post('/api/parking/release', (req, res) => {
       return res.status(400).json({ error: 'Parametro richiesto: userId' });
     }
 
-    const info = db.prepare(`
-      UPDATE parking_spots 
-      SET status = 'FREE', available_in_minutes = 0, updated_at = CURRENT_TIMESTAMP 
-      WHERE user_id = ?
-    `).run(userId);
+    if (useSupabase) {
+      const { data, error } = await supabase
+        .from('parking_spots')
+        .update({
+          status: 'FREE',
+          available_in_minutes: 0,
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', userId)
+        .select();
+      if (error) throw error;
+      if (!data || data.length === 0) {
+        return res.status(404).json({ error: 'Nessuno stallo da liberare per questo utente' });
+      }
+    } else {
+      const info = db.prepare(`
+        UPDATE parking_spots 
+        SET status = 'FREE', available_in_minutes = 0, updated_at = CURRENT_TIMESTAMP 
+        WHERE user_id = ?
+      `).run(userId);
 
-    if (info.changes === 0) {
-      return res.status(404).json({ error: 'Nessuno stallo da liberare per questo utente' });
+      if (info.changes === 0) {
+        return res.status(404).json({ error: 'Nessuno stallo da liberare per questo utente' });
+      }
     }
 
     console.log(`[FREE] Utente ${userId} ripartito. Stallo ora LIBERO sulla mappa.`);
@@ -173,6 +252,6 @@ app.post('/api/parking/release', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server ParkNow! (Sensor Fusion Architecture) attivo sulla porta ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server ParkNow! attivo sulla porta ${PORT}`);
 });
