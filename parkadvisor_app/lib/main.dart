@@ -1,3 +1,4 @@
+import 'profile_screen.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
@@ -448,6 +449,16 @@ class _HomeScreenState extends State<HomeScreen> {
         title: const Text('ParkNow!', style: TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.person),
+            tooltip: 'Profilo e Crediti',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const ProfileScreen()),
+              );
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.settings_bluetooth),
             tooltip: 'Configura BT Auto e Wi-Fi Casa/Lavoro',
