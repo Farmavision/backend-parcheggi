@@ -2,14 +2,16 @@ const https = require('https');
 
 function fetchBuffer(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers, timeout: 5000 }, (res) => {
+    const req = https.get(url, { headers, timeout: 6000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return resolve(fetchBuffer(res.headers.location, headers));
       }
       if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ buffer: Buffer.concat(chunks), type: res.headers['content-type'] || 'image/jpeg' }));
+      res.on('end', () => {
+        resolve({ buffer: Buffer.concat(chunks), type: res.headers['content-type'] || 'image/jpeg' });
+      });
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
@@ -48,11 +50,16 @@ module.exports = function registerParkingRoutes(app, { useSupabase, supabase, db
   async function findUser(uid) {
     if (!uid) return null;
     if (useSupabase) {
-      let r = await supabase.from('users').select('*').eq('id', uid).maybeSingle();
-      if (!r.data) r = await supabase.from('users').select('*').eq('user_id', uid).maybeSingle();
-      return r.data || null;
+      for (const col of ['external_user_id', 'id', 'user_id']) {
+        const r = await supabase.from('users').select('*').eq(col, uid).maybeSingle();
+        if (r.data) return { row: r.data, keyCol: col };
+      }
+      return null;
     }
-    try { return db.prepare('SELECT * FROM users WHERE id = ?').get(uid) || null; } catch (_) { return null; }
+    try {
+      const row = db.prepare('SELECT * FROM users WHERE external_user_id = ? OR id = ?').get(uid, uid);
+      return row ? { row, keyCol: 'id' } : null;
+    } catch (_) { return null; }
   }
 
   app.post('/api/parking/reserve', async (req, res) => {
@@ -71,24 +78,31 @@ module.exports = function registerParkingRoutes(app, { useSupabase, supabase, db
 
       const settings = await getSystemSettings();
       const fee = Number(settings.fee_search ?? settings.search_fee ?? 5);
-      const user = await findUser(userId);
+      const foundUser = await findUser(userId);
+      const user = foundUser ? foundUser.row : null;
       const curBal = user ? Number(user.credits_balance ?? user.credits ?? 50) : 50;
       if (curBal < fee) return res.status(400).json({ error: 'Crediti insufficienti' });
       const newBalance = curBal - fee;
 
       if (useSupabase) {
         if (user) {
-          const col = 'credits_balance' in user ? 'credits_balance' : 'credits';
-          const keyCol = 'id' in user ? 'id' : 'user_id';
-          await supabase.from('users').update({ [col]: newBalance }).eq(keyCol, user[keyCol]);
+          const balCol = 'credits_balance' in user ? 'credits_balance' : 'credits';
+          const kCol = foundUser.keyCol;
+          await supabase.from('users').update({ [balCol]: newBalance }).eq(kCol, user[kCol]);
         }
-        await supabase.from('parking_spots').update({ status: 'RESERVED', updated_at: new Date().toISOString() }).eq('id', spotId);
+        await supabase.from('parking_spots')
+          .update({ status: 'RESERVED', updated_at: new Date().toISOString() })
+          .eq('id', spotId);
       } else {
-        db.prepare("UPDATE parking_spots SET status = 'RESERVED', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(spotId);
+        db.prepare("UPDATE parking_spots SET status = 'RESERVED', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+          .run(spotId);
       }
 
-      const owner = await findUser(spot.user_id);
-      const rawPlate = String(owner?.license_plate || owner?.plate || '').replace(/\s+/g, '');
+      const foundOwner = await findUser(spot.user_id);
+      const owner = foundOwner ? foundOwner.row : null;
+      const visRaw = String(owner?.car_plate_visible || owner?.license_plate || owner?.plate || '')
+        .replace(/\*/g, '')
+        .replace(/\s+/g, '');
       const { isFreeNow, rem } = computeWait(spot);
       const address = await reverseGeocode(spot.latitude, spot.longitude);
 
@@ -106,7 +120,7 @@ module.exports = function registerParkingRoutes(app, { useSupabase, supabase, db
             brand: String(owner?.car_brand || owner?.brand || ''),
             model: String(owner?.car_model || owner?.model || ''),
             color: String(owner?.car_color || owner?.color || ''),
-            plateVisible: rawPlate.length >= 2 ? rawPlate.slice(-2) : rawPlate,
+            plateVisible: visRaw.length >= 2 ? visRaw.slice(-2) : visRaw,
           },
         },
       });
@@ -131,16 +145,44 @@ module.exports = function registerParkingRoutes(app, { useSupabase, supabase, db
   });
 
   app.get('/api/parking/streetview', async (req, res) => {
-    const { lat, lon } = req.query;
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return res.status(400).end();
+
     const key = process.env.GOOGLE_MAPS_API_KEY;
-    if (!lat || !lon || !key) return res.status(404).end();
+    if (key) {
+      try {
+        const gUrl = `https://maps.googleapis.com/maps/api/streetview?size=640x360&location=${lat},${lon}&fov=90&pitch=0&source=outdoor&key=${key}`;
+        const { buffer, type } = await fetchBuffer(gUrl);
+        res.set('Content-Type', type);
+        return res.send(buffer);
+      } catch (_) {}
+    }
+
     try {
-      const url = `https://maps.googleapis.com/maps/api/streetview?size=640x360&location=${lat},${lon}&fov=90&pitch=0&source=outdoor&key=${key}`;
-      const { buffer, type } = await fetchBuffer(url);
+      const dLat = 0.00055;
+      const dLon = 0.00095 / Math.max(0.2, Math.cos((lat * Math.PI) / 180));
+      const bbox = `${lon - dLon},${lat - dLat},${lon + dLon},${lat + dLat}`;
+      const arcUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${bbox}&bboxSR=4326&imageSR=4326&size=640,360&format=jpg&f=image`;
+      const { buffer, type } = await fetchBuffer(arcUrl, { 'User-Agent': 'ParkNowApp/1.0' });
+      if (type.startsWith('image/')) {
+        res.set('Content-Type', type);
+        return res.send(buffer);
+      }
+    } catch (_) {}
+
+    try {
+      const z = 18;
+      const n = Math.pow(2, z);
+      const x = Math.floor(((lon + 180) / 360) * n);
+      const rad = (lat * Math.PI) / 180;
+      const y = Math.floor(((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2) * n);
+      const tileUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+      const { buffer, type } = await fetchBuffer(tileUrl, { 'User-Agent': 'ParkNowApp/1.0' });
       res.set('Content-Type', type);
-      res.send(buffer);
+      return res.send(buffer);
     } catch (_) {
-      res.status(404).end();
+      return res.status(404).end();
     }
   });
 };
