@@ -7,8 +7,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
-require('./admin_routes')(app, { useSupabase, supabase, db, getSystemSettings });
-
 const useSupabase = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY);
 let supabase = null;
 let db = null;
@@ -262,5 +260,7 @@ app.post('/api/admin/settings', async (req, res) => {
 });
 
 require('./parking_routes')(app, { useSupabase, supabase, db, getSystemSettings });
+
+require('./admin_routes')(app, { useSupabase, supabase, db, getSystemSettings });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Server ParkNow! attivo sulla porta ${PORT}`));
