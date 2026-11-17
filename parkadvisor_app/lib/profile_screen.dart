@@ -57,14 +57,47 @@ class _ProfileScreenState extends State<ProfileScreen> {
     });
 
     try {
-      final res = await http.get(Uri.parse('$_backendBaseUrl/api/user/profile?userId=$_userId')).timeout(const Duration(seconds: 8));
+      final res = await http.get(Uri.parse('$_backendBaseUrl/api/user/profile?userId=$_userId')).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200 && mounted) {
         final data = json.decode(res.body);
         final remoteCredits = (data['credits_balance'] as num?)?.toInt();
-        if (remoteCredits != null) {
-          await prefs.setInt('credits_balance', remoteCredits);
-          setState(() => _creditsBalance = remoteCredits);
+        final remotePhone = data['phone_number'] as String?;
+        final remoteBrand = data['car_brand'] as String?;
+        final remoteModel = data['car_model'] as String?;
+        final remoteColor = data['car_color'] as String?;
+        final remoteAutoShare = data['auto_share_enabled'] as bool?;
+        final remoteRadius = (data['search_radius_m'] as num?)?.toInt();
+        final remoteWifi = data['home_wifi_ssid'] as String?;
+        final remoteBt = data['car_bluetooth_mac'] as String?;
+        String decodedPlate = '';
+        final encPlate = data['car_plate_encrypted'] as String?;
+        if (encPlate != null && encPlate.isNotEmpty) {
+          try { decodedPlate = utf8.decode(base64Decode(encPlate)); } catch (_) {}
         }
+
+        if (remoteCredits != null) await prefs.setInt('credits_balance', remoteCredits);
+        if (remotePhone != null) await prefs.setString('user_phone', remotePhone);
+        if (remoteBrand != null) await prefs.setString('car_brand', remoteBrand);
+        if (remoteModel != null) await prefs.setString('car_model', remoteModel);
+        if (remoteColor != null) await prefs.setString('car_color', remoteColor);
+        if (decodedPlate.isNotEmpty) await prefs.setString('car_plate', decodedPlate);
+        if (remoteAutoShare != null) await prefs.setBool('auto_share_enabled', remoteAutoShare);
+        if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) await prefs.setInt('search_radius_m', remoteRadius);
+        if (remoteWifi != null) await prefs.setString('home_wifi_ssid', remoteWifi);
+        if (remoteBt != null) await prefs.setString('car_bt_mac', remoteBt);
+
+        setState(() {
+          if (remoteCredits != null) _creditsBalance = remoteCredits;
+          if (remotePhone != null) _phoneController.text = remotePhone;
+          if (remoteBrand != null) _brandController.text = remoteBrand;
+          if (remoteModel != null) _modelController.text = remoteModel;
+          if (remoteColor != null) _colorController.text = remoteColor;
+          if (decodedPlate.isNotEmpty) _plateController.text = decodedPlate;
+          if (remoteAutoShare != null) _autoShare = remoteAutoShare;
+          if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) _searchRadius = remoteRadius;
+          if (remoteWifi != null) _wifiController.text = remoteWifi;
+          if (remoteBt != null) _btController.text = remoteBt;
+        });
       }
     } catch (_) {}
   }
@@ -82,6 +115,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (_wifiController.text.trim().isNotEmpty) await prefs.setString('home_wifi_ssid', _wifiController.text.trim());
     if (_btController.text.trim().isNotEmpty) await prefs.setString('car_bt_mac', _btController.text.trim().toUpperCase());
 
+    bool cloudSynced = false;
+    String? syncError;
     try {
       final res = await http.post(
         Uri.parse('$_backendBaseUrl/api/user/profile'),
@@ -98,20 +133,32 @@ class _ProfileScreenState extends State<ProfileScreen> {
           'homeWifiSsid': _wifiController.text.trim(),
           'carBluetoothMac': _btController.text.trim().toUpperCase(),
         }),
-      ).timeout(const Duration(seconds: 10));
+      ).timeout(const Duration(seconds: 15));
       if (res.statusCode == 200) {
+        cloudSynced = true;
         final data = json.decode(res.body);
         final bal = (data['profile']?['credits_balance'] as num?)?.toInt();
         if (bal != null) {
           await prefs.setInt('credits_balance', bal);
           if (mounted) setState(() => _creditsBalance = bal);
         }
+      } else {
+        syncError = 'HTTP ${res.statusCode}';
       }
-    } catch (_) {}
+    } catch (e) {
+      syncError = 'Connessione lenta o server in avvio';
+    }
 
     if (!mounted) return;
     setState(() => _isSaving = false);
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Profilo e preferenze salvati!')));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: cloudSynced ? Colors.green.shade700 : Colors.orange.shade800,
+        content: Text(cloudSynced
+            ? 'Profilo salvato e sincronizzato sul cloud!'
+            : 'Salvato sul telefono (sync cloud rimandata: $syncError)'),
+      ),
+    );
   }
 
   @override
