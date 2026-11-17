@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -44,6 +45,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoadingApi = false;
   bool _hasUserLocation = false;
   int _searchRadiusM = 500;
+  Timer? _syncTimer;
 
   Map<String, String> get _headers => {'Content-Type': 'application/json', 'Accept': 'application/json'};
 
@@ -69,6 +71,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {});
     });
     _initPermissionsAndEngine();
+    _syncTimer = Timer.periodic(const Duration(seconds: 15), (_) => _syncLiveMapAndSpotState());
   }
 
   Future<void> _loadSearchRadius() async {
@@ -207,8 +210,39 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _fetchAvailableSpots(double lat, double lon) async {
-    setState(() { _isLoadingApi = true; _apiStatus = 'Ricerca stalli entro ${_searchRadiusM}m...'; });
+  Future<void> _syncLiveMapAndSpotState() async {
+    if (!mounted) return;
+    await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude, silent: true);
+    if (_sensorEngine.isManualReleaseConfirmed) {
+      try {
+        final res = await http.get(Uri.parse("$_backendBaseUrl/api/parking/my-spot?userId=$_userId")).timeout(const Duration(seconds: 8));
+        if (res.statusCode == 200 && mounted) {
+          final spot = json.decode(res.body)['spot'];
+          if (spot == null || spot['status'] == 'OCCUPIED') {
+            _sensorEngine.resetExpiredReleaseConfirmation();
+            final profRes = await http.get(Uri.parse("$_backendBaseUrl/api/user/profile?userId=$_userId")).timeout(const Duration(seconds: 8));
+            int? newBal;
+            if (profRes.statusCode == 200) {
+              newBal = (json.decode(profRes.body)['credits_balance'] as num?)?.toInt();
+              if (newBal != null) {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setInt('credits_balance', newBal);
+              }
+            }
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                backgroundColor: Colors.red.shade700,
+                content: Text("Anti-frode: stallo non liberato entro il limite. Rimosso dalla mappa${newBal != null ? ' (Saldo: $newBal)' : ''}."),
+              ));
+            }
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _fetchAvailableSpots(double lat, double lon, {bool silent = false}) async {
+    if (!silent) setState(() { _isLoadingApi = true; _apiStatus = 'Ricerca stalli entro ${_searchRadiusM}m...'; });
     try {
       final url = Uri.parse('$_backendBaseUrl/api/parking/nearby?lat=$lat&lon=$lon&radius=$_searchRadiusM');
       final response = await http.get(url, headers: _headers).timeout(const Duration(seconds: 10));
@@ -270,6 +304,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _syncTimer?.cancel();
     _sensorEngine.dispose();
     super.dispose();
   }

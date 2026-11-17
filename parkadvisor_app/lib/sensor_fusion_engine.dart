@@ -416,6 +416,16 @@ class SensorFusionEngine extends ChangeNotifier {
     notifyListeners();
   }
 
+  void resetExpiredReleaseConfirmation() {
+    if (_manualReleaseConfirmed || currentState == VehicleState.leavingSoon) {
+      _manualReleaseConfirmed = false;
+      _notified100m = false;
+      _lastSentEta = null;
+      if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
+      notifyListeners();
+    }
+  }
+
   Future<void> forceReleaseCar() async => await _triggerCarReleased(force: true);
 
   @override

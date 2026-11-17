@@ -83,6 +83,19 @@ app.get('/', async (req, res) => {
   res.json({ status: 'ok', service: 'ParkNow! API', storage: useSupabase ? 'supabase' : 'sqlite' });
 });
 
+app.get('/api/parking/my-spot', async (req, res) => {
+  try {
+    await processExpiredReleaseVerifications();
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId richiesto' });
+    if (!useSupabase) return res.json({ spot: null });
+    const { data } = await supabase.from('parking_spots').select('*').eq('user_id', userId).maybeSingle();
+    res.json({ spot: data || null });
+  } catch (err) {
+    res.status(500).json({ error: 'Errore controllo stallo utente' });
+  }
+});
+
 app.get('/api/parking/nearby', async (req, res) => {
   try {
     await processExpiredReleaseVerifications();
