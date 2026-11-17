@@ -480,6 +480,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   context,
                   MaterialPageRoute(
                     builder: (_) => SearchParkingScreen(
+                      userId: _userId,
                       sensorEngine: _sensorEngine,
                       backendBaseUrl: _backendBaseUrl,
                       searchRadiusM: _searchRadiusM,
