@@ -2,12 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'map_modes_screen.dart';
 import 'profile_screen.dart';
 import 'sensor_fusion_engine.dart';
 
@@ -36,16 +35,10 @@ class _HomeScreenState extends State<HomeScreen> {
   static const String _backendBaseUrl = 'https://parknow-api.onrender.com';
   static const String _userId = 'USER-001';
 
-  final MapController _mapController = MapController();
-  LatLng _currentCenter = const LatLng(41.85784, 12.55860);
-
   late SensorFusionEngine _sensorEngine;
-  List<dynamic> _availableSpots = [];
-  String _apiStatus = 'Sincronizzazione mappa...';
-  bool _isLoadingApi = false;
-  bool _hasUserLocation = false;
   int _searchRadiusM = 500;
-  Timer? _syncTimer;
+  int _creditsBalance = 50;
+  Timer? _antiFraudWatchTimer;
 
   Map<String, String> get _headers => {'Content-Type': 'application/json', 'Accept': 'application/json'};
 
@@ -63,28 +56,68 @@ class _HomeScreenState extends State<HomeScreen> {
       onUnknownBluetoothDetected: _promptSaveUnknownBluetooth,
     );
     _sensorEngine.addListener(() {
-      if (!mounted) return;
-      if (_sensorEngine.currentUserLat != null && _sensorEngine.currentUserLon != null) {
-        _currentCenter = LatLng(_sensorEngine.currentUserLat!, _sensorEngine.currentUserLon!);
-        _hasUserLocation = true;
-      }
-      setState(() {});
+      if (mounted) setState(() {});
     });
-    _initPermissionsAndEngine();
-    _syncTimer = Timer.periodic(const Duration(seconds: 15), (_) => _syncLiveMapAndSpotState());
+    _initApp();
+    _antiFraudWatchTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkPendingReleaseExpiration());
   }
 
-  Future<void> _loadSearchRadius() async {
+  Future<void> _loadLocalAndRemoteUser() async {
     final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getInt('search_radius_m') ?? 500;
-    if (mounted) setState(() => _searchRadiusM = saved);
+    if (mounted) {
+      setState(() {
+        _searchRadiusM = prefs.getInt('search_radius_m') ?? 500;
+        _creditsBalance = prefs.getInt('credits_balance') ?? 50;
+      });
+    }
+    try {
+      final res = await http
+          .get(Uri.parse('$_backendBaseUrl/api/user/profile?userId=$_userId'))
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200 && mounted) {
+        final data = json.decode(res.body);
+        final remoteBal = (data['credits_balance'] as num?)?.toInt();
+        final remoteRad = (data['search_radius_m'] as num?)?.toInt();
+        if (remoteBal != null) {
+          await prefs.setInt('credits_balance', remoteBal);
+          setState(() => _creditsBalance = remoteBal);
+        }
+        if (remoteRad != null) {
+          await prefs.setInt('search_radius_m', remoteRad);
+          setState(() => _searchRadiusM = remoteRad);
+        }
+      }
+    } catch (_) {}
   }
 
-  Future<void> _initPermissionsAndEngine() async {
-    await _loadSearchRadius();
+  Future<void> _initApp() async {
+    await _loadLocalAndRemoteUser();
     await Geolocator.requestPermission();
     await _sensorEngine.initialize();
-    await _centerAndRefreshMap();
+  }
+
+  Future<void> _checkPendingReleaseExpiration() async {
+    if (!mounted || !_sensorEngine.isManualReleaseConfirmed) return;
+    try {
+      final res = await http
+          .get(Uri.parse('$_backendBaseUrl/api/parking/my-spot?userId=$_userId'))
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200 && mounted) {
+        final spot = json.decode(res.body)['spot'];
+        if (spot == null || spot['status'] == 'OCCUPIED') {
+          _sensorEngine.resetExpiredReleaseConfirmation();
+          await _loadLocalAndRemoteUser();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                backgroundColor: Colors.red.shade700,
+                content: Text('Anti-frode: stallo non liberato entro il limite. Penalità applicata (Saldo: $_creditsBalance).'),
+              ),
+            );
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   void _promptSaveUnknownWifi(String ssid) {
@@ -122,9 +155,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _handleCarParked(double lat, double lon, String method) async {
     try {
-      await http.post(Uri.parse('$_backendBaseUrl/api/parking/park'), headers: _headers,
-        body: json.encode({'userId': _userId, 'latitude': lat, 'longitude': lon, 'detectionMethod': method}));
-      await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/park'),
+        headers: _headers,
+        body: json.encode({'userId': _userId, 'latitude': lat, 'longitude': lon, 'detectionMethod': method}),
+      );
     } catch (_) {}
   }
 
@@ -132,21 +167,24 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     SystemSound.play(SystemSoundType.alert);
     HapticFeedback.heavyImpact();
+    final minLabel = estimatedMinutes == 1 ? '1 minuto' : '$estimatedMinutes minuti';
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         icon: const Icon(Icons.notifications_active, color: Colors.orange, size: 34),
         title: const Text('Stai tornando all\'auto (< 100m)'),
         content: Text(
-          'Confermi che stai liberando il parcheggio tra circa $estimatedMinutes minuti?\n\n'
-          'Nota anti-frode: i crediti vengono accreditati alla partenza entro il tempo limite; in caso di mancata partenza scatta una penalità.\n\n'
-          'Se ignori questo avviso, il rilascio partirà in automatico all\'aggancio BT/GPS/Giroscopio (se attivo nel profilo).',
+          'Confermi che stai liberando il parcheggio tra circa $minLabel (camminata + 1 min messa in moto)?\n\n'
+          'Nota anti-frode: i crediti vengono accreditati alla partenza entro il tempo limite; in caso di mancata partenza scatta una penalità.',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Ignora')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade800, foregroundColor: Colors.white),
-            onPressed: () async { Navigator.pop(ctx); await _sensorEngine.confirmManualReleaseIntent(); },
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await _sensorEngine.confirmManualReleaseIntent();
+            },
             child: const Text('Conferma rilascio'),
           ),
         ],
@@ -154,20 +192,32 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> _handleEtaUpdated(int m) async {
-    try { await http.post(Uri.parse("$_backendBaseUrl/api/parking/leaving"), headers: _headers, body: json.encode({"userId": _userId, "availableInMinutes": m})); } catch (_) {}
-  }
   Future<void> _handleManualReleaseConfirmed(int estimatedMinutes) async {
     try {
-      final res = await http.post(Uri.parse('$_backendBaseUrl/api/parking/confirm-release'), headers: _headers,
-        body: json.encode({'userId': _userId, 'availableInMinutes': estimatedMinutes}));
+      final res = await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/confirm-release'),
+        headers: _headers,
+        body: json.encode({'userId': _userId, 'availableInMinutes': estimatedMinutes}),
+      );
       if (res.statusCode == 200 && mounted) {
         final delta = json.decode(res.body)['deltaMinutes'] ?? 5;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(backgroundColor: Colors.orange.shade800, content: Text('Rilascio confermato! Libera il posto entro $delta min per ricevere i crediti.')),
+          SnackBar(
+            backgroundColor: Colors.orange.shade800,
+            content: Text('Rilascio confermato ($estimatedMinutes min)! Libera entro $delta min per ricevere i crediti.'),
+          ),
         );
       }
-      await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
+    } catch (_) {}
+  }
+
+  Future<void> _handleEtaUpdated(int m) async {
+    try {
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/leaving'),
+        headers: _headers,
+        body: json.encode({'userId': _userId, 'availableInMinutes': m}),
+      );
     } catch (_) {}
   }
 
@@ -180,85 +230,30 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _handleCarReleased() async {
     try {
-      final res = await http.post(Uri.parse('$_backendBaseUrl/api/parking/release'), headers: _headers,
-        body: json.encode({'userId': _userId}));
+      final res = await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/release'),
+        headers: _headers,
+        body: json.encode({'userId': _userId}),
+      );
       if (res.statusCode == 200 && mounted) {
         final data = json.decode(res.body);
         final awarded = data['creditsAwarded'] ?? 0;
-        final balance = data['newBalance'];
-        if (awarded > 0) {
+        final balance = (data['newBalance'] as num?)?.toInt();
+        if (balance != null) {
           final prefs = await SharedPreferences.getInstance();
-          if (balance != null) await prefs.setInt('credits_balance', (balance as num).toInt());
+          await prefs.setInt('credits_balance', balance);
+          setState(() => _creditsBalance = balance);
+        }
+        if (awarded > 0) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(backgroundColor: Colors.green.shade700, content: Text('Stallo liberato! +$awarded crediti accreditati (Saldo: $balance)')),
+            SnackBar(
+              backgroundColor: Colors.green.shade700,
+              content: Text('Stallo liberato! +$awarded crediti accreditati (Saldo: $_creditsBalance)'),
+            ),
           );
         }
       }
-      await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
     } catch (_) {}
-  }
-
-  Future<void> _centerAndRefreshMap() async {
-    try {
-      Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-      final newPos = LatLng(pos.latitude, pos.longitude);
-      setState(() { _currentCenter = newPos; _hasUserLocation = true; });
-      _mapController.move(newPos, 17.0);
-      await _fetchAvailableSpots(pos.latitude, pos.longitude);
-    } catch (e) {
-      setState(() => _apiStatus = 'Errore GPS: $e');
-    }
-  }
-
-  Future<void> _syncLiveMapAndSpotState() async {
-    if (!mounted) return;
-    await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude, silent: true);
-    if (_sensorEngine.isManualReleaseConfirmed) {
-      try {
-        final res = await http.get(Uri.parse("$_backendBaseUrl/api/parking/my-spot?userId=$_userId")).timeout(const Duration(seconds: 8));
-        if (res.statusCode == 200 && mounted) {
-          final spot = json.decode(res.body)['spot'];
-          if (spot == null || spot['status'] == 'OCCUPIED') {
-            _sensorEngine.resetExpiredReleaseConfirmation();
-            final profRes = await http.get(Uri.parse("$_backendBaseUrl/api/user/profile?userId=$_userId")).timeout(const Duration(seconds: 8));
-            int? newBal;
-            if (profRes.statusCode == 200) {
-              newBal = (json.decode(profRes.body)['credits_balance'] as num?)?.toInt();
-              if (newBal != null) {
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.setInt('credits_balance', newBal);
-              }
-            }
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                backgroundColor: Colors.red.shade700,
-                content: Text("Anti-frode: stallo non liberato entro il limite. Rimosso dalla mappa${newBal != null ? ' (Saldo: $newBal)' : ''}."),
-              ));
-            }
-          }
-        }
-      } catch (_) {}
-    }
-  }
-
-  Future<void> _fetchAvailableSpots(double lat, double lon, {bool silent = false}) async {
-    if (!silent) setState(() { _isLoadingApi = true; _apiStatus = 'Ricerca stalli entro ${_searchRadiusM}m...'; });
-    try {
-      final url = Uri.parse('$_backendBaseUrl/api/parking/nearby?lat=$lat&lon=$lon&radius=$_searchRadiusM');
-      final response = await http.get(url, headers: _headers).timeout(const Duration(seconds: 10));
-      if (response.statusCode == 200) {
-        final spots = json.decode(response.body)['spots'] as List<dynamic>? ?? [];
-        setState(() {
-          _availableSpots = spots;
-          _apiStatus = spots.isEmpty ? 'Nessuno stallo entro ${_searchRadiusM}m' : '${spots.length} stalli disponibili entro ${_searchRadiusM}m';
-          _isLoadingApi = false;
-        });
-      } else {
-        setState(() { _apiStatus = 'Errore server (HTTP ${response.statusCode})'; _isLoadingApi = false; });
-      }
-    } catch (e) {
-      setState(() { _apiStatus = 'Errore connessione: $e'; _isLoadingApi = false; });
-    }
   }
 
   Future<void> _openConnectivityProfileDialog() async {
@@ -268,7 +263,7 @@ class _HomeScreenState extends State<HomeScreen> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Profilo Connettività'),
+        title: const Text('Connettività Auto & Casa'),
         content: SingleChildScrollView(
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text('Wi-Fi attuale: ${_sensorEngine.currentConnectedWifiSsid ?? "Non connesso"}', style: const TextStyle(fontSize: 12)),
@@ -291,128 +286,271 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildCarSpotBadge(Color c, {int? mins}) => Container(
-    decoration: BoxDecoration(color: c, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2.5)),
-    alignment: Alignment.center,
-    child: mins != null
-        ? Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Text("$mins", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15, height: 1.0)),
-            const Text("min", style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 9, height: 1.0)),
-          ])
-        : const Icon(Icons.directions_car, color: Colors.white, size: 22),
-  );
+  Widget _buildPrimaryActionTile({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required Color startColor,
+    required Color endColor,
+    required VoidCallback onTap,
+    String? badgeText,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(18),
+        child: Ink(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(colors: [startColor, endColor], begin: Alignment.topLeft, end: Alignment.bottomRight),
+            borderRadius: BorderRadius.circular(18),
+            boxShadow: [BoxShadow(color: startColor.withValues(alpha: 0.3), blurRadius: 8, offset: const Offset(0, 4))],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.2), shape: BoxShape.circle),
+                  child: Icon(icon, color: Colors.white, size: 30),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(title, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                          if (badgeText != null) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+                              child: Text(badgeText, style: TextStyle(color: startColor, fontSize: 11, fontWeight: FontWeight.bold)),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(subtitle, style: TextStyle(color: Colors.white.withValues(alpha: 0.9), fontSize: 13)),
+                    ],
+                  ),
+                ),
+                const Icon(Icons.arrow_forward_ios, color: Colors.white, size: 18),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   @override
   void dispose() {
-    _syncTimer?.cancel();
+    _antiFraudWatchTimer?.cancel();
     _sensorEngine.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final List<Marker> markers = [];
-    if (_hasUserLocation) {
-      markers.add(Marker(point: _currentCenter, width: 36, height: 36, child: const Icon(Icons.my_location, color: Colors.blue, size: 26)));
-    }
-    if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
-      markers.add(Marker(
-        point: LatLng(_sensorEngine.parkedLat!, _sensorEngine.parkedLon!), width: 44, height: 44,
-        child: _buildCarSpotBadge(_sensorEngine.isManualReleaseConfirmed ? Colors.orange : Colors.indigo, mins: _sensorEngine.isManualReleaseConfirmed ? _sensorEngine.estimatedMinutesToRelease : null),
-      ));
-    }
-    for (var spot in _availableSpots) {
-      final double sLat = (spot['latitude'] as num).toDouble(), sLon = (spot['longitude'] as num).toDouble();
-      if (_sensorEngine.parkedLat != null && Geolocator.distanceBetween(sLat, sLon, _sensorEngine.parkedLat!, _sensorEngine.parkedLon!) < 3.0) continue;
-      final bool isLeaving = spot['status'] == 'LEAVING_SOON';
-      markers.add(Marker(
-        point: LatLng(sLat, sLon), width: 44, height: 44,
-        child: GestureDetector(
-          onTap: () => ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(isLeaving ? 'In liberazione tra ${spot['availableInMinutes']} min (${spot['distanceMeters']}m)' : 'Stallo LIBERO (${spot['distanceMeters']}m)'),
-          )),
-          child: _buildCarSpotBadge(isLeaving ? Colors.orange : Colors.green, mins: isLeaving ? ((spot['availableInMinutes'] as num?)?.toInt() ?? 1) : null),
-        ),
-      ));
-    }
+    final bool hasParkedCar = _sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null;
+    final bool isReleasing = _sensorEngine.isManualReleaseConfirmed;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('ParkNow!', style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        backgroundColor: Colors.indigo.shade800,
+        foregroundColor: Colors.white,
         actions: [
+          Center(
+            child: Container(
+              margin: const EdgeInsets.only(right: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.18), borderRadius: BorderRadius.circular(20)),
+              child: Row(
+                children: [
+                  const Icon(Icons.account_balance_wallet, size: 16, color: Colors.amberAccent),
+                  const SizedBox(width: 5),
+                  Text('$_creditsBalance', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                ],
+              ),
+            ),
+          ),
+          IconButton(icon: const Icon(Icons.settings_bluetooth), tooltip: 'BT Auto e Wi-Fi Casa', onPressed: _openConnectivityProfileDialog),
           IconButton(
             icon: const Icon(Icons.person),
-            tooltip: 'Profilo, Veicolo e Crediti',
+            tooltip: 'Profilo e Impostazioni',
             onPressed: () async {
               await Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen()));
-              await _loadSearchRadius();
+              await _loadLocalAndRemoteUser();
               await _sensorEngine.reloadUserPreferences();
-              await _fetchAvailableSpots(_currentCenter.latitude, _currentCenter.longitude);
             },
           ),
-          IconButton(icon: const Icon(Icons.settings_bluetooth), onPressed: _openConnectivityProfileDialog),
         ],
       ),
-      body: Column(children: [
-        Expanded(
-          flex: 52,
-          child: Stack(children: [
-            FlutterMap(
-              mapController: _mapController,
-              options: MapOptions(initialCenter: _currentCenter, initialZoom: 17.0),
-              children: [
-                TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'com.example.parkadvisor_app'),
-                MarkerLayer(markers: markers),
-              ],
-            ),
-            Positioned(
-              top: 10, left: 10, right: 10,
-              child: Card(child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(children: [
-                  Icon(_isLoadingApi ? Icons.sync : Icons.local_parking, color: Colors.green),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(_apiStatus, style: const TextStyle(fontWeight: FontWeight.w600))),
-                  IconButton(icon: const Icon(Icons.refresh), onPressed: _centerAndRefreshMap),
-                ]),
-              )),
-            ),
-          ]),
-        ),
-        Expanded(
-          flex: 48,
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(14),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                const Text('Stato Sensor Fusion:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                Chip(
-                  label: Text(_sensorEngine.currentState.name.toUpperCase(), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
-                  backgroundColor: _sensorEngine.currentState == VehicleState.stayAtHome ? Colors.teal : Colors.indigo,
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            // 1. Scheda Stato Sosta e Rilascio rapido
+            Card(
+              elevation: 2,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              color: isReleasing
+                  ? Colors.orange.shade50
+                  : hasParkedCar
+                      ? Colors.indigo.shade50
+                      : Colors.grey.shade100,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          isReleasing
+                              ? Icons.timer
+                              : hasParkedCar
+                                  ? Icons.local_parking
+                                  : Icons.sensors,
+                          color: isReleasing ? Colors.orange.shade800 : Colors.indigo.shade800,
+                          size: 28,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                isReleasing
+                                    ? 'Rilascio confermato (${_sensorEngine.estimatedMinutesToRelease} min)'
+                                    : hasParkedCar
+                                        ? 'Auto parcheggiata'
+                                        : 'Stato: ${_sensorEngine.currentState.name.toUpperCase()}',
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                              ),
+                              Text(
+                                isReleasing
+                                    ? 'Libera il posto entro il tempo limite per ricevere i crediti'
+                                    : hasParkedCar
+                                        ? (_sensorEngine.distanceFromCarMeters != null
+                                            ? 'Distanza attuale: ${_sensorEngine.distanceFromCarMeters!.round()} m dal veicolo'
+                                            : 'Posizione salvata e protetta')
+                                        : 'Sensor Fusion attiva • Auto-share ${_sensorEngine.autoShareEnabled ? "ON" : "OFF"}',
+                                style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (hasParkedCar && !isReleasing) ...[
+                      const SizedBox(height: 12),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange.shade800,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                        icon: const Icon(Icons.notifications_active),
+                        label: const Text('Sto tornando all\'auto • Segnala rilascio', style: TextStyle(fontWeight: FontWeight.bold)),
+                        onPressed: () async => await _sensorEngine.confirmManualReleaseIntent(),
+                      ),
+                    ],
+                  ],
                 ),
-              ]),
-              const SizedBox(height: 6),
-              Text('Velocità: ${_sensorEngine.currentSpeedKmh.toStringAsFixed(1)} km/h | Giroscopio: ${_sensorEngine.gyroscopeMagnitude.toStringAsFixed(2)} rad/s', style: const TextStyle(fontSize: 13)),
-              Text('Pedometro: ${_sensorEngine.pedestrianStatus} (${_sensorEngine.sessionSteps} passi) | Auto-share: ${_sensorEngine.autoShareEnabled ? "ON" : "OFF"}', style: const TextStyle(fontSize: 13)),
-              Text('BT Auto: ${_sensorEngine.targetCarBluetoothName ?? _sensorEngine.targetCarBluetoothMac ?? "Non associato"} | Raggio: ${_searchRadiusM}m', style: const TextStyle(fontSize: 13)),
-              if (_sensorEngine.distanceFromCarMeters != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Text('Distanza dall\'auto: ${_sensorEngine.distanceFromCarMeters!.toStringAsFixed(1)} m (Soglia: 100m)', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.indigo)),
-                ),
-              const Divider(height: 20),
-              Row(children: [
-                Expanded(child: OutlinedButton(onPressed: () => _sensorEngine.forceParkHere(), child: const Text('1. Parcheggia', style: TextStyle(fontSize: 12)))),
-                const SizedBox(width: 6),
-                Expanded(child: OutlinedButton(onPressed: () => _sensorEngine.forceLeavingSoon(), child: const Text('2. Entro 100m', style: TextStyle(fontSize: 12)))),
-                const SizedBox(width: 6),
-                Expanded(child: OutlinedButton(onPressed: () => _sensorEngine.forceReleaseCar(), child: const Text('3. Ripartito', style: TextStyle(fontSize: 12)))),
-              ]),
-            ]),
-          ),
+              ),
+            ),
+            const SizedBox(height: 18),
+
+            // 2. Pulsante Principale: CERCA PARCHEGGIO
+            _buildPrimaryActionTile(
+              title: 'Cerca parcheggio',
+              subtitle: 'Apri la mappa degli stalli liberi entro $_searchRadiusM m',
+              icon: Icons.travel_explore,
+              startColor: Colors.teal.shade700,
+              endColor: Colors.teal.shade500,
+              badgeText: '${_searchRadiusM}m',
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => SearchParkingScreen(
+                      sensorEngine: _sensorEngine,
+                      backendBaseUrl: _backendBaseUrl,
+                      searchRadiusM: _searchRadiusM,
+                    ),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 14),
+
+            // 3. Pulsante Principale: TROVA LA MIA AUTO
+            _buildPrimaryActionTile(
+              title: 'Trova la mia auto',
+              subtitle: hasParkedCar
+                  ? 'Visualizza su mappa lo stallo dove hai parcheggiato'
+                  : 'Controlla sulla mappa l\'ultimo parcheggio registrato',
+              icon: Icons.directions_car,
+              startColor: Colors.indigo.shade800,
+              endColor: Colors.blue.shade600,
+              badgeText: hasParkedCar
+                  ? (_sensorEngine.distanceFromCarMeters != null ? '${_sensorEngine.distanceFromCarMeters!.round()}m' : 'ATTIVO')
+                  : null,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => FindMyCarScreen(
+                      sensorEngine: _sensorEngine,
+                      backendBaseUrl: _backendBaseUrl,
+                      userId: _userId,
+                    ),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 22),
+
+            // 4. Telemetria compatta e comandi di simulazione test
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade300),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Telemetria: ${_sensorEngine.currentSpeedKmh.toStringAsFixed(1)} km/h • '
+                    'Passi: ${_sensorEngine.sessionSteps} • '
+                    'BT: ${_sensorEngine.targetCarBluetoothName ?? "Non associato"}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                  const SizedBox(height: 10),
+                  const Text('Simulazione Ciclo Sosta (Collaudo):', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(child: OutlinedButton(onPressed: () => _sensorEngine.forceParkHere(), child: const Text('1. Parcheggia', style: TextStyle(fontSize: 11)))),
+                      const SizedBox(width: 6),
+                      Expanded(child: OutlinedButton(onPressed: () => _sensorEngine.forceLeavingSoon(), child: const Text('2. Entro 100m', style: TextStyle(fontSize: 11)))),
+                      const SizedBox(width: 6),
+                      Expanded(child: OutlinedButton(onPressed: () => _sensorEngine.forceReleaseCar(), child: const Text('3. Ripartito', style: TextStyle(fontSize: 11)))),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
-      ]),
+      ),
     );
   }
 }
