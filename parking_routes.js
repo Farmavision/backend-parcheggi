@@ -72,6 +72,16 @@ module.exports = function registerParkingRoutes(app, { useSupabase, supabase, db
         : db.prepare('SELECT * FROM parking_spots WHERE id = ?').get(spotId);
 
       if (!spot) return res.status(404).json({ error: 'Stallo non trovato' });
+      if (app.locals.adminConfig) {
+        const cfg = await app.locals.adminConfig.getFullConfig();
+        if (Number(cfg.params.self_booking_block_enabled) === 1 && String(spot.user_id) === String(userId)) {
+          return res.status(400).json({ error: 'Non puoi prenotare il tuo stesso stallo' });
+        }
+        const geo = await app.locals.adminConfig.isPointAllowed(Number(spot.latitude), Number(spot.longitude));
+        if (!geo.allowed) {
+          return res.status(403).json({ error: 'Servizio non ancora attivo in questa zona' });
+        }
+      }
       if (spot.status !== 'FREE' && spot.status !== 'LEAVING_SOON') {
         return res.status(409).json({ error: 'Stallo non più disponibile' });
       }

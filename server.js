@@ -7,6 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
+require('./admin_routes')(app, { useSupabase, supabase, db, getSystemSettings });
 
 const useSupabase = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY);
 let supabase = null;
