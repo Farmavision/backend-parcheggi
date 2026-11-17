@@ -4,23 +4,20 @@ import 'package:flutter/material.dart';
 
 class AdminScreen extends StatefulWidget {
   const AdminScreen({super.key});
-
   @override
   State<AdminScreen> createState() => _AdminScreenState();
 }
 
 class _AdminScreenState extends State<AdminScreen> {
   static const String _baseUrl = 'https://parknow-api.onrender.com';
-
   final TextEditingController _pinCtrl = TextEditingController();
   bool _unlocked = false;
   bool _loading = false;
   bool _saving = false;
   String _pin = '';
-
   bool _geofenceEnabled = false;
   bool _selfBookingBlock = false;
-  List> _zones = [];
+  List<Map<String, dynamic>> _zones = [];
 
   final Map<String, TextEditingController> _controllers = {
     'initial_credits': TextEditingController(text: '50'),
@@ -38,35 +35,21 @@ class _AdminScreenState extends State<AdminScreen> {
   @override
   void dispose() {
     _pinCtrl.dispose();
-    for (final c in _controllers.values) {
-      c.dispose();
-    }
+    for (final c in _controllers.values) c.dispose();
     super.dispose();
   }
 
-  Future> _apiCall(
-    String method,
-    String path, {
-    Map<String, dynamic>? body,
-    String? pin,
-  }) async {
+  Future<Map<String, dynamic>> _apiCall(String method, String path, {Map<String, dynamic>? body, String? pin}) async {
     final HttpClient client = HttpClient();
     try {
       final req = await client.openUrl(method, Uri.parse('$_baseUrl$path'));
       req.headers.set('Content-Type', 'application/json; charset=utf-8');
-      if (pin != null && pin.isNotEmpty) {
-        req.headers.set('x-admin-pin', pin);
-      }
-      if (body != null) {
-        req.add(utf8.encode(jsonEncode(body)));
-      }
+      if (pin != null && pin.isNotEmpty) req.headers.set('x-admin-pin', pin);
+      if (body != null) req.add(utf8.encode(jsonEncode(body)));
       final res = await req.close();
       final text = await res.transform(utf8.decoder).join();
       final decoded = text.isNotEmpty ? jsonDecode(text) : <String, dynamic>{};
-      return {
-        'status': res.statusCode,
-        'data': decoded is Map<String, dynamic> ? decoded : <String, dynamic>{},
-      };
+      return {'status': res.statusCode, 'data': decoded is Map<String, dynamic> ? decoded : <String, dynamic>{}};
     } finally {
       client.close();
     }
@@ -83,10 +66,10 @@ class _AdminScreenState extends State<AdminScreen> {
         await _loadConfig();
         if (mounted) setState(() => _unlocked = true);
       } else {
-        _showSnack('PIN Amministratore errato', isError: true);
+        _showSnack('PIN errato', isError: true);
       }
     } catch (_) {
-      _showSnack('Errore di connessione al server', isError: true);
+      _showSnack('Errore connessione server', isError: true);
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -98,11 +81,8 @@ class _AdminScreenState extends State<AdminScreen> {
       final data = r['data'] as Map<String, dynamic>;
       final params = (data['params'] as Map<String, dynamic>?) ?? {};
       final rawZones = (data['zones'] as List?) ?? [];
-
       for (final entry in _controllers.entries) {
-        if (params[entry.key] != null) {
-          entry.value.text = params[entry.key].toString();
-        }
+        if (params[entry.key] != null) entry.value.text = params[entry.key].toString();
       }
       if (!mounted) return;
       setState(() {
@@ -124,20 +104,14 @@ class _AdminScreenState extends State<AdminScreen> {
         final parsed = num.tryParse(entry.value.text.trim().replaceAll(',', '.'));
         if (parsed != null) params[entry.key] = parsed;
       }
-
-      final r = await _apiCall(
-        'POST',
-        '/api/admin/config',
-        body: {'params': params, 'zones': _zones},
-        pin: _pin,
-      );
+      final r = await _apiCall('POST', '/api/admin/config', body: {'params': params, 'zones': _zones}, pin: _pin);
       if (r['status'] == 200) {
-        _showSnack('Parametri e zone salvati su cloud!');
+        _showSnack('Salvato su cloud!');
       } else {
-        _showSnack('Errore salvataggio (${r['status']})', isError: true);
+        _showSnack('Errore (${r['status']})', isError: true);
       }
     } catch (_) {
-      _showSnack('Impossibile contattare il server', isError: true);
+      _showSnack('Errore connessione server', isError: true);
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -148,54 +122,21 @@ class _AdminScreenState extends State<AdminScreen> {
     final latCtrl = TextEditingController();
     final lonCtrl = TextEditingController();
     final radCtrl = TextEditingController(text: '1.5');
-
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Nuova Zona Attiva'),
+        title: const Text('Nuova Zona'),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              TextField(
-                controller: nameCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Nome Zona / Quartiere',
-                  hintText: 'Es. Roma - Appio Claudio',
-                ),
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: latCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
-                      decoration: const InputDecoration(
-                        labelText: 'Latitudine',
-                        hintText: '41.8562',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: TextField(
-                      controller: lonCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
-                      decoration: const InputDecoration(
-                        labelText: 'Longitudine',
-                        hintText: '12.5591',
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: radCtrl,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                decoration: const InputDecoration(labelText: 'Raggio di copertura (km)'),
-              ),
+              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Nome Zona (es. Centro)')),
+              Row(children: [
+                Expanded(child: TextField(controller: latCtrl, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true), decoration: const InputDecoration(labelText: 'Latitudine'))),
+                const SizedBox(width: 8),
+                Expanded(child: TextField(controller: lonCtrl, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true), decoration: const InputDecoration(labelText: 'Longitudine'))),
+              ]),
+              TextField(controller: radCtrl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Raggio (km)')),
             ],
           ),
         ),
@@ -207,19 +148,9 @@ class _AdminScreenState extends State<AdminScreen> {
               final lat = double.tryParse(latCtrl.text.trim().replaceAll(',', '.'));
               final lon = double.tryParse(lonCtrl.text.trim().replaceAll(',', '.'));
               final rad = double.tryParse(radCtrl.text.trim().replaceAll(',', '.')) ?? 1.5;
-              if (name.isEmpty || lat == null || lon == null) {
-                _showSnack('Inserisci nome e coordinate valide', isError: true);
-                return;
-              }
+              if (name.isEmpty || lat == null || lon == null) return _showSnack('Dati non validi', isError: true);
               setState(() {
-                _zones.add({
-                  'id': 'zone_${DateTime.now().millisecondsSinceEpoch}',
-                  'name': name,
-                  'lat': lat,
-                  'lon': lon,
-                  'radius_km': rad,
-                  'active': true,
-                });
+                _zones.add({'id': 'z_${DateTime.now().millisecondsSinceEpoch}', 'name': name, 'lat': lat, 'lon': lon, 'radius_km': rad, 'active': true});
               });
               Navigator.pop(ctx);
             },
@@ -232,38 +163,20 @@ class _AdminScreenState extends State<AdminScreen> {
 
   void _showSnack(String msg, {bool isError = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: isError ? Colors.red.shade700 : Colors.green.shade700,
-      ),
-    );
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: isError ? Colors.red.shade700 : Colors.green.shade700));
   }
 
   Widget _numField(String key, String label, IconData icon) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
-      child: TextField(
-        controller: _controllers[key],
-        keyboardType: const TextInputType.numberWithOptions(decimal: true),
-        decoration: InputDecoration(
-          labelText: label,
-          prefixIcon: Icon(icon),
-          border: const OutlineInputBorder(),
-          isDense: true,
-        ),
-      ),
+      child: TextField(controller: _controllers[key], keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon), border: const OutlineInputBorder(), isDense: true)),
     );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Pannello Amministratore'),
-        backgroundColor: Colors.blueGrey.shade900,
-        foregroundColor: Colors.white,
-      ),
+      appBar: AppBar(title: const Text('Pannello Amministratore'), backgroundColor: Colors.blueGrey.shade900, foregroundColor: Colors.white),
       body: !_unlocked
           ? Padding(
               padding: const EdgeInsets.all(24),
@@ -272,41 +185,9 @@ class _AdminScreenState extends State<AdminScreen> {
                 children: [
                   Icon(Icons.admin_panel_settings, size: 64, color: Colors.blueGrey.shade800),
                   const SizedBox(height: 16),
-                  const Text(
-                    'Area Riservata Amministratore',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Inserisci il PIN per configurare tariffe, tempi e zone attive.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.black54),
-                  ),
-                  const SizedBox(height: 20),
-                  TextField(
-                    controller: _pinCtrl,
-                    obscureText: true,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: 'PIN Amministratore',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.lock),
-                    ),
-                    onSubmitted: (_) => _verifyPin(),
-                  ),
+                  TextField(controller: _pinCtrl, obscureText: true, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'PIN Amministratore', border: OutlineInputBorder(), prefixIcon: Icon(Icons.lock)), onSubmitted: (_) => _verifyPin()),
                   const SizedBox(height: 16),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: _loading ? null : _verifyPin,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blueGrey.shade900,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                      ),
-                      child: Text(_loading ? 'Verifica...' : 'Sblocca Pannello'),
-                    ),
-                  ),
+                  SizedBox(width: double.infinity, child: ElevatedButton(onPressed: _loading ? null : _verifyPin, style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey.shade900, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14)), child: Text(_loading ? 'Verifica...' : 'Sblocca Pannello'))),
                 ],
               ),
             )
@@ -314,147 +195,24 @@ class _AdminScreenState extends State<AdminScreen> {
               padding: const EdgeInsets.all(16),
               children: [
                 Card(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   child: Padding(
                     padding: const EdgeInsets.all(14),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          children: [
-                            const Icon(Icons.public, color: Colors.teal),
-                            const SizedBox(width: 8),
-                            const Expanded(
-                              child: Text(
-                                'Limitazione Zone Geografiche',
-                                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                              ),
-                            ),
-                            Switch(
-                              value: _geofenceEnabled,
-                              onChanged: (v) => setState(() => _geofenceEnabled = v),
-                            ),
-                          ],
-                        ),
-                        Text(
-                          _geofenceEnabled
-                              ? 'ATTIVO: l\'app funziona solo all\'interno delle zone abilitate qui sotto.'
-                              : 'DISATTIVO: l\'app è utilizzabile ovunque senza limiti di zona.',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: _geofenceEnabled ? Colors.teal.shade800 : Colors.black54,
-                          ),
-                        ),
-                        const Divider(height: 20),
-                        if (_zones.isEmpty)
-                          const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 8),
-                            child: Text('Nessuna zona configurata.', style: TextStyle(color: Colors.black54)),
-                          ),
-                        ..._zones.asMap().entries.map((entry) {
-                          final idx = entry.key;
-                          final z = entry.value;
-                          return ListTile(
-                            contentPadding: EdgeInsets.zero,
-                            leading: Switch(
-                              value: z['active'] == true,
-                              onChanged: (v) => setState(() => _zones[idx]['active'] = v),
-                            ),
-                            title: Text(z['name'].toString(), style: const TextStyle(fontWeight: FontWeight.w600)),
-                            subtitle: Text('Raggio ${z['radius_km']} km · (${z['lat']}, ${z['lon']})'),
-                            trailing: IconButton(
-                              icon: const Icon(Icons.delete_outline, color: Colors.red),
-                              onPressed: () => setState(() => _zones.removeAt(idx)),
-                            ),
-                          );
-                        }),
-                        const SizedBox(height: 8),
-                        OutlinedButton.icon(
-                          onPressed: _openAddZoneDialog,
-                          icon: const Icon(Icons.add_location_alt),
-                          label: const Text('Aggiungi Zona Attiva'),
-                        ),
+                        Row(children: [const Icon(Icons.public, color: Colors.teal), const SizedBox(width: 8), const Expanded(child: Text('Zone Geografiche (Geofencing)', style: TextStyle(fontWeight: FontWeight.bold))), Switch(value: _geofenceEnabled, onChanged: (v) => setState(() => _geofenceEnabled = v))]),
+                        const Divider(),
+                        ..._zones.asMap().entries.map((e) => ListTile(contentPadding: EdgeInsets.zero, leading: Switch(value: e.value['active'] == true, onChanged: (v) => setState(() => _zones[e.key]['active'] = v)), title: Text(e.value['name'].toString()), subtitle: Text('${e.value['radius_km']} km'), trailing: IconButton(icon: const Icon(Icons.delete, color: Colors.red), onPressed: () => setState(() => _zones.removeAt(e.key))))),
+                        OutlinedButton.icon(onPressed: _openAddZoneDialog, icon: const Icon(Icons.add), label: const Text('Aggiungi Zona')),
                       ],
                     ),
                   ),
                 ),
-                const SizedBox(height: 12),
-                Card(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Economia & Crediti', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 12),
-                        _numField('initial_credits', 'Crediti iniziali nuovi utenti', Icons.card_giftcard),
-                        _numField('search_fee', 'Costo prenotazione stallo (crediti)', Icons.toll),
-                        _numField('release_reward', 'Premio cessione stallo (crediti)', Icons.emoji_events),
-                        _numField('cancellation_penalty', 'Penale annullamento / mancato rilascio', Icons.warning_amber),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Card(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Tempi & Scadenze', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 12),
-                        _numField('release_delta_minutes', 'Preavviso uscita standard (minuti)', Icons.timer),
-                        _numField('reservation_hold_minutes', 'Tempo max arrivo prenotazione (minuti)', Icons.hourglass_bottom),
-                        _numField('free_spot_ttl_minutes', 'Durata visibilità stallo libero (minuti)', Icons.update),
-                        _numField('polling_interval_seconds', 'Frequenza aggiornamento stato (secondi)', Icons.sync),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Card(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Distanze & Regole Operative', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 12),
-                        _numField('search_radius_meters', 'Raggio ricerca stalli vicini (metri)', Icons.radar),
-                        _numField('arrival_verification_meters', 'Tolleranza GPS verifica arrivo/uscita (metri)', Icons.gps_fixed),
-                        SwitchListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('Blocca auto-prenotazione stesso utente'),
-                          subtitle: const Text('Attiva in produzione; disattiva per test con un solo telefono'),
-                          value: _selfBookingBlock,
-                          onChanged: (v) => setState(() => _selfBookingBlock = v),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
+                Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Economia & Crediti', style: TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 12), _numField('initial_credits', 'Crediti iniziali', Icons.card_giftcard), _numField('search_fee', 'Costo prenotazione', Icons.toll), _numField('release_reward', 'Premio rilascio', Icons.emoji_events), _numField('cancellation_penalty', 'Penale', Icons.warning)]))),
+                Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Tempi & Scadenze', style: TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 12), _numField('release_delta_minutes', 'Preavviso (min)', Icons.timer), _numField('reservation_hold_minutes', 'Attesa max (min)', Icons.hourglass_bottom), _numField('free_spot_ttl_minutes', 'Durata libero (min)', Icons.update), _numField('polling_interval_seconds', 'Polling (sec)', Icons.sync)]))),
+                Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Distanze & Regole', style: TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 12), _numField('search_radius_meters', 'Raggio (m)', Icons.radar), _numField('arrival_verification_meters', 'Tolleranza GPS (m)', Icons.gps_fixed), SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Blocca auto-prenotazione'), value: _selfBookingBlock, onChanged: (v) => setState(() => _selfBookingBlock = v))]))),
                 const SizedBox(height: 18),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    onPressed: _saving ? null : _saveConfig,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.green.shade800,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 15),
-                    ),
-                    icon: const Icon(Icons.cloud_upload),
-                    label: Text(
-                      _saving ? 'Salvataggio in corso...' : 'Salva Configurazione Amministratore',
-                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 24),
+                SizedBox(width: double.infinity, child: ElevatedButton(onPressed: _saving ? null : _saveConfig, style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade800, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 15)), child: Text(_saving ? 'Salvataggio...' : 'Salva Configurazione'))),
               ],
             ),
     );
