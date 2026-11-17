@@ -1,7 +1,6 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
 
 class AdminScreen extends StatefulWidget {
   const AdminScreen({super.key});
@@ -45,17 +44,41 @@ class _AdminScreenState extends State<AdminScreen> {
     super.dispose();
   }
 
+  Future> _apiCall(
+    String method,
+    String path, {
+    Map<String, dynamic>? body,
+    String? pin,
+  }) async {
+    final HttpClient client = HttpClient();
+    try {
+      final req = await client.openUrl(method, Uri.parse('$_baseUrl$path'));
+      req.headers.set('Content-Type', 'application/json; charset=utf-8');
+      if (pin != null && pin.isNotEmpty) {
+        req.headers.set('x-admin-pin', pin);
+      }
+      if (body != null) {
+        req.add(utf8.encode(jsonEncode(body)));
+      }
+      final res = await req.close();
+      final text = await res.transform(utf8.decoder).join();
+      final decoded = text.isNotEmpty ? jsonDecode(text) : <String, dynamic>{};
+      return {
+        'status': res.statusCode,
+        'data': decoded is Map<String, dynamic> ? decoded : <String, dynamic>{},
+      };
+    } finally {
+      client.close();
+    }
+  }
+
   Future<void> _verifyPin() async {
     final entered = _pinCtrl.text.trim();
     if (entered.isEmpty) return;
     setState(() => _loading = true);
     try {
-      final res = await http.post(
-        Uri.parse('$_baseUrl/api/admin/verify-pin'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'pin': entered}),
-      );
-      if (res.statusCode == 200) {
+      final r = await _apiCall('POST', '/api/admin/verify-pin', body: {'pin': entered});
+      if (r['status'] == 200) {
         _pin = entered;
         await _loadConfig();
         if (mounted) setState(() => _unlocked = true);
@@ -70,9 +93,9 @@ class _AdminScreenState extends State<AdminScreen> {
   }
 
   Future<void> _loadConfig() async {
-    final res = await http.get(Uri.parse('$_baseUrl/api/admin/config'));
-    if (res.statusCode == 200) {
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final r = await _apiCall('GET', '/api/admin/config');
+    if (r['status'] == 200) {
+      final data = r['data'] as Map<String, dynamic>;
       final params = (data['params'] as Map<String, dynamic>?) ?? {};
       final rawZones = (data['zones'] as List?) ?? [];
 
@@ -102,18 +125,16 @@ class _AdminScreenState extends State<AdminScreen> {
         if (parsed != null) params[entry.key] = parsed;
       }
 
-      final res = await http.post(
-        Uri.parse('$_baseUrl/api/admin/config'),
-        headers: {
-          'Content-Type': 'application/json',
-          'x-admin-pin': _pin,
-        },
-        body: jsonEncode({'params': params, 'zones': _zones}),
+      final r = await _apiCall(
+        'POST',
+        '/api/admin/config',
+        body: {'params': params, 'zones': _zones},
+        pin: _pin,
       );
-      if (res.statusCode == 200) {
+      if (r['status'] == 200) {
         _showSnack('Parametri e zone salvati su cloud!');
       } else {
-        _showSnack('Errore salvataggio (${res.statusCode})', isError: true);
+        _showSnack('Errore salvataggio (${r['status']})', isError: true);
       }
     } catch (_) {
       _showSnack('Impossibile contattare il server', isError: true);
@@ -127,100 +148,84 @@ class _AdminScreenState extends State<AdminScreen> {
     final latCtrl = TextEditingController();
     final lonCtrl = TextEditingController();
     final radCtrl = TextEditingController(text: '1.5');
-    bool fetchingGps = false;
 
     await showDialog<void>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlgState) => AlertDialog(
-          title: const Text('Nuova Zona Attiva'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: nameCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Nome Zona / Quartiere',
-                    hintText: 'Es. Roma - Appio Claudio',
+      builder: (ctx) => AlertDialog(
+        title: const Text('Nuova Zona Attiva'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: nameCtrl,
+                decoration: const InputDecoration(
+                  labelText: 'Nome Zona / Quartiere',
+                  hintText: 'Es. Roma - Appio Claudio',
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: latCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                      decoration: const InputDecoration(
+                        labelText: 'Latitudine',
+                        hintText: '41.8562',
+                      ),
+                    ),
                   ),
-                ),
-                const SizedBox(height: 10),
-                OutlinedButton.icon(
-                  onPressed: fetchingGps
-                      ? null
-                      : () async {
-                          setDlgState(() => fetchingGps = true);
-                          try {
-                            final pos = await Geolocator.getCurrentPosition();
-                            latCtrl.text = pos.latitude.toStringAsFixed(6);
-                            lonCtrl.text = pos.longitude.toStringAsFixed(6);
-                          } catch (_) {
-                            _showSnack('GPS non disponibile', isError: true);
-                          } finally {
-                            setDlgState(() => fetchingGps = false);
-                          }
-                        },
-                  icon: const Icon(Icons.my_location),
-                  label: Text(fetchingGps ? 'Rilevamento GPS...' : 'Usa posizione GPS attuale'),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: latCtrl,
-                        keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
-                        decoration: const InputDecoration(labelText: 'Latitudine'),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: lonCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                      decoration: const InputDecoration(
+                        labelText: 'Longitudine',
+                        hintText: '12.5591',
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: lonCtrl,
-                        keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
-                        decoration: const InputDecoration(labelText: 'Longitudine'),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: radCtrl,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                  decoration: const InputDecoration(labelText: 'Raggio di copertura (km)'),
-                ),
-              ],
-            ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: radCtrl,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: const InputDecoration(labelText: 'Raggio di copertura (km)'),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annulla')),
-            ElevatedButton(
-              onPressed: () {
-                final name = nameCtrl.text.trim();
-                final lat = double.tryParse(latCtrl.text.trim().replaceAll(',', '.'));
-                final lon = double.tryParse(lonCtrl.text.trim().replaceAll(',', '.'));
-                final rad = double.tryParse(radCtrl.text.trim().replaceAll(',', '.')) ?? 1.5;
-                if (name.isEmpty || lat == null || lon == null) {
-                  _showSnack('Inserisci nome e coordinate valide', isError: true);
-                  return;
-                }
-                setState(() {
-                  _zones.add({
-                    'id': 'zone_${DateTime.now().millisecondsSinceEpoch}',
-                    'name': name,
-                    'lat': lat,
-                    'lon': lon,
-                    'radius_km': rad,
-                    'active': true,
-                  });
-                });
-                Navigator.pop(ctx);
-              },
-              child: const Text('Aggiungi'),
-            ),
-          ],
         ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annulla')),
+          ElevatedButton(
+            onPressed: () {
+              final name = nameCtrl.text.trim();
+              final lat = double.tryParse(latCtrl.text.trim().replaceAll(',', '.'));
+              final lon = double.tryParse(lonCtrl.text.trim().replaceAll(',', '.'));
+              final rad = double.tryParse(radCtrl.text.trim().replaceAll(',', '.')) ?? 1.5;
+              if (name.isEmpty || lat == null || lon == null) {
+                _showSnack('Inserisci nome e coordinate valide', isError: true);
+                return;
+              }
+              setState(() {
+                _zones.add({
+                  'id': 'zone_${DateTime.now().millisecondsSinceEpoch}',
+                  'name': name,
+                  'lat': lat,
+                  'lon': lon,
+                  'radius_km': rad,
+                  'active': true,
+                });
+              });
+              Navigator.pop(ctx);
+            },
+            child: const Text('Aggiungi'),
+          ),
+        ],
       ),
     );
   }

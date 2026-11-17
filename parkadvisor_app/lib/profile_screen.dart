@@ -182,16 +182,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
         backgroundColor: Colors.blue.shade800,
         foregroundColor: Colors.white,
         actions: [
-          IconButton(
-            icon: const Icon(Icons.admin_panel_settings),
-            tooltip: 'Pannello Amministratore',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const AdminScreen()),
-              );
-            },
-          ),IconButton(icon: const Icon(Icons.refresh), onPressed: _loadProfileData)],
+        IconButton(
+          icon: const Icon(Icons.admin_panel_settings),
+          tooltip: 'Pannello Amministratore',
+          onPressed: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const AdminScreen()),
+            );
+          },
+        ),IconButton(icon: const Icon(Icons.refresh), onPressed: _loadProfileData)],
       ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
