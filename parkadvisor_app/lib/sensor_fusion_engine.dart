@@ -44,7 +44,8 @@ class SensorFusionEngine extends ChangeNotifier {
 
   final Future<void> Function(double lat, double lon, String method) onCarParked;
   final Future<void> Function(int estimatedMinutes) onApproachingCar100m;
-  final Future<void> Function()? onManualReleaseConfirmed;
+  final Future<void> Function(int estimatedMinutes)? onManualReleaseConfirmed;
+  final Future<void> Function(int estimatedMinutes)? onEtaUpdated;
   final Future<void> Function() onCarReleased;
   final void Function()? onAutoShareSkipped;
   final void Function(String ssid)? onUnknownWifiDetected;
@@ -61,12 +62,19 @@ class SensorFusionEngine extends ChangeNotifier {
   bool _notified100m = false;
   bool _manualReleaseConfirmed = false;
   bool _autoShareSkippedNotified = false;
+  int? _lastSentEta;
+  bool get isManualReleaseConfirmed => _manualReleaseConfirmed;
+  int get estimatedMinutesToRelease {
+    final d = distanceFromCarMeters ?? 0.0;
+    return (d <= 3.0 ? 0 : (d / 75.0).ceil()) + 1;
+  }
 
   SensorFusionEngine({
     required this.onCarParked,
     required this.onApproachingCar100m,
     required this.onCarReleased,
     this.onManualReleaseConfirmed,
+    this.onEtaUpdated,
     this.onAutoShareSkipped,
     this.onUnknownWifiDetected,
     this.onUnknownBluetoothDetected,
@@ -118,7 +126,12 @@ class SensorFusionEngine extends ChangeNotifier {
   Future<void> confirmManualReleaseIntent() async {
     _manualReleaseConfirmed = true;
     currentState = VehicleState.leavingSoon;
-    if (onManualReleaseConfirmed != null) await onManualReleaseConfirmed!();
+    if (parkedLat != null && parkedLon != null && currentUserLat != null && currentUserLon != null) {
+      distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
+    }
+    final eta = estimatedMinutesToRelease;
+    _lastSentEta = eta;
+    if (onManualReleaseConfirmed != null) await onManualReleaseConfirmed!(eta);
     notifyListeners();
   }
 
@@ -269,7 +282,11 @@ class SensorFusionEngine extends ChangeNotifier {
         if (distanceFromCarMeters! <= 100.0 && isWalking && !_notified100m && currentState == VehicleState.parked) {
           _notified100m = true;
           currentState = VehicleState.leavingSoon;
-          onApproachingCar100m(2);
+          onApproachingCar100m(estimatedMinutesToRelease);
+        }
+        if (_manualReleaseConfirmed && _lastSentEta != estimatedMinutesToRelease) {
+          _lastSentEta = estimatedMinutesToRelease;
+          onEtaUpdated?.call(estimatedMinutesToRelease);
         }
         if (currentSpeedKmh > 12.0 && distanceFromCarMeters! > 15.0) {
           _triggerCarReleased();
@@ -395,7 +412,7 @@ class SensorFusionEngine extends ChangeNotifier {
     if (parkedLat == null) return;
     currentState = VehicleState.leavingSoon;
     _notified100m = true;
-    await onApproachingCar100m(2);
+    await onApproachingCar100m(estimatedMinutesToRelease);
     notifyListeners();
   }
 

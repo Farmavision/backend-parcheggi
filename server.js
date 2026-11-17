@@ -99,7 +99,7 @@ app.get('/api/parking/nearby', async (req, res) => {
     }
     const formatted = rows.map(r => ({
       id: r.id, userId: r.user_id, latitude: r.latitude, longitude: r.longitude,
-      status: r.status, availableInMinutes: r.available_in_minutes, updatedAt: r.updated_at,
+      status: r.status, availableInMinutes: r.status === 'LEAVING_SOON' && r.updated_at ? Math.max(1, (r.available_in_minutes || 1) - Math.floor((Date.now() - new Date(r.updated_at).getTime()) / 60000)) : r.available_in_minutes, updatedAt: r.updated_at,
       distanceMeters: (lat && lon) ? Math.round(getDistanceMeters(parseFloat(lat), parseFloat(lon), r.latitude, r.longitude)) : null
     }));
     const result = (lat && lon)

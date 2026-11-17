@@ -54,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onCarParked: _handleCarParked,
       onApproachingCar100m: _handleApproachingCar100m,
       onManualReleaseConfirmed: _handleManualReleaseConfirmed,
+      onEtaUpdated: _handleEtaUpdated,
       onCarReleased: _handleCarReleased,
       onAutoShareSkipped: _handleAutoShareSkipped,
       onUnknownWifiDetected: _promptSaveUnknownWifi,
@@ -150,10 +151,13 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> _handleManualReleaseConfirmed() async {
+  Future<void> _handleEtaUpdated(int m) async {
+    try { await http.post(Uri.parse("$_backendBaseUrl/api/parking/leaving"), headers: _headers, body: json.encode({"userId": _userId, "availableInMinutes": m})); } catch (_) {}
+  }
+  Future<void> _handleManualReleaseConfirmed(int estimatedMinutes) async {
     try {
       final res = await http.post(Uri.parse('$_backendBaseUrl/api/parking/confirm-release'), headers: _headers,
-        body: json.encode({'userId': _userId, 'availableInMinutes': 2}));
+        body: json.encode({'userId': _userId, 'availableInMinutes': estimatedMinutes}));
       if (res.statusCode == 200 && mounted) {
         final delta = json.decode(res.body)['deltaMinutes'] ?? 5;
         ScaffoldMessenger.of(context).showSnackBar(
@@ -253,9 +257,15 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildCarSpotBadge(Color c) => Container(
+  Widget _buildCarSpotBadge(Color c, {int? mins}) => Container(
     decoration: BoxDecoration(color: c, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2.5)),
-    child: const Icon(Icons.directions_car, color: Colors.white, size: 22),
+    alignment: Alignment.center,
+    child: mins != null
+        ? Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Text("$mins", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15, height: 1.0)),
+            const Text("min", style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 9, height: 1.0)),
+          ])
+        : const Icon(Icons.directions_car, color: Colors.white, size: 22),
   );
 
   @override
@@ -273,7 +283,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_sensorEngine.parkedLat != null && _sensorEngine.parkedLon != null) {
       markers.add(Marker(
         point: LatLng(_sensorEngine.parkedLat!, _sensorEngine.parkedLon!), width: 44, height: 44,
-        child: _buildCarSpotBadge(_sensorEngine.currentState == VehicleState.leavingSoon ? Colors.orange : Colors.indigo),
+        child: _buildCarSpotBadge(_sensorEngine.isManualReleaseConfirmed ? Colors.orange : Colors.indigo, mins: _sensorEngine.isManualReleaseConfirmed ? _sensorEngine.estimatedMinutesToRelease : null),
       ));
     }
     for (var spot in _availableSpots) {
@@ -286,7 +296,7 @@ class _HomeScreenState extends State<HomeScreen> {
           onTap: () => ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(isLeaving ? 'In liberazione tra ${spot['availableInMinutes']} min (${spot['distanceMeters']}m)' : 'Stallo LIBERO (${spot['distanceMeters']}m)'),
           )),
-          child: _buildCarSpotBadge(isLeaving ? Colors.orange : Colors.green),
+          child: _buildCarSpotBadge(isLeaving ? Colors.orange : Colors.green, mins: isLeaving ? ((spot['availableInMinutes'] as num?)?.toInt() ?? 1) : null),
         ),
       ));
     }
