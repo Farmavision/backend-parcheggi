@@ -260,4 +260,6 @@ app.post('/api/admin/settings', async (req, res) => {
   }
 });
 
+require('./parking_routes')(app, { useSupabase, supabase, db, getSystemSettings });
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server ParkNow! attivo sulla porta ${PORT}`));
