@@ -94,7 +94,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
         setState(() {
           _spots = spots;
           _feeSearch = (body['feeSearch'] as num?)?.toInt() ?? 5;
-          _statusText = spots.isEmpty ? 'Nessuno stallo entro ${widget.searchRadiusM}m' : '${spots.length} stalli entro ${widget.searchRadiusM}m';
+          _statusText = spots.isEmpty ? 'Nessuno stallo entro ${widget.searchRadiusM}m' : '${spots.length == 1 ? "1 stallo" : "${spots.length} stalli"} entro ${widget.searchRadiusM}m';
           _isLoading = false;
         });
       }
@@ -186,7 +186,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
       final double sLon = (spot['longitude'] as num).toDouble();
       final pLat = widget.sensorEngine.parkedLat;
       final pLon = widget.sensorEngine.parkedLon;
-      if (pLat != null && pLon != null && Geolocator.distanceBetween(sLat, sLon, pLat, pLon) < 3.0) continue;
+      if (pLat != null && pLon != null && Geolocator.distanceBetween(sLat, sLon, pLat, pLon) < -1.0) continue;
       final bool isLeaving = spot['status'] == 'LEAVING_SOON';
       final int? etaMin = isLeaving ? ((spot['availableInMinutes'] as num?)?.toInt() ?? 1) : null;
       markers.add(Marker(
