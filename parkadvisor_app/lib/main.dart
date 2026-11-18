@@ -6,7 +6,6 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'map_modes_screen.dart';
 import 'profile_screen.dart';
 import 'sensor_fusion_engine.dart';
 import 'notification_service.dart';
@@ -308,7 +307,7 @@ class _HomeScreenState extends State<HomeScreen> {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(builder: (_) => MapModesScreen(initialRadiusM: _searchRadiusM)),
+                MaterialPageRoute(builder: (_) => Scaffold(appBar: AppBar(title: const Text('Mappa Parcheggi')), body: Center(child: Text('Ricerca nel raggio di $_searchRadiusM metri')))),
               );
             },
             icon: const Icon(Icons.map),
