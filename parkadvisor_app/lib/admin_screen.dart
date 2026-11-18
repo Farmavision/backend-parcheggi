@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class AdminScreen extends StatefulWidget {
   const AdminScreen({super.key});
@@ -15,7 +16,7 @@ class _AdminScreenState extends State<AdminScreen> {
   bool _loading = false;
   String _adminPin = '';
 
-  List> _zones = [];
+  final List> _zones = [];
   final _rewardCtrl = TextEditingController(text: '10');
   final _feeCtrl = TextEditingController(text: '5');
   final _penaltyCtrl = TextEditingController(text: '15');
@@ -70,12 +71,17 @@ class _AdminScreenState extends State<AdminScreen> {
       final r = await _apiCall('GET', '/api/admin/settings');
       if (r['status'] == 200) {
         final data = r['data'] as Map<String, dynamic>;
+        final prefs = await SharedPreferences.getInstance();
         setState(() {
           if (data['reward_release'] != null) _rewardCtrl.text = data['reward_release'].toString();
           if (data['fee_search'] != null) _feeCtrl.text = data['fee_search'].toString();
           if (data['penalty_false_release'] != null) _penaltyCtrl.text = data['penalty_false_release'].toString();
           if (data['release_delta_minutes'] != null) _deltaCtrl.text = data['release_delta_minutes'].toString();
-          if (data['auto_release_delay_s'] != null) _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
+          if (data['auto_release_delay_s'] != null) {
+            _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
+            final val = int.tryParse(_autoReleaseDelayCtrl.text);
+            if (val != null) prefs.setInt('auto_release_delay_s', val);
+          }
         });
       }
     } catch (_) {}
@@ -84,12 +90,16 @@ class _AdminScreenState extends State<AdminScreen> {
   Future<void> _saveConfig() async {
     setState(() => _loading = true);
     try {
+      final delayVal = int.tryParse(_autoReleaseDelayCtrl.text) ?? 60;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('auto_release_delay_s', delayVal);
+
       final r = await _apiCall('POST', '/api/admin/settings', body: {
         'reward_release': int.tryParse(_rewardCtrl.text) ?? 10,
         'fee_search': int.tryParse(_feeCtrl.text) ?? 5,
         'penalty_false_release': int.tryParse(_penaltyCtrl.text) ?? 15,
         'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
-        'auto_release_delay_s': int.tryParse(_autoReleaseDelayCtrl.text) ?? 60,
+        'auto_release_delay_s': delayVal,
       });
       if (r['status'] == 200) {
         _showSnack('Salvato su cloud!');
