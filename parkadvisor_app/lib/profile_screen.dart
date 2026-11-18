@@ -15,7 +15,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   static const String _userId = 'USER-001';
 
   bool _autoShare = true;
-  bool _isBetaTester = false; // <-- Nuova variabile Beta Tester
+  bool _isBetaTester = false;
   int _searchRadius = 500;
   int _creditsBalance = 50;
   bool _isSaving = false;
@@ -46,7 +46,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _autoShare = prefs.getBool('auto_share_enabled') ?? true;
-      _isBetaTester = prefs.getBool('is_beta_tester') ?? false; // <-- Carica stato Beta Tester
+      _isBetaTester = prefs.getBool('is_beta_tester') ?? false;
       final savedRadius = prefs.getInt('search_radius_m') ?? 500;
       _searchRadius = _allowedRadii.contains(savedRadius) ? savedRadius : 500;
       _creditsBalance = prefs.getInt('credits_balance') ?? 50;
@@ -69,7 +69,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         final remoteModel = data['car_model'] as String?;
         final remoteColor = data['car_color'] as String?;
         final remoteAutoShare = data['auto_share_enabled'] as bool?;
-        final remoteBetaTester = data['is_beta_tester'] as bool?; // <-- Predisposizione per Backend
+        final remoteBetaTester = data['is_beta_tester'] as bool?;
         final remoteRadius = (data['search_radius_m'] as num?)?.toInt();
         final remoteWifi = data['home_wifi_ssid'] as String?;
         final remoteBt = data['car_bluetooth_mac'] as String?;
@@ -86,7 +86,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         if (remoteColor != null) await prefs.setString('car_color', remoteColor);
         if (decodedPlate.isNotEmpty) await prefs.setString('car_plate', decodedPlate);
         if (remoteAutoShare != null) await prefs.setBool('auto_share_enabled', remoteAutoShare);
-        if (remoteBetaTester != null) await prefs.setBool('is_beta_tester', remoteBetaTester); // <-- Salva stato remoto Beta
+        if (remoteBetaTester != null) await prefs.setBool('is_beta_tester', remoteBetaTester);
         if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) await prefs.setInt('search_radius_m', remoteRadius);
         if (remoteWifi != null) await prefs.setString('home_wifi_ssid', remoteWifi);
         if (remoteBt != null) await prefs.setString('car_bt_mac', remoteBt);
@@ -99,7 +99,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           if (remoteColor != null) _colorController.text = remoteColor;
           if (decodedPlate.isNotEmpty) _plateController.text = decodedPlate;
           if (remoteAutoShare != null) _autoShare = remoteAutoShare;
-          if (remoteBetaTester != null) _isBetaTester = remoteBetaTester; // <-- Aggiorna UI Beta
+          if (remoteBetaTester != null) _isBetaTester = remoteBetaTester;
           if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) _searchRadius = remoteRadius;
           if (remoteWifi != null) _wifiController.text = remoteWifi;
           if (remoteBt != null) _btController.text = remoteBt;
@@ -112,7 +112,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     setState(() => _isSaving = true);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('auto_share_enabled', _autoShare);
-    await prefs.setBool('is_beta_tester', _isBetaTester); // <-- Salva stato Beta in locale
+    await prefs.setBool('is_beta_tester', _isBetaTester);
     await prefs.setInt('search_radius_m', _searchRadius);
     await prefs.setString('user_phone', _phoneController.text.trim());
     await prefs.setString('car_brand', _brandController.text.trim());
@@ -136,7 +136,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           'carColor': _colorController.text.trim(),
           'carPlate': _plateController.text.trim().toUpperCase(),
           'autoShareEnabled': _autoShare,
-          'isBetaTester': _isBetaTester, // <-- Invia stato Beta al backend
+          'isBetaTester': _isBetaTester,
           'searchRadiusM': _searchRadius,
           'homeWifiSsid': _wifiController.text.trim(),
           'carBluetoothMac': _btController.text.trim().toUpperCase(),
@@ -210,3 +210,108 @@ class _ProfileScreenState extends State<ProfileScreen> {
             child: ListTile(
               leading: Icon(Icons.account_balance_wallet, color: Colors.blue.shade800, size: 38),
               title: const Text('Borsellino Crediti', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(_isBetaTester ? 'Account Beta Tester (Costi esenti)' : 'Saldo attuale disponibile'),
+              trailing: Text('$_creditsBalance cr', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.blue.shade900)),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            color: Colors.amber.shade50,
+            child: SwitchListTile(
+              secondary: Icon(Icons.science, color: Colors.amber.shade900),
+              title: const Text('Modalità Beta Tester', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('Abilita il rilascio automatico Silenzio-Assenso e azzera i costi di utilizzo.'),
+              value: _isBetaTester,
+              onChanged: (v) => setState(() => _isBetaTester = v),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: SwitchListTile(
+              title: const Text('Condivisione Automatica Parcheggio', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('Rileva automaticamente sosta e ripartenza tramite sensori'),
+              value: _autoShare,
+              onChanged: (v) => setState(() => _autoShare = v),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Raggio di Ricerca Predefinito', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<int>(
+                    value: _searchRadius,
+                    decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
+                    items: _allowedRadii.map((r) => DropdownMenuItem(value: r, child: Text('$r metri'))).toList(),
+                    onChanged: (v) { if (v != null) setState(() => _searchRadius = v); },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Dati Veicolo & Contatto', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 12),
+                  TextField(controller: _phoneController, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Telefono', border: OutlineInputBorder(), isDense: true)),
+                  const SizedBox(height: 10),
+                  TextField(controller: _brandController, decoration: const InputDecoration(labelText: 'Marca Auto (es. Fiat)', border: OutlineInputBorder(), isDense: true)),
+                  const SizedBox(height: 10),
+                  TextField(controller: _modelController, decoration: const InputDecoration(labelText: 'Modello (es. Panda)', border: OutlineInputBorder(), isDense: true)),
+                  const SizedBox(height: 10),
+                  TextField(controller: _colorController, decoration: const InputDecoration(labelText: 'Colore', border: OutlineInputBorder(), isDense: true)),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _plateController,
+                    textCapitalization: TextCapitalization.characters,
+                    onChanged: (_) => setState(() {}),
+                    decoration: InputDecoration(labelText: 'Targa (visibile: $_maskedPlatePreview)', border: const OutlineInputBorder(), isDense: true),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Sensori & Automazione', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 12),
+                  TextField(controller: _wifiController, decoration: const InputDecoration(labelText: 'Nome Wi-Fi Casa (esclude falsi rilascio)', border: OutlineInputBorder(), isDense: true)),
+                  const SizedBox(height: 10),
+                  TextField(controller: _btController, decoration: const InputDecoration(labelText: 'MAC Bluetooth Auto', border: OutlineInputBorder(), isDense: true)),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _isSaving ? null : _saveProfile,
+              icon: const Icon(Icons.save),
+              label: Text(_isSaving ? 'Salvataggio...' : 'Salva Profilo'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blue.shade800,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 15),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

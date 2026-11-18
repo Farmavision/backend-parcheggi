@@ -9,11 +9,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'map_modes_screen.dart';
 import 'profile_screen.dart';
 import 'sensor_fusion_engine.dart';
-import 'notification_service.dart'; // Importazione del servizio notifiche
+import 'notification_service.dart';
 
-void main() async { // Modificato in async per supportare l'inizializzazione
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService().init(); // Inizializza il servizio notifiche
+  await NotificationService().init();
   runApp(const ParkNowApp());
 }
 
@@ -177,4 +177,174 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         icon: const Icon(Icons.notifications_active, color: Colors.orange, size: 34),
-        title: const
+        title: const Text('Ti stai avvicinando all\'auto!'),
+        content: Text('Sei entro 100m dal tuo veicolo (arrivo stimato in $minLabel).\n\nVuoi segnalare che stai per liberare il posto? (Se sei Beta Tester, il rilascio avverrà in automatico allo scadere del timer).'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              _sensorEngine.cancelAutoRelease();
+              Navigator.pop(ctx);
+            },
+            child: const Text('Non sto partendo'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              _sensorEngine.confirmManualRelease(estimatedMinutes);
+              Navigator.pop(ctx);
+            },
+            child: const Text('Conferma Uscita'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _handleManualReleaseConfirmed(int minutes) async {
+    try {
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/confirm-release'),
+        headers: _headers,
+        body: json.encode({'userId': _userId, 'availableInMinutes': minutes}),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _handleEtaUpdated(int minutes) async {
+    try {
+      await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/leaving'),
+        headers: _headers,
+        body: json.encode({'userId': _userId, 'availableInMinutes': minutes}),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _handleCarReleased() async {
+    try {
+      final res = await http.post(
+        Uri.parse('$_backendBaseUrl/api/parking/release'),
+        headers: _headers,
+        body: json.encode({'userId': _userId}),
+      );
+      if (res.statusCode == 200 && mounted) {
+        final data = json.decode(res.body);
+        final newBal = (data['newBalance'] as num?)?.toInt();
+        final awarded = (data['creditsAwarded'] as num?)?.toInt() ?? 10;
+        if (newBal != null) {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setInt('credits_balance', newBal);
+          setState(() => _creditsBalance = newBal);
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.green.shade700,
+            content: Text('Stallo liberato con successo! +$awarded crediti guadagnati.'),
+          ),
+        );
+      }
+    } catch (_) {}
+  }
+
+  void _handleAutoShareSkipped(String reason) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Auto-condivisione saltata: $reason')),
+    );
+  }
+
+  @override
+  void dispose() {
+    _antiFraudWatchTimer?.cancel();
+    _sensorEngine.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('ParkNow!'),
+        backgroundColor: Colors.indigo,
+        foregroundColor: Colors.white,
+        actions: [
+          Center(
+            child: Container(
+              margin: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(16)),
+              child: Text('$_creditsBalance cr', style: const TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.person),
+            tooltip: 'Profilo e Impostazioni',
+            onPressed: () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen()));
+              _loadLocalAndRemoteUser();
+            },
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            color: _sensorEngine.isCarParked ? Colors.orange.shade50 : Colors.green.shade50,
+            child: ListTile(
+              leading: Icon(
+                _sensorEngine.isCarParked ? Icons.local_parking : Icons.directions_car,
+                color: _sensorEngine.isCarParked ? Colors.orange.shade800 : Colors.green.shade800,
+                size: 36,
+              ),
+              title: Text(
+                _sensorEngine.isCarParked ? 'Auto Parcheggiata' : 'In Movimento / Nessuna Sosta',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              subtitle: Text(_sensorEngine.statusMessage),
+            ),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => MapModesScreen(initialRadiusM: _searchRadiusM)),
+              );
+            },
+            icon: const Icon(Icons.map),
+            label: const Text('Cerca Parcheggio Vicino (Mappa & Radar)'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.indigo,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 16),
+            ),
+          ),
+          const SizedBox(height: 24),
+          const Text('Pannello Collaudo & Simulazione', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: () => _sensorEngine.simulateParkHere(),
+                icon: const Icon(Icons.pin_drop),
+                label: const Text('1. Simula Parcheggio'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => _sensorEngine.simulateApproach100m(),
+                icon: const Icon(Icons.radar),
+                label: const Text('2. Simula Avvicinamento 100m'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => _sensorEngine.simulateDeparture(),
+                icon: const Icon(Icons.exit_to_app),
+                label: const Text('3. Simula Ripartenza'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
