@@ -6,6 +6,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'map_modes_screen.dart';
 import 'profile_screen.dart';
 import 'sensor_fusion_engine.dart';
 import 'notification_service.dart';
@@ -303,20 +304,58 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           const SizedBox(height: 16),
-          ElevatedButton.icon(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => Scaffold(appBar: AppBar(title: const Text('Mappa Parcheggi')), body: Center(child: Text('Ricerca nel raggio di $_searchRadiusM metri')))),
-              );
-            },
-            icon: const Icon(Icons.map),
-            label: const Text('Cerca Parcheggio Vicino (Mappa & Radar)'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.indigo,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 16),
-            ),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => FindMyCarScreen(
+                          sensorEngine: _sensorEngine,
+                          backendBaseUrl: _backendBaseUrl,
+                          userId: _userId,
+                        ),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.directions_car),
+                  label: const Text('Trova la mia auto', textAlign: TextAlign.center),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.teal.shade700,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () async {
+                    await Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => SearchParkingScreen(
+                          sensorEngine: _sensorEngine,
+                          backendBaseUrl: _backendBaseUrl,
+                          userId: _userId,
+                          searchRadiusM: _searchRadiusM,
+                        ),
+                      ),
+                    );
+                    _loadLocalAndRemoteUser();
+                  },
+                  icon: const Icon(Icons.local_parking),
+                  label: const Text('Trova parcheggio', textAlign: TextAlign.center),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.indigo,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
+                  ),
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 24),
           const Text('Pannello Collaudo & Simulazione', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
