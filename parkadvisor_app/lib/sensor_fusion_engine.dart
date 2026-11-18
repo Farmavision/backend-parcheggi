@@ -147,6 +147,8 @@ class SensorFusionEngine extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> confirmManualReleaseIntent() => confirmManualRelease();
+
   Future<void> confirmManualRelease([int? customMinutes]) async {
     _manualReleaseConfirmed = true;
     currentState = VehicleState.leavingSoon;
