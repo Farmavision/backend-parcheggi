@@ -276,4 +276,30 @@ require('./parking_routes')(app, { useSupabase, supabase, db, getSystemSettings 
 // Il tuo require originale cercava admin_routes. 
 // require('./admin_routes')(app, { useSupabase, supabase, db, getSystemSettings }); 
 
+
+const betaFeedbacks = [];
+app.post("/api/beta/feedback", async (req, res) => {
+  try {
+    const { userId, category, message, diagnostics } = req.body || {};
+    if (!message) return res.status(400).json({ error: "Messaggio obbligatorio" });
+    const entry = {
+      id: Date.now(),
+      userId: userId || "USER-001",
+      category: category || "Generale",
+      message,
+      diagnostics: diagnostics || {},
+      createdAt: new Date().toISOString(),
+    };
+    betaFeedbacks.unshift(entry);
+    console.log("[BETA FEEDBACK]", JSON.stringify(entry));
+    return res.json({ success: true, feedback: entry });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/beta/feedback", (req, res) => {
+  return res.json({ feedbacks: betaFeedbacks });
+});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server ParkNow! attivo sulla porta ${PORT}`));

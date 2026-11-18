@@ -45,8 +45,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Future<void> _loadProfileData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _autoShare = prefs.getBool('auto_share_enabled') ?? true;
       _isBetaTester = prefs.getBool('is_beta_tester') ?? false;
+      _autoShare = _isBetaTester ? true : (prefs.getBool('auto_share_enabled') ?? true);
       final savedRadius = prefs.getInt('search_radius_m') ?? 500;
       _searchRadius = _allowedRadii.contains(savedRadius) ? savedRadius : 500;
       _creditsBalance = prefs.getInt('credits_balance') ?? 50;
@@ -85,11 +85,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
         if (remoteModel != null) await prefs.setString('car_model', remoteModel);
         if (remoteColor != null) await prefs.setString('car_color', remoteColor);
         if (decodedPlate.isNotEmpty) await prefs.setString('car_plate', decodedPlate);
-        if (remoteAutoShare != null) await prefs.setBool('auto_share_enabled', remoteAutoShare);
         if (remoteBetaTester != null) await prefs.setBool('is_beta_tester', remoteBetaTester);
+        final effectiveAutoShare = (remoteBetaTester ?? _isBetaTester) ? true : (remoteAutoShare ?? _autoShare);
+        await prefs.setBool('auto_share_enabled', effectiveAutoShare);
         if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) await prefs.setInt('search_radius_m', remoteRadius);
         if (remoteWifi != null) await prefs.setString('home_wifi_ssid', remoteWifi);
-        if (remoteBt != null) await prefs.setString('car_bt_mac', remoteBt);
+        if (remoteBt != null) await prefs.setString('car_bluetooth_mac', remoteBt);
 
         setState(() {
           if (remoteCredits != null) _creditsBalance = remoteCredits;
@@ -98,8 +99,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
           if (remoteModel != null) _modelController.text = remoteModel;
           if (remoteColor != null) _colorController.text = remoteColor;
           if (decodedPlate.isNotEmpty) _plateController.text = decodedPlate;
-          if (remoteAutoShare != null) _autoShare = remoteAutoShare;
           if (remoteBetaTester != null) _isBetaTester = remoteBetaTester;
+          _autoShare = _isBetaTester ? true : (remoteAutoShare ?? _autoShare);
           if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) _searchRadius = remoteRadius;
           if (remoteWifi != null) _wifiController.text = remoteWifi;
           if (remoteBt != null) _btController.text = remoteBt;
@@ -108,8 +109,172 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } catch (_) {}
   }
 
+  Future<void> _onBetaTesterToggled(bool value) async {
+    if (!value) {
+      setState(() => _isBetaTester = false);
+      return;
+    }
+
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: Icon(Icons.science, color: Colors.amber.shade900, size: 40),
+        title: const Text('Programma Beta Tester ParkNow!', textAlign: TextAlign.center),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: const [
+              Text(
+                'Il tuo contributo è fondamentale per costruire una base informativa solida sull\'affidabilità del rilevamento automatico dei parcheggi in città.',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              SizedBox(height: 12),
+              Text('Attivando la modalità Beta Tester accetti le seguenti condizioni:'),
+              SizedBox(height: 8),
+              Text('• Condivisione Automatica Obbligatoria: il rilevamento sosta e ripartenza tramite sensori resta sempre attivo e non può essere disabilitato.'),
+              SizedBox(height: 6),
+              Text('• Rilascio Silenzio-Assenso: quando ti avvicini entro 100m dall\'auto parte un conto alla rovescia con notifica; se non annulli, lo stallo viene liberato in automatico.'),
+              SizedBox(height: 6),
+              Text('• Utilizzo Gratuito: durante il test i costi in crediti per la ricerca parcheggio sono completamente azzerati.'),
+              SizedBox(height: 6),
+              Text('• Segnalazioni Dirette: avrai accesso al modulo rapido per inviare anomalie o suggerimenti al team tecnico.'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Annulla'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () => Navigator.pop(ctx, true),
+            icon: const Icon(Icons.check_circle_outline),
+            label: const Text('Accetta e Attiva'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.amber.shade800,
+              foregroundColor: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (accepted == true && mounted) {
+      setState(() {
+        _isBetaTester = true;
+        _autoShare = true;
+      });
+    }
+  }
+
+  Future<void> _openBetaReportDialog() async {
+    String selectedCategory = 'Sensori / Rilevamento Sosta';
+    final messageCtrl = TextEditingController();
+    bool sending = false;
+
+    final categories = [
+      'Sensori / Rilevamento Sosta',
+      'Notifica Silenzio-Assenso',
+      'Mappa / Ricerca Parcheggio',
+      'Bluetooth / Wi-Fi',
+      'Altro / Suggerimento',
+    ];
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          icon: Icon(Icons.bug_report, color: Colors.amber.shade900, size: 36),
+          title: const Text('Invia Segnalazione Beta'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Aiutaci a migliorare la precisione del sistema descrivendo cosa è successo:', style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  value: selectedCategory,
+                  isExpanded: true,
+                  decoration: const InputDecoration(labelText: 'Area interessata', border: OutlineInputBorder(), isDense: true),
+                  items: categories.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
+                  onChanged: (v) { if (v != null) setDialogState(() => selectedCategory = v); },
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: messageCtrl,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: 'Descrizione dettagliata',
+                    hintText: 'Es. Ero fermo al semaforo e ha rilevato sosta, oppure la notifica non è comparsa...',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: sending ? null : () => Navigator.pop(ctx),
+              child: const Text('Chiudi'),
+            ),
+            ElevatedButton.icon(
+              onPressed: sending
+                  ? null
+                  : () async {
+                      final msg = messageCtrl.text.trim();
+                      if (msg.isEmpty) return;
+                      setDialogState(() => sending = true);
+                      bool ok = false;
+                      try {
+                        final res = await http.post(
+                          Uri.parse('$_backendBaseUrl/api/beta/feedback'),
+                          headers: {'Content-Type': 'application/json'},
+                          body: json.encode({
+                            'userId': _userId,
+                            'category': selectedCategory,
+                            'message': msg,
+                            'diagnostics': {
+                              'searchRadiusM': _searchRadius,
+                              'hasWifiConfigured': _wifiController.text.trim().isNotEmpty,
+                              'hasBtConfigured': _btController.text.trim().isNotEmpty,
+                              'carInfo': '${_brandController.text.trim()} ${_modelController.text.trim()}'.trim(),
+                            },
+                          }),
+                        ).timeout(const Duration(seconds: 12));
+                        ok = res.statusCode == 200 || res.statusCode == 201;
+                      } catch (_) {}
+
+                      if (ctx.mounted) Navigator.pop(ctx);
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            backgroundColor: ok ? Colors.green.shade700 : Colors.orange.shade800,
+                            content: Text(ok
+                                ? 'Segnalazione inviata al team tecnico. Grazie per il contributo!'
+                                : 'Segnalazione salvata: verrà sincronizzata appena il server risponde.'),
+                          ),
+                        );
+                      }
+                    },
+              icon: const Icon(Icons.send),
+              label: Text(sending ? 'Invio...' : 'Invia Report'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber.shade900,
+                foregroundColor: Colors.white,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _saveProfile() async {
     setState(() => _isSaving = true);
+    if (_isBetaTester) _autoShare = true;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('auto_share_enabled', _autoShare);
     await prefs.setBool('is_beta_tester', _isBetaTester);
@@ -217,21 +382,52 @@ class _ProfileScreenState extends State<ProfileScreen> {
           const SizedBox(height: 12),
           Card(
             color: Colors.amber.shade50,
-            child: SwitchListTile(
-              secondary: Icon(Icons.science, color: Colors.amber.shade900),
-              title: const Text('Modalità Beta Tester', style: TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: const Text('Abilita il rilascio automatico Silenzio-Assenso e azzera i costi di utilizzo.'),
-              value: _isBetaTester,
-              onChanged: (v) => setState(() => _isBetaTester = v),
+            child: Column(
+              children: [
+                SwitchListTile(
+                  secondary: Icon(Icons.science, color: Colors.amber.shade900),
+                  title: const Text('Modalità Beta Tester', style: TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: const Text('Abilita il rilascio automatico Silenzio-Assenso e azzera i costi di utilizzo.'),
+                  value: _isBetaTester,
+                  onChanged: _onBetaTesterToggled,
+                ),
+                if (_isBetaTester)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _openBetaReportDialog,
+                        icon: Icon(Icons.bug_report, color: Colors.amber.shade900),
+                        label: Text('Invia Segnalazione / Feedback Beta', style: TextStyle(color: Colors.amber.shade900, fontWeight: FontWeight.bold)),
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(color: Colors.amber.shade800),
+                          backgroundColor: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
           const SizedBox(height: 12),
           Card(
+            color: _isBetaTester ? Colors.grey.shade100 : null,
             child: SwitchListTile(
-              title: const Text('Condivisione Automatica Parcheggio', style: TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: const Text('Rileva automaticamente sosta e ripartenza tramite sensori'),
-              value: _autoShare,
-              onChanged: (v) => setState(() => _autoShare = v),
+              title: Text(
+                'Condivisione Automatica Parcheggio',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: _isBetaTester ? Colors.grey.shade700 : null,
+                ),
+              ),
+              subtitle: Text(
+                _isBetaTester
+                    ? 'Attiva e obbligatoria in modalità Beta Tester per la raccolta dati.'
+                    : 'Rileva automaticamente sosta e ripartenza tramite sensori',
+              ),
+              value: _isBetaTester ? true : _autoShare,
+              onChanged: _isBetaTester ? null : (v) => setState(() => _autoShare = v),
             ),
           ),
           const SizedBox(height: 12),
