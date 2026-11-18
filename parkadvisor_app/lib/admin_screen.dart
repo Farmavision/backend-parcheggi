@@ -16,7 +16,7 @@ class _AdminScreenState extends State<AdminScreen> {
   bool _loading = false;
   String _adminPin = '';
 
-  final List> _zones = [];
+  final List<Map<String, dynamic>> _zones = [];
   final _rewardCtrl = TextEditingController(text: '10');
   final _feeCtrl = TextEditingController(text: '5');
   final _penaltyCtrl = TextEditingController(text: '15');
@@ -30,7 +30,7 @@ class _AdminScreenState extends State<AdminScreen> {
     );
   }
 
-  Future> _apiCall(String method, String path, {Map<String, dynamic>? body, String? pin}) async {
+  Future<Map<String, dynamic>> _apiCall(String method, String path, {Map<String, dynamic>? body, String? pin}) async {
     final uri = Uri.parse('$_backendBaseUrl$path');
     final headers = {'Content-Type': 'application/json', 'x-admin-pin': pin ?? _adminPin};
     http.Response res;
