@@ -15,6 +15,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   static const String _userId = 'USER-001';
 
   bool _autoShare = true;
+  bool _isBetaTester = false; // <-- Nuova variabile Beta Tester
   int _searchRadius = 500;
   int _creditsBalance = 50;
   bool _isSaving = false;
@@ -45,6 +46,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _autoShare = prefs.getBool('auto_share_enabled') ?? true;
+      _isBetaTester = prefs.getBool('is_beta_tester') ?? false; // <-- Carica stato Beta Tester
       final savedRadius = prefs.getInt('search_radius_m') ?? 500;
       _searchRadius = _allowedRadii.contains(savedRadius) ? savedRadius : 500;
       _creditsBalance = prefs.getInt('credits_balance') ?? 50;
@@ -67,6 +69,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         final remoteModel = data['car_model'] as String?;
         final remoteColor = data['car_color'] as String?;
         final remoteAutoShare = data['auto_share_enabled'] as bool?;
+        final remoteBetaTester = data['is_beta_tester'] as bool?; // <-- Predisposizione per Backend
         final remoteRadius = (data['search_radius_m'] as num?)?.toInt();
         final remoteWifi = data['home_wifi_ssid'] as String?;
         final remoteBt = data['car_bluetooth_mac'] as String?;
@@ -83,6 +86,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         if (remoteColor != null) await prefs.setString('car_color', remoteColor);
         if (decodedPlate.isNotEmpty) await prefs.setString('car_plate', decodedPlate);
         if (remoteAutoShare != null) await prefs.setBool('auto_share_enabled', remoteAutoShare);
+        if (remoteBetaTester != null) await prefs.setBool('is_beta_tester', remoteBetaTester); // <-- Salva stato remoto Beta
         if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) await prefs.setInt('search_radius_m', remoteRadius);
         if (remoteWifi != null) await prefs.setString('home_wifi_ssid', remoteWifi);
         if (remoteBt != null) await prefs.setString('car_bt_mac', remoteBt);
@@ -95,6 +99,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           if (remoteColor != null) _colorController.text = remoteColor;
           if (decodedPlate.isNotEmpty) _plateController.text = decodedPlate;
           if (remoteAutoShare != null) _autoShare = remoteAutoShare;
+          if (remoteBetaTester != null) _isBetaTester = remoteBetaTester; // <-- Aggiorna UI Beta
           if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) _searchRadius = remoteRadius;
           if (remoteWifi != null) _wifiController.text = remoteWifi;
           if (remoteBt != null) _btController.text = remoteBt;
@@ -107,6 +112,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     setState(() => _isSaving = true);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('auto_share_enabled', _autoShare);
+    await prefs.setBool('is_beta_tester', _isBetaTester); // <-- Salva stato Beta in locale
     await prefs.setInt('search_radius_m', _searchRadius);
     await prefs.setString('user_phone', _phoneController.text.trim());
     await prefs.setString('car_brand', _brandController.text.trim());
@@ -130,6 +136,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           'carColor': _colorController.text.trim(),
           'carPlate': _plateController.text.trim().toUpperCase(),
           'autoShareEnabled': _autoShare,
+          'isBetaTester': _isBetaTester, // <-- Invia stato Beta al backend
           'searchRadiusM': _searchRadius,
           'homeWifiSsid': _wifiController.text.trim(),
           'carBluetoothMac': _btController.text.trim().toUpperCase(),
@@ -182,16 +189,18 @@ class _ProfileScreenState extends State<ProfileScreen> {
         backgroundColor: Colors.blue.shade800,
         foregroundColor: Colors.white,
         actions: [
-        IconButton(
-          icon: const Icon(Icons.admin_panel_settings),
-          tooltip: 'Pannello Amministratore',
-          onPressed: () {
-            Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const AdminScreen()),
-            );
-          },
-        ),IconButton(icon: const Icon(Icons.refresh), onPressed: _loadProfileData)],
+          IconButton(
+            icon: const Icon(Icons.admin_panel_settings),
+            tooltip: 'Pannello Amministratore',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const AdminScreen()),
+              );
+            },
+          ),
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _loadProfileData)
+        ],
       ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
@@ -201,93 +210,3 @@ class _ProfileScreenState extends State<ProfileScreen> {
             child: ListTile(
               leading: Icon(Icons.account_balance_wallet, color: Colors.blue.shade800, size: 38),
               title: const Text('Borsellino Crediti', style: TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: const Text('Crediti maturati con rilascio verificato'),
-              trailing: Text('$_creditsBalance', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.green.shade700)),
-            ),
-          ),
-          const SizedBox(height: 18),
-          const Text('ACCOUNT', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.grey)),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _phoneController,
-            keyboardType: TextInputType.phone,
-            decoration: const InputDecoration(labelText: 'Numero di Cellulare', prefixIcon: Icon(Icons.phone_android), border: OutlineInputBorder()),
-          ),
-          const SizedBox(height: 18),
-          const Text('IL TUO VEICOLO', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.grey)),
-          const SizedBox(height: 8),
-          Row(children: [
-            Expanded(child: TextField(controller: _brandController, decoration: const InputDecoration(labelText: 'Marca', border: OutlineInputBorder()))),
-            const SizedBox(width: 10),
-            Expanded(child: TextField(controller: _modelController, decoration: const InputDecoration(labelText: 'Modello', border: OutlineInputBorder()))),
-          ]),
-          const SizedBox(height: 10),
-          Row(children: [
-            Expanded(child: TextField(controller: _colorController, decoration: const InputDecoration(labelText: 'Colore', border: OutlineInputBorder()))),
-            const SizedBox(width: 10),
-            Expanded(child: TextField(controller: _plateController, textCapitalization: TextCapitalization.characters, onChanged: (_) => setState(() {}), decoration: const InputDecoration(labelText: 'Targa', border: OutlineInputBorder()))),
-          ]),
-          Padding(
-            padding: const EdgeInsets.only(top: 6, left: 4),
-            child: Text('Visibilità pubblica targa (ultime 2 cifre): $_maskedPlatePreview', style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade700)),
-          ),
-          const SizedBox(height: 18),
-          const Text('RILASCIO PARCHEGGIO', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.grey)),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Notifica / Condivisione Automatica'),
-            subtitle: Text(_autoShare
-                ? 'Attiva: se ignori il pop-up <100m, libera in automatico all\'aggancio BT/GPS/Giroscopio'
-                : 'Manuale: libera lo stallo solo su conferma esplicita del pop-up'),
-            value: _autoShare,
-            onChanged: (v) => setState(() => _autoShare = v),
-          ),
-          const SizedBox(height: 14),
-          Text('RAGGIO DI RICERCA: $_searchRadius metri', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.grey)),
-          Slider(
-            value: _allowedRadii.indexOf(_searchRadius).toDouble(),
-            min: 0,
-            max: (_allowedRadii.length - 1).toDouble(),
-            divisions: _allowedRadii.length - 1,
-            label: '$_searchRadius m',
-            onChanged: (v) => setState(() => _searchRadius = _allowedRadii[v.toInt()]),
-          ),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: _allowedRadii.map((r) => Text('${r}m', style: const TextStyle(fontSize: 12, color: Colors.grey))).toList(),
-          ),
-          const SizedBox(height: 14),
-          ExpansionTile(
-            tilePadding: EdgeInsets.zero,
-            title: const Text('Sensori Smart (Opzionale)', style: TextStyle(fontWeight: FontWeight.w600)),
-            children: [
-              const SizedBox(height: 8),
-              TextField(controller: _wifiController, decoration: const InputDecoration(labelText: 'Wi-Fi Casa/Ufficio', prefixIcon: Icon(Icons.wifi), border: OutlineInputBorder())),
-              const SizedBox(height: 10),
-              TextField(controller: _btController, decoration: const InputDecoration(labelText: 'MAC Bluetooth Auto', prefixIcon: Icon(Icons.bluetooth_connected), border: OutlineInputBorder())),
-            ],
-          ),
-        ],
-      ),
-      bottomNavigationBar: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-          child: SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.blue.shade800,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 15),
-              ),
-              icon: const Icon(Icons.save),
-              label: Text(_isSaving ? 'SALVATAGGIO...' : 'SALVA PROFILO', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              onPressed: _isSaving ? null : _saveProfile,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}

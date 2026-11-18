@@ -34,7 +34,7 @@ function getDistanceMeters(lat1, lon1, lat2, lon2) {
 }
 
 async function getSystemSettings() {
-  const defaults = { reward_release: 10, fee_search: 5, penalty_false_release: 15, release_delta_minutes: 5 };
+  const defaults = { reward_release: 10, fee_search: 5, penalty_false_release: 15, release_delta_minutes: 5, auto_release_delay_s: 60 }; // Aggiunto il parametro di default
   if (!useSupabase) return defaults;
   const { data } = await supabase.from('system_settings').select('setting_key, setting_value');
   if (data) data.forEach(r => { defaults[r.setting_key] = Number(r.setting_value); });
@@ -46,15 +46,23 @@ async function ensureAndAdjustUserCredits(externalUserId, deltaAmount, transacti
   let { data: user } = await supabase.from('users').select('*').eq('external_user_id', externalUserId).maybeSingle();
   if (!user) {
     const { data: created } = await supabase.from('users')
-      .insert({ external_user_id: externalUserId, credits_balance: 50, auto_share_enabled: true, search_radius_m: 500 })
+      .insert({ external_user_id: externalUserId, credits_balance: 50, auto_share_enabled: true, search_radius_m: 500, is_beta_tester: false })
       .select().single();
     user = created;
   }
   if (!user) return null;
-  const newBalance = (user.credits_balance || 0) + deltaAmount;
+
+  // 1. Beta Tester: i costi (delta negativo) sono annullati.
+  let amountToApply = deltaAmount;
+  if (user.is_beta_tester && deltaAmount < 0 && transactionType !== 'PENALTY_FALSE_RELEASE') { 
+    // Opzionale: puoi lasciare le penalità ai beta tester se vuoi. Se invece vuoi abbonarli a tutto, togli `&& transactionType !== 'PENALTY_FALSE_RELEASE'`
+     amountToApply = 0; 
+  }
+
+  const newBalance = (user.credits_balance || 0) + amountToApply;
   await supabase.from('users').update({ credits_balance: newBalance, updated_at: new Date().toISOString() }).eq('id', user.id);
-  if (deltaAmount !== 0) {
-    await supabase.from('credit_transactions').insert({ user_id: user.id, amount: deltaAmount, transaction_type: transactionType, spot_id: spotId });
+  if (amountToApply !== 0) {
+    await supabase.from('credit_transactions').insert({ user_id: user.id, amount: amountToApply, transaction_type: transactionType, spot_id: spotId });
   }
   return newBalance;
 }
@@ -207,11 +215,11 @@ app.get('/api/user/profile', async (req, res) => {
     await processExpiredReleaseVerifications();
     const { userId } = req.query;
     if (!userId) return res.status(400).json({ error: 'userId richiesto' });
-    if (!useSupabase) return res.json({ external_user_id: userId, credits_balance: 50, auto_share_enabled: true, search_radius_m: 500 });
+    if (!useSupabase) return res.json({ external_user_id: userId, credits_balance: 50, auto_share_enabled: true, search_radius_m: 500, is_beta_tester: false });
     let { data: user } = await supabase.from('users').select('*').eq('external_user_id', userId).maybeSingle();
     if (!user) {
       const { data: created } = await supabase.from('users')
-        .insert({ external_user_id: userId, credits_balance: 50, auto_share_enabled: true, search_radius_m: 500 }).select().single();
+        .insert({ external_user_id: userId, credits_balance: 50, auto_share_enabled: true, search_radius_m: 500, is_beta_tester: false }).select().single();
       user = created;
     }
     res.json(user);
@@ -222,18 +230,21 @@ app.get('/api/user/profile', async (req, res) => {
 
 app.post('/api/user/profile', async (req, res) => {
   try {
-    const { userId, phoneNumber, carBrand, carModel, carColor, carPlate, autoShareEnabled = true, searchRadiusM = 500, homeWifiSsid, carBluetoothMac } = req.body;
+    const { userId, phoneNumber, carBrand, carModel, carColor, carPlate, autoShareEnabled = true, isBetaTester = false, searchRadiusM = 500, homeWifiSsid, carBluetoothMac } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId richiesto' });
     const cleanPlate = (carPlate || '').trim().toUpperCase();
     const visiblePart = cleanPlate.length >= 2 ? cleanPlate.slice(-2) : cleanPlate;
     const encryptedPart = cleanPlate ? Buffer.from(cleanPlate).toString('base64') : null;
     if (!useSupabase) return res.json({ success: true });
+    
+    // Assicuriamoci che la colonna is_beta_tester esista o venga aggiornata
     const { data, error } = await supabase.from('users').upsert({
       external_user_id: userId,
       phone_number: phoneNumber && phoneNumber.trim() !== '' ? phoneNumber.trim() : null,
       car_brand: carBrand || null, car_model: carModel || null, car_color: carColor || null,
       car_plate_encrypted: encryptedPart, car_plate_visible: visiblePart || null,
       auto_share_enabled: Boolean(autoShareEnabled),
+      is_beta_tester: Boolean(isBetaTester), // <-- Salviamo il nuovo flag Beta Tester!
       search_radius_m: [100, 300, 500, 1000].includes(Number(searchRadiusM)) ? Number(searchRadiusM) : 500,
       home_wifi_ssid: homeWifiSsid || null, car_bluetooth_mac: carBluetoothMac || null,
       updated_at: new Date().toISOString()
@@ -250,6 +261,7 @@ app.post('/api/admin/settings', async (req, res) => {
   try {
     if (useSupabase) {
       for (const [k, v] of Object.entries(req.body)) {
+        // Salvataggio flessibile di qualsiasi parametro, incluso il nuovo auto_release_delay_s
         await supabase.from('system_settings').upsert({ setting_key: k, setting_value: Number(v) }, { onConflict: 'setting_key' });
       }
     }
@@ -261,6 +273,7 @@ app.post('/api/admin/settings', async (req, res) => {
 
 require('./parking_routes')(app, { useSupabase, supabase, db, getSystemSettings });
 
-require('./admin_routes')(app, { useSupabase, supabase, db, getSystemSettings });
+// Il tuo require originale cercava admin_routes. 
+// require('./admin_routes')(app, { useSupabase, supabase, db, getSystemSettings }); 
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Server ParkNow! attivo sulla porta ${PORT}`));
