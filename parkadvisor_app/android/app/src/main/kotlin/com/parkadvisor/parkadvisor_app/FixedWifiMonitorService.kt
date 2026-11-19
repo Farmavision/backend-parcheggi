@@ -45,7 +45,7 @@ class FixedWifiMonitorService : Service() {
         val action = intent?.action ?: ACTION_START
         when (action) {
             ACTION_START -> {
-                startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Monitoraggio Wi-Fi fisse e sosta attivo"))
+                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Monitoraggio Wi-Fi fisse e sosta attivo"))
             }
             ACTION_WIFI_DISCONNECTED -> {
                 val disconnectedSsid = intent?.getStringExtra("ssid") ?: "Wi-Fi fissa"
@@ -57,7 +57,7 @@ class FixedWifiMonitorService : Service() {
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.cancel(NOTIF_WIFI_EXIT_ID)
                 triggerServerRelease(4)
-                startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Rilascio stallo confermato (4 min)"))
+                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Rilascio stallo confermato (4 min)"))
             }
             ACTION_USER_IGNORE_WALK -> {
                 cancelEscalation()
@@ -66,7 +66,7 @@ class FixedWifiMonitorService : Service() {
                 nm.cancel(NOTIF_WIFI_EXIT_ID)
                 val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
                 prefs.edit().putLong("flutter.walk_snooze_until", System.currentTimeMillis() + 30 * 60 * 1000L).apply()
-                startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita a piedi: monitoraggio in pausa 30 min"))
+                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita a piedi: monitoraggio in pausa 30 min"))
             }
         }
         return START_STICKY
@@ -115,7 +115,7 @@ class FixedWifiMonitorService : Service() {
                     .apply()
                 cancelEscalation()
                 stopGpsTracking()
-                startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Connesso a $ssid (GPS in stand-by)"))
+                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Connesso a $ssid (GPS in stand-by)"))
             }
         } catch (_: Exception) {}
     }
@@ -128,7 +128,7 @@ class FixedWifiMonitorService : Service() {
         val snoozeUntil = prefs.getLong("flutter.walk_snooze_until", 0L)
         if (System.currentTimeMillis() < snoozeUntil) return
 
-        startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita da $ssidName rilevata: in attesa risposta..."))
+        safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita da $ssidName rilevata: in attesa risposta..."))
         showWifiExitNotification(ssidName)
 
         val waitSec = prefs.getInt("flutter.wifi_exit_timeout_sec", 35).coerceIn(5, 300)
@@ -136,7 +136,7 @@ class FixedWifiMonitorService : Service() {
         escalationRunnable = Runnable {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.cancel(NOTIF_WIFI_EXIT_ID)
-            startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Notifica ignorata (${waitSec}s): GPS avvicinamento attivo"))
+            safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Notifica ignorata (${waitSec}s): GPS avvicinamento attivo"))
             startGpsTracking()
         }
         handler.postDelayed(escalationRunnable!!, waitSec * 1000L)
@@ -183,7 +183,7 @@ class FixedWifiMonitorService : Service() {
             gpsTimeoutRunnable?.let { handler.removeCallbacks(it) }
             gpsTimeoutRunnable = Runnable {
                 stopGpsTracking()
-                startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("GPS spento dopo ${idleMin}m senza avvicinamento"))
+                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("GPS spento dopo ${idleMin}m senza avvicinamento"))
             }
             handler.postDelayed(gpsTimeoutRunnable!!, idleMin * 60 * 1000L)
         } catch (_: SecurityException) {}
@@ -290,6 +290,14 @@ class FixedWifiMonitorService : Service() {
             }
             nm.createNotificationChannel(chMonitor)
             nm.createNotificationChannel(chAlert)
+        }
+    }
+
+    private fun safeStartForeground(id: Int, notif: Notification) {
+        try {
+            startForeground(id, notif)
+        } catch (_: Exception) {
+            stopSelf()
         }
     }
 

@@ -112,6 +112,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
   Future<void> initialize() async {
     await [Permission.activityRecognition, Permission.bluetoothConnect, Permission.locationWhenInUse, Permission.notification].request();
+    try { await const MethodChannel('parknow/bg_service').invokeMethod('startMonitorService'); } catch (_) {}
     final prefs = await SharedPreferences.getInstance();
     parkedLat = prefs.getDouble('parked_lat');
     parkedLon = prefs.getDouble('parked_lon');
