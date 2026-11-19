@@ -20,6 +20,8 @@ class _AdminScreenState extends State<AdminScreen> {
   final _rewardCtrl = TextEditingController(text: '10');
   final _feeCtrl = TextEditingController(text: '5');
   final _penaltyCtrl = TextEditingController(text: '15');
+  final _wifiExitSecCtrl = TextEditingController(text: '35');
+  final _gpsIdleMinCtrl = TextEditingController(text: '12');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
 
@@ -77,6 +79,8 @@ class _AdminScreenState extends State<AdminScreen> {
           if (data['fee_search'] != null) _feeCtrl.text = data['fee_search'].toString();
           if (data['penalty_false_release'] != null) _penaltyCtrl.text = data['penalty_false_release'].toString();
           if (data['release_delta_minutes'] != null) _deltaCtrl.text = data['release_delta_minutes'].toString();
+      if (data['wifi_exit_timeout_sec'] != null) _wifiExitSecCtrl.text = data['wifi_exit_timeout_sec'].toString();
+      if (data['gps_idle_timeout_min'] != null) _gpsIdleMinCtrl.text = data['gps_idle_timeout_min'].toString();
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
             final val = int.tryParse(_autoReleaseDelayCtrl.text);
@@ -98,7 +102,9 @@ class _AdminScreenState extends State<AdminScreen> {
         'reward_release': int.tryParse(_rewardCtrl.text) ?? 10,
         'fee_search': int.tryParse(_feeCtrl.text) ?? 5,
         'penalty_false_release': int.tryParse(_penaltyCtrl.text) ?? 15,
-        'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
+        'wifi_exit_timeout_sec': int.tryParse(_wifiExitSecCtrl.text) ?? 35,
+      'gps_idle_timeout_min': int.tryParse(_gpsIdleMinCtrl.text) ?? 12,
+      'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
       });
       if (r['status'] == 200) {
@@ -236,6 +242,34 @@ class _AdminScreenState extends State<AdminScreen> {
                     labelText: 'Finestra Verifica Rilascio (minuti)',
                     helperText: 'Tempo massimo concesso per liberare lo stallo dopo la conferma.',
                     border: OutlineInputBorder(),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _wifiExitSecCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Attesa risposta notifica uscita Wi-Fi (secondi)',
+                helperText: 'Default: 35s. Se ignorata, attiva GPS in background.',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (v) async {
+                final p = await SharedPreferences.getInstance();
+                await p.setInt('wifi_exit_timeout_sec', int.tryParse(v) ?? 35);
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _gpsIdleMinCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Timeout spegnimento GPS senza avvicinamento (minuti)',
+                helperText: 'Default: 12m. Spegne il GPS se non ti avvicini all\u0027auto.',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (v) async {
+                final p = await SharedPreferences.getInstance();
+                await p.setInt('gps_idle_timeout_min', int.tryParse(v) ?? 12);
+              },
+            ),
                   ),
                 ),
                 const SizedBox(height: 14),

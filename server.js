@@ -34,7 +34,7 @@ function getDistanceMeters(lat1, lon1, lat2, lon2) {
 }
 
 async function getSystemSettings() {
-  const defaults = { reward_release: 10, fee_search: 5, penalty_false_release: 15, release_delta_minutes: 5, auto_release_delay_s: 60 }; // Aggiunto il parametro di default
+  const defaults = { reward_release: 10, fee_search: 5, penalty_false_release: 15, wifi_exit_timeout_sec: 35, gps_idle_timeout_min: 12, release_delta_minutes: 5, auto_release_delay_s: 60 }; // Aggiunto il parametro di default
   if (!useSupabase) return defaults;
   const { data } = await supabase.from('system_settings').select('setting_key, setting_value');
   if (data) data.forEach(r => { defaults[r.setting_key] = Number(r.setting_value); });

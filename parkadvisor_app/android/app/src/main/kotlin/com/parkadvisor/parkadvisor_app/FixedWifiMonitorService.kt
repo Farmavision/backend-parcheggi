@@ -30,6 +30,7 @@ class FixedWifiMonitorService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var escalationRunnable: Runnable? = null
+    private var gpsTimeoutRunnable: Runnable? = null
     private var gpsActive = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var locationListener: LocationListener? = null
@@ -130,14 +131,15 @@ class FixedWifiMonitorService : Service() {
         startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita da $ssidName rilevata: in attesa risposta..."))
         showWifiExitNotification(ssidName)
 
+        val waitSec = prefs.getInt("flutter.wifi_exit_timeout_sec", 35).coerceIn(5, 300)
         cancelEscalation()
         escalationRunnable = Runnable {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.cancel(NOTIF_WIFI_EXIT_ID)
-            startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Notifica ignorata: GPS avvicinamento auto attivo"))
+            startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Notifica ignorata (${waitSec}s): GPS avvicinamento attivo"))
             startGpsTracking()
         }
-        handler.postDelayed(escalationRunnable!!, 35000L)
+        handler.postDelayed(escalationRunnable!!, waitSec * 1000L)
     }
 
     private fun cancelEscalation() {
@@ -176,10 +178,20 @@ class FixedWifiMonitorService : Service() {
         try {
             lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 4000L, 5f, locationListener!!, Looper.getMainLooper())
             gpsActive = true
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val idleMin = prefs.getInt("flutter.gps_idle_timeout_min", 12).coerceIn(1, 120)
+            gpsTimeoutRunnable?.let { handler.removeCallbacks(it) }
+            gpsTimeoutRunnable = Runnable {
+                stopGpsTracking()
+                startForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("GPS spento dopo ${idleMin}m senza avvicinamento"))
+            }
+            handler.postDelayed(gpsTimeoutRunnable!!, idleMin * 60 * 1000L)
         } catch (_: SecurityException) {}
     }
 
     private fun stopGpsTracking() {
+        gpsTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        gpsTimeoutRunnable = null
         if (!gpsActive) return
         try {
             val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
