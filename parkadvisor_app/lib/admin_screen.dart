@@ -242,6 +242,8 @@ class _AdminScreenState extends State<AdminScreen> {
                     labelText: 'Finestra Verifica Rilascio (minuti)',
                     helperText: 'Tempo massimo concesso per liberare lo stallo dopo la conferma.',
                     border: OutlineInputBorder(),
+
+                  ),
             const SizedBox(height: 12),
             TextField(
               controller: _wifiExitSecCtrl,
@@ -270,7 +272,6 @@ class _AdminScreenState extends State<AdminScreen> {
                 await p.setInt('gps_idle_timeout_min', int.tryParse(v) ?? 12);
               },
             ),
-                  ),
                 ),
                 const SizedBox(height: 14),
                 TextField(
