@@ -485,7 +485,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 children: [
                   const Text('Sensori & Automazione', style: TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 12),
-                  TextField(controller: _wifiController, decoration: const InputDecoration(labelText: 'Nome Wi-Fi Casa (esclude falsi rilascio)', border: OutlineInputBorder(), isDense: true)),
+                  TextField(controller: _wifiController, decoration: const InputDecoration(labelText: 'Wi-Fi Fisse Casa/Lavoro (separate da virgola)', border: OutlineInputBorder(), isDense: true)),
                   const SizedBox(height: 10),
                   TextField(controller: _btController, decoration: const InputDecoration(labelText: 'MAC Bluetooth Auto', border: OutlineInputBorder(), isDense: true)),
                 ],
