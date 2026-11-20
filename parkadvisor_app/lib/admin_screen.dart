@@ -24,6 +24,7 @@ class _AdminScreenState extends State<AdminScreen> {
   final _xtGpsAttivoSecCtrl = TextEditingController(text: '10');
   final _xtGpsMaxAttivoMinCtrl = TextEditingController(text: '5');
   final _xtGpsDisattivoSecCtrl = TextEditingController(text: '15');
+  final _geofenceRadiusMCtrl = TextEditingController(text: '100');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
 
@@ -83,10 +84,12 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
     final gpsAtt = int.tryParse(_xtGpsAttivoSecCtrl.text) ?? 10;
     final gpsMax = int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5;
     final gpsDis = int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15;
-    SharedPreferences.getInstance().then((s){s.setInt('xt_rit_not_sec',ritNot);s.setInt('xt_gps_attivo_sec',gpsAtt);s.setInt('xt_gps_max_attivo_min',gpsMax);s.setInt('xt_gps_disattivo_sec',gpsDis);});
+    final geoRad = (int.tryParse(_geofenceRadiusMCtrl.text) ?? 100).clamp(20, 2000);
+    SharedPreferences.getInstance().then((s){s.setInt('xt_rit_not_sec',ritNot);s.setInt('xt_gps_attivo_sec',gpsAtt);s.setInt('xt_gps_max_attivo_min',gpsMax);s.setInt('xt_gps_disattivo_sec',gpsDis);s.setInt('geofence_radius_m',geoRad);});
           if (data['penalty_false_release'] != null) _penaltyCtrl.text = data['penalty_false_release'].toString();
           if (data['release_delta_minutes'] != null) _deltaCtrl.text = data['release_delta_minutes'].toString();
-      SharedPreferences.getInstance().then((spLoad) { _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString(); _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString(); _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString(); _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString(); });
+      SharedPreferences.getInstance().then((spLoad) { _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString(); _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString(); _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString(); _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString();
+          _geofenceRadiusMCtrl.text = (data['geofence_radius_m'] ?? spLoad.getInt('geofence_radius_m') ?? 100).toString(); });
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
             final val = int.tryParse(_autoReleaseDelayCtrl.text);
@@ -114,6 +117,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       'xt_gps_attivo_sec': int.tryParse(_xtGpsAttivoSecCtrl.text) ?? 10,
       'xt_gps_max_attivo_min': int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5,
       'xt_gps_disattivo_sec': int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15,
+      'geofence_radius_m': (int.tryParse(_geofenceRadiusMCtrl.text) ?? 100).clamp(20, 2000),
       'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
       });
@@ -292,6 +296,16 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           decoration: const InputDecoration(
             labelText: 'Xt.gps.disattivo — Ritardo rientro GPS risparmio energetico (sec)',
             helperText: 'Default: 15s. Stabilizzazione prima di riportare il GPS standard.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _geofenceRadiusMCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Raggio Geofence auto (metri)',
+            helperText: 'Default: 100m (min 20m). Distanza attivazione rilevamento intorno allo stallo.',
             border: OutlineInputBorder(),
           ),
         ),

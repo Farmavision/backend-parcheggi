@@ -78,6 +78,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private var passedThroughStall = false
     private var vehicularSamples = 0
     private var initialGpsDistanceMeters: Float? = null
+    private var lastGeofenceCoords: Pair<Double, Double>? = null
+    private var lastGeofenceRadiusMeters: Float = -1f
 
     private var hasStepSensor = false
     private var lastStepTimestampMs = 0L
@@ -155,6 +157,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun getXtGpsAttivoSec(): Long = (prefs.getInt("flutter.xt_gps_attivo_sec", 10)).coerceAtLeast(0).toLong()
     private fun getXtGpsMaxAttivoMin(): Long = (prefs.getInt("flutter.xt_gps_max_attivo_min", 5)).coerceAtLeast(1).toLong()
     private fun getXtGpsDisattivoSec(): Long = (prefs.getInt("flutter.xt_gps_disattivo_sec", 15)).coerceAtLeast(0).toLong()
+    private fun getGeofenceRadiusMeters(): Float = (prefs.getInt("flutter.geofence_radius_m", 100)).coerceIn(20, 2000).toFloat()
 
     private fun hasActiveParking(): Boolean {
         return prefs.contains("flutter.parked_lat") && prefs.contains("flutter.parked_lon")
@@ -286,6 +289,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         if (coords == null) {
             promptShownForCurrentSession = false
             activeScenario = "NONE"
+            lastGeofenceCoords = null
+            lastGeofenceRadiusMeters = -1f
             try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
             return
         }
@@ -294,9 +299,15 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             return
         }
 
+        val radiusMeters = getGeofenceRadiusMeters()
+        if (lastGeofenceCoords == coords && lastGeofenceRadiusMeters == radiusMeters) return
+        try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
+        lastGeofenceCoords = coords
+        lastGeofenceRadiusMeters = radiusMeters
+
         val geofence = Geofence.Builder()
             .setRequestId(GEOFENCE_REQ_ID)
-            .setCircularRegion(coords.first, coords.second, 100f)
+            .setCircularRegion(coords.first, coords.second, radiusMeters)
             .setExpirationDuration(Geofence.NEVER_EXPIRE)
             .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER)
             .build()
@@ -439,12 +450,13 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             initialGpsDistanceMeters = distMeters
         }
 
-        if (distMeters <= 100f) {
+        val geoRadius = getGeofenceRadiusMeters()
+        if (distMeters <= geoRadius) {
             inExitAnalysis = true
         }
 
         val initDist = initialGpsDistanceMeters ?: distMeters
-        if (!inExitAnalysis && distMeters > initDist + 50f && distMeters > 160f) {
+        if (!inExitAnalysis && distMeters > initDist + 50f && distMeters > geoRadius + 60f) {
             closeTrackingAndSchedulePowerSave()
             return
         }

@@ -61,6 +61,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
   bool _gyroTransitionDetected = false;
   bool _notified100m = false;
+  double geofenceRadiusMeters = 100.0;
   bool _passedThroughStall = false;
   int _vehicularSpeedSamples = 0;
   DateTime? _lastHumanStepAt;
@@ -316,7 +317,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
       if (isCarParked && parkedLat != null && parkedLon != null) {
         distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
-        if (distanceFromCarMeters! <= 100.0 && !_notified100m) {
+        if (distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m) {
           _notified100m = true;
           _autoReleaseManager.startCountdownIfBetaTester();
           await onApproachingCar100m(estimatedMinutesToRelease);
