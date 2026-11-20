@@ -34,7 +34,11 @@ class NotificationService {
       'Avvisi Urgenti Rilascio Parcheggio',
       channelDescription: 'Avvisi di conto alla rovescia per rilascio stallo',
       importance: Importance.max,
-      priority: Priority.high,
+      priority: Priority.max,
+      fullScreenIntent: true,
+      category: AndroidNotificationCategory.alarm,
+      visibility: NotificationVisibility.public,
+      audioAttributesUsage: AudioAttributesUsage.alarm,
       actions: <AndroidNotificationAction>[
         AndroidNotificationAction(
           'CONFIRM_RELEASE_NOW',
@@ -48,19 +52,14 @@ class NotificationService {
           showsUserInterface: false,
           cancelNotification: true,
         ),
-        AndroidNotificationAction(
-          'CANCEL_RELEASE',
-          'Non sto partendo (Annulla)',
-          showsUserInterface: true,
-          cancelNotification: true,
-        ),
+        
       ],
     );
     final NotificationDetails details = NotificationDetails(android: androidDetails);
     await flutterLocalNotificationsPlugin.show(
       id: 1001,
-      title: 'Rilascio parcheggio tra ${delaySeconds}s',
-      body: 'Ti stai avvicinando all\'auto. Tocca Annulla se non stai ripartendo.',
+      title: 'Stai lasciando il parcheggio?',
+      body: 'Conferma per liberare lo stallo oppure rifiuta.',
       notificationDetails: details,
     );
   }

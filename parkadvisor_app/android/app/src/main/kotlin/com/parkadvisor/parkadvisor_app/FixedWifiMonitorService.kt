@@ -48,7 +48,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     companion object {
         const val CHANNEL_FG = "parknow_fg_service_v1"
-        const val CHANNEL_ALERT = "parknow_urgent_alert_v2"
+        const val CHANNEL_ALERT = "parknow_urgent_alarm_v3"
         const val FG_NOTIF_ID = 4101
         const val PROMPT_NOTIF_ID = 4102
         const val RELEASED_NOTIF_ID = 4104
@@ -83,6 +83,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private var lastStepTimestampMs = 0L
     private var recentStepCount = 0
     private var isCarBtConnected = false
+    private var activeRingtone: android.media.Ringtone? = null
 
     private var wifiDebounceRunnable: Runnable? = null
     private var gpsActivateDelayRunnable: Runnable? = null
@@ -547,7 +548,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             val fgChannel = NotificationChannel(CHANNEL_FG, "Monitoraggio Parcheggio Attivo", NotificationManager.IMPORTANCE_LOW)
             nm.createNotificationChannel(fgChannel)
 
-            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM) ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
             val audioAttrs = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
@@ -579,6 +580,29 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
+    
+    private fun wakeUpScreenAndSoundAlarm() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            @Suppress("DEPRECATION")
+            val wl = pm.newWakeLock(android.os.PowerManager.FULL_WAKE_LOCK or android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP or android.os.PowerManager.ON_AFTER_RELEASE, "parkadvisor:UrgentWakeLock")
+            wl.acquire(15_000L)
+        } catch (_: Exception) {}
+        try {
+            stopAlarmRingtone()
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM) ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            val rt = RingtoneManager.getRingtone(applicationContext, uri)
+            rt?.audioAttributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) rt?.isLooping = true
+            rt?.play()
+            activeRingtone = rt
+            handler.postDelayed({ stopAlarmRingtone() }, 12_000L)
+        } catch (_: Exception) {}
+    }
+    private fun stopAlarmRingtone() {
+        try { activeRingtone?.stop(); activeRingtone = null } catch (_: Exception) {}
+    }
+
     private fun showReleasePromptNotification() {
         val openPi = PendingIntent.getActivity(this, 20, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val confirmPi = PendingIntent.getBroadcast(
@@ -607,11 +631,15 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Rifiuta / Non parto", denyPi)
             .build()
 
+        wakeUpScreenAndSoundAlarm()
+        prefs.edit().putBoolean("flutter.pending_lockscreen_alarm", true).apply()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(PROMPT_NOTIF_ID, notif)
     }
 
     private fun cancelPromptNotification() {
+        stopAlarmRingtone()
+        prefs.edit().putBoolean("flutter.pending_lockscreen_alarm", false).apply()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.cancel(PROMPT_NOTIF_ID)
     }

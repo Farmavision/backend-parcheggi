@@ -178,21 +178,21 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (ctx) => AlertDialog(
         icon: const Icon(Icons.notifications_active, color: Colors.orange, size: 34),
         title: const Text('Ti stai avvicinando all\'auto!'),
-        content: Text('Sei entro 100m dal tuo veicolo (arrivo stimato in $minLabel).\n\nVuoi segnalare che stai per liberare il posto? (Se sei Beta Tester, il rilascio avverrà in automatico allo scadere del timer).'),
+        content: Text('Sei entro 100m dal tuo veicolo (arrivo stimato in $minLabel).\n\nSe ignori questo avviso, il rilascio scatterà automaticamente solo alla ripartenza in auto.'),
         actions: [
           TextButton(
             onPressed: () {
               _sensorEngine.cancelAutoRelease();
               Navigator.pop(ctx);
             },
-            child: const Text('Non sto partendo'),
+            child: const Text('Rifiuta / Non parto'),
           ),
           ElevatedButton(
             onPressed: () {
               _sensorEngine.confirmManualRelease(estimatedMinutes);
               Navigator.pop(ctx);
             },
-            child: const Text('Conferma Uscita'),
+            child: const Text('Conferma Rilascio'),
           ),
         ],
       ),
