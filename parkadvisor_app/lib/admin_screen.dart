@@ -83,15 +83,11 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
     final gpsAtt = int.tryParse(_xtGpsAttivoSecCtrl.text) ?? 10;
     final gpsMax = int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5;
     final gpsDis = int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15;
-    final spSave = await SharedPreferences.getInstance();
-    await spSave.setInt('xt_rit_not_sec', ritNot);
-    await spSave.setInt('xt_gps_attivo_sec', gpsAtt);
-    await spSave.setInt('xt_gps_max_attivo_min', gpsMax);
-    await spSave.setInt('xt_gps_disattivo_sec', gpsDis);
+    SharedPreferences.getInstance().then((s){s.setInt('xt_rit_not_sec',ritNot);s.setInt('xt_gps_attivo_sec',gpsAtt);s.setInt('xt_gps_max_attivo_min',gpsMax);s.setInt('xt_gps_disattivo_sec',gpsDis);});
           if (data['penalty_false_release'] != null) _penaltyCtrl.text = data['penalty_false_release'].toString();
           if (data['release_delta_minutes'] != null) _deltaCtrl.text = data['release_delta_minutes'].toString();
-      final spLoad = await SharedPreferences.getInstance();
-        _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString();
+      SharedPreferences.getInstance().then((spLoad){
+        _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString();});
         _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString();
         _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString();
         _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString();

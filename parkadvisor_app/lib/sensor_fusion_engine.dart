@@ -60,12 +60,11 @@ class SensorFusionEngine extends ChangeNotifier {
   Timer? _btCheckTimer;
 
   bool _gyroTransitionDetected = false;
-  bool _notified100m = false; _passedThroughStall = false; _vehicularSpeedSamples = 0;
+  bool _notified100m = false;
   bool _passedThroughStall = false;
   int _vehicularSpeedSamples = 0;
   DateTime? _lastHumanStepAt;
   Timer? _gpsDeactivateTimer;
-  int _vehicularSpeedSamples = 0;
   bool _manualReleaseConfirmed = false;
   bool _autoShareSkippedNotified = false;
   int? _lastSentEta;
@@ -163,13 +162,13 @@ class SensorFusionEngine extends ChangeNotifier {
         if (distanceFromCarMeters! <= 30.0) {
           _passedThroughStall = true;
         }
-        if (_passedThroughStall && isCarBluetoothConnected && distanceFromCarMeters! > 15.0) {
+        if (_passedThroughStall && isCarBtConnected && distanceFromCarMeters! > 15.0) {
           _vehicularSpeedSamples = 0;
           _passedThroughStall = false;
           await _triggerCarReleased();
           return;
         }
-        final double speedKmh = (pos.speed.isFinite && pos.speed > 0) ? pos.speed * 3.6 : 0.0;
+        final double speedKmh = currentSpeedKmh;
         final bool stepsStopped = _lastHumanStepAt != null &&
             DateTime.now().difference(_lastHumanStepAt!).inSeconds >= 6;
         if (_passedThroughStall && stepsStopped && speedKmh >= 16.0 && distanceFromCarMeters! > 40.0) {

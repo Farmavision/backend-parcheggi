@@ -53,6 +53,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         const val PROMPT_NOTIF_ID = 4102
         const val RELEASED_NOTIF_ID = 4104
 
+        const val ACTION_START = "com.parkadvisor.ACTION_START"
         const val ACTION_CONFIRM_RELEASE = "com.parkadvisor.ACTION_CONFIRM_RELEASE"
         const val ACTION_DENY_RELEASE = "com.parkadvisor.ACTION_DENY_RELEASE"
         const val ACTION_GEOFENCE_TRANSITION = "com.parkadvisor.ACTION_GEOFENCE_TRANSITION"

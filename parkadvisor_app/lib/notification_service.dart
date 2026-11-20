@@ -10,7 +10,6 @@ class NotificationService {
   Function()? onCancelReleaseAction;
   Function()? onConfirmReleaseAction;
   Function()? onDenyReleaseAction;
-  Function()? onConfirmReleaseAction;
 
   Future<void> init({Function()? onCancelAction}) async {
     onCancelReleaseAction = onCancelAction;
