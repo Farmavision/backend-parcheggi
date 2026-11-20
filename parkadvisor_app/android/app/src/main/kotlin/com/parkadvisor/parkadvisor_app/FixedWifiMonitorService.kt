@@ -17,7 +17,7 @@ import org.json.JSONObject
 class FixedWifiMonitorService : Service() {
     companion object {
         const val CHANNEL_MONITOR = "parknow_bg_monitor"
-        const val CHANNEL_ALERT = "parknow_wifi_exit_alert"
+        const val CHANNEL_ALERT = "parknow_urgent_alert_v2"
         const val NOTIF_FOREGROUND_ID = 4101
         const val NOTIF_WIFI_EXIT_ID = 4102
         const val NOTIF_100M_ID = 4103
@@ -32,6 +32,7 @@ class FixedWifiMonitorService : Service() {
     private var escalationRunnable: Runnable? = null
     private var gpsTimeoutRunnable: Runnable? = null
     private var gpsActive = false
+    private var vehicularSamples = 0
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var locationListener: LocationListener? = null
 
@@ -164,6 +165,21 @@ class FixedWifiMonitorService : Service() {
                 val results = FloatArray(1)
                 Location.distanceBetween(loc.latitude, loc.longitude, carLat, carLon, results)
                 val distMeters = results[0]
+                val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6f else 0f
+
+                if (speedKmh >= 10f && distMeters > 120f) {
+                    vehicularSamples++
+                    if (vehicularSamples >= 2) {
+                        vehicularSamples = 0
+                        prefs.edit().remove("flutter.parked_lat").remove("flutter.parked_lon").apply()
+                        triggerServerRelease(0)
+                        showDepartureReleasedNotification()
+                        stopGpsTracking()
+                        return
+                    }
+                } else if (speedKmh < 6f) {
+                    vehicularSamples = 0
+                }
 
                 if (distMeters <= 100f) {
                     showApproaching100mNotification(distMeters.toInt())
@@ -218,6 +234,8 @@ class FixedWifiMonitorService : Service() {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setVibrate(longArrayOf(0, 500, 250, 500))
             .setAutoCancel(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setFullScreenIntent(openPi, true)
             .setContentIntent(openPi)
             .addAction(android.R.drawable.ic_menu_send, "Sì, libero tra poco", confirmPi)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Resto a piedi", ignorePi)
@@ -239,6 +257,8 @@ class FixedWifiMonitorService : Service() {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setVibrate(longArrayOf(0, 700, 300, 700, 300, 700))
             .setAutoCancel(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setFullScreenIntent(openPi, true)
             .setContentIntent(openPi)
             .build()
 
@@ -276,6 +296,8 @@ class FixedWifiMonitorService : Service() {
             .setContentText(text)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setFullScreenIntent(openPi, true)
             .setContentIntent(openPi)
             .build()
     }

@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 class NotificationService {
@@ -18,7 +19,7 @@ class NotificationService {
     await flutterLocalNotificationsPlugin.initialize(
       settings: initializationSettings,
       onDidReceiveNotificationResponse: (NotificationResponse response) {
-        if (response.actionId == 'CANCEL_RELEASE') {
+        if (response.actionId == 'CONFIRM_RELEASE_NOW') { onConfirmRelease?.call(); } else if (response.actionId == 'CANCEL_RELEASE') {
           onCancelReleaseAction?.call();
         }
       },
@@ -27,12 +28,18 @@ class NotificationService {
 
   Future<void> showAutoReleaseNotification({required int delaySeconds}) async {
     const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
-      'auto_release_channel',
-      'Rilascio Automatico Parcheggio',
+      'parknow_urgent_release_v2',
+      'Avvisi Urgenti Rilascio Parcheggio',
       channelDescription: 'Avvisi di conto alla rovescia per rilascio stallo',
       importance: Importance.max,
       priority: Priority.high,
       actions: <AndroidNotificationAction>[
+        AndroidNotificationAction(
+          'CONFIRM_RELEASE_NOW',
+          'Conferma Rilascio Ora',
+          showsUserInterface: true,
+          cancelNotification: true,
+        ),
         AndroidNotificationAction(
           'CANCEL_RELEASE',
           'Non sto partendo (Annulla)',
@@ -41,7 +48,7 @@ class NotificationService {
         ),
       ],
     );
-    const NotificationDetails details = NotificationDetails(android: androidDetails);
+    final NotificationDetails details = NotificationDetails(android: androidDetails);
     await flutterLocalNotificationsPlugin.show(
       id: 1001,
       title: 'Rilascio parcheggio tra ${delaySeconds}s',

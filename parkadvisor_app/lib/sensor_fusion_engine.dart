@@ -60,7 +60,8 @@ class SensorFusionEngine extends ChangeNotifier {
   Timer? _btCheckTimer;
 
   bool _gyroTransitionDetected = false;
-  bool _notified100m = false;
+  bool _notified100m = false; _vehicularSpeedSamples = 0;
+  int _vehicularSpeedSamples = 0;
   bool _manualReleaseConfirmed = false;
   bool _autoShareSkippedNotified = false;
   int? _lastSentEta;
@@ -155,6 +156,17 @@ class SensorFusionEngine extends ChangeNotifier {
     currentState = VehicleState.leavingSoon;
     if (parkedLat != null && parkedLon != null && currentUserLat != null && currentUserLon != null) {
       distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
+        final double speedKmh = (position.speed.isFinite && position.speed > 0) ? position.speed * 3.6 : 0.0;
+        if (speedKmh >= 10.0 && distanceFromCarMeters! > 40.0) {
+          _vehicularSpeedSamples++;
+          if (_vehicularSpeedSamples >= 2 && distanceFromCarMeters! > 120.0) {
+            _vehicularSpeedSamples = 0;
+            await _triggerCarReleased();
+            return;
+          }
+        } else if (speedKmh < 6.0) {
+          _vehicularSpeedSamples = 0;
+        }
     }
     final eta = customMinutes ?? estimatedMinutesToRelease;
     _lastSentEta = eta;
@@ -294,7 +306,7 @@ class SensorFusionEngine extends ChangeNotifier {
           _autoReleaseManager.startCountdownIfBetaTester();
           await onApproachingCar100m(estimatedMinutesToRelease);
         } else if (distanceFromCarMeters! > 130.0) {
-          _notified100m = false;
+          _notified100m = false; _vehicularSpeedSamples = 0;
           _autoReleaseManager.cancelCountdown();
         }
         if (_manualReleaseConfirmed && onEtaUpdated != null) {
@@ -371,7 +383,7 @@ class SensorFusionEngine extends ChangeNotifier {
     parkedLon = currentUserLon;
     distanceFromCarMeters = 0.0;
     currentState = VehicleState.parked;
-    _notified100m = false;
+    _notified100m = false; _vehicularSpeedSamples = 0;
     _manualReleaseConfirmed = false;
     _gyroTransitionDetected = false;
 
@@ -389,7 +401,7 @@ class SensorFusionEngine extends ChangeNotifier {
     parkedLon = null;
     distanceFromCarMeters = null;
     currentState = VehicleState.driving;
-    _notified100m = false;
+    _notified100m = false; _vehicularSpeedSamples = 0;
     _manualReleaseConfirmed = false;
 
     final prefs = await SharedPreferences.getInstance();
