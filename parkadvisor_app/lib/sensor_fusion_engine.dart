@@ -60,7 +60,7 @@ class SensorFusionEngine extends ChangeNotifier {
   Timer? _btCheckTimer;
 
   bool _gyroTransitionDetected = false;
-  bool _notified100m = false; _vehicularSpeedSamples = 0;
+  bool _notified100m = false;
   int _vehicularSpeedSamples = 0;
   bool _manualReleaseConfirmed = false;
   bool _autoShareSkippedNotified = false;
@@ -156,7 +156,7 @@ class SensorFusionEngine extends ChangeNotifier {
     currentState = VehicleState.leavingSoon;
     if (parkedLat != null && parkedLon != null && currentUserLat != null && currentUserLon != null) {
       distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
-        final double speedKmh = (position.speed.isFinite && position.speed > 0) ? position.speed * 3.6 : 0.0;
+        final double speedKmh = (pos.speed.isFinite && pos.speed > 0) ? pos.speed * 3.6 : 0.0;
         if (speedKmh >= 10.0 && distanceFromCarMeters! > 40.0) {
           _vehicularSpeedSamples++;
           if (_vehicularSpeedSamples >= 2 && distanceFromCarMeters! > 120.0) {

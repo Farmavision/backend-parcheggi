@@ -8,6 +8,7 @@ class NotificationService {
 
   final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
   Function()? onCancelReleaseAction;
+  Function()? onConfirmReleaseAction;
 
   Future<void> init({Function()? onCancelAction}) async {
     onCancelReleaseAction = onCancelAction;
@@ -19,7 +20,7 @@ class NotificationService {
     await flutterLocalNotificationsPlugin.initialize(
       settings: initializationSettings,
       onDidReceiveNotificationResponse: (NotificationResponse response) {
-        if (response.actionId == 'CONFIRM_RELEASE_NOW') { onConfirmRelease?.call(); } else if (response.actionId == 'CANCEL_RELEASE') {
+        if (response.actionId == 'CONFIRM_RELEASE_NOW') { onConfirmReleaseAction?.call(); } else if (response.actionId == 'CANCEL_RELEASE') {
           onCancelReleaseAction?.call();
         }
       },
