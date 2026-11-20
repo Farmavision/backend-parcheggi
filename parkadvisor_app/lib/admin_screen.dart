@@ -20,8 +20,10 @@ class _AdminScreenState extends State<AdminScreen> {
   final _rewardCtrl = TextEditingController(text: '10');
   final _feeCtrl = TextEditingController(text: '5');
   final _penaltyCtrl = TextEditingController(text: '15');
-  final _wifiExitSecCtrl = TextEditingController(text: '35');
-  final _gpsIdleMinCtrl = TextEditingController(text: '12');
+  final _xtRitNotSecCtrl = TextEditingController(text: '15');
+  final _xtGpsAttivoSecCtrl = TextEditingController(text: '10');
+  final _xtGpsMaxAttivoMinCtrl = TextEditingController(text: '5');
+  final _xtGpsDisattivoSecCtrl = TextEditingController(text: '15');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
 
@@ -77,10 +79,22 @@ class _AdminScreenState extends State<AdminScreen> {
         setState(() {
           if (data['reward_release'] != null) _rewardCtrl.text = data['reward_release'].toString();
           if (data['fee_search'] != null) _feeCtrl.text = data['fee_search'].toString();
+final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
+    final gpsAtt = int.tryParse(_xtGpsAttivoSecCtrl.text) ?? 10;
+    final gpsMax = int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5;
+    final gpsDis = int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15;
+    final spSave = await SharedPreferences.getInstance();
+    await spSave.setInt('xt_rit_not_sec', ritNot);
+    await spSave.setInt('xt_gps_attivo_sec', gpsAtt);
+    await spSave.setInt('xt_gps_max_attivo_min', gpsMax);
+    await spSave.setInt('xt_gps_disattivo_sec', gpsDis);
           if (data['penalty_false_release'] != null) _penaltyCtrl.text = data['penalty_false_release'].toString();
           if (data['release_delta_minutes'] != null) _deltaCtrl.text = data['release_delta_minutes'].toString();
-      if (data['wifi_exit_timeout_sec'] != null) _wifiExitSecCtrl.text = data['wifi_exit_timeout_sec'].toString();
-      if (data['gps_idle_timeout_min'] != null) _gpsIdleMinCtrl.text = data['gps_idle_timeout_min'].toString();
+      final spLoad = await SharedPreferences.getInstance();
+        _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString();
+        _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString();
+        _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString();
+        _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString();
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
             final val = int.tryParse(_autoReleaseDelayCtrl.text);
@@ -102,8 +116,12 @@ class _AdminScreenState extends State<AdminScreen> {
         'reward_release': int.tryParse(_rewardCtrl.text) ?? 10,
         'fee_search': int.tryParse(_feeCtrl.text) ?? 5,
         'penalty_false_release': int.tryParse(_penaltyCtrl.text) ?? 15,
-        'wifi_exit_timeout_sec': int.tryParse(_wifiExitSecCtrl.text) ?? 35,
-      'gps_idle_timeout_min': int.tryParse(_gpsIdleMinCtrl.text) ?? 12,
+        'wifi_exit_timeout_sec': int.tryParse(_xtRitNotSecCtrl.text) ?? 15,
+      'gps_idle_timeout_min': int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5,
+      'xt_rit_not_sec': int.tryParse(_xtRitNotSecCtrl.text) ?? 15,
+      'xt_gps_attivo_sec': int.tryParse(_xtGpsAttivoSecCtrl.text) ?? 10,
+      'xt_gps_max_attivo_min': int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5,
+      'xt_gps_disattivo_sec': int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15,
       'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
       });
@@ -247,32 +265,44 @@ class _AdminScreenState extends State<AdminScreen> {
                 ),
             const SizedBox(height: 12),
             TextField(
-              controller: _wifiExitSecCtrl,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Attesa risposta notifica uscita Wi-Fi (secondi)',
-                helperText: 'Default: 35s. Se ignorata, attiva GPS in background.',
-                border: OutlineInputBorder(),
-              ),
-              onChanged: (v) async {
-                final p = await SharedPreferences.getInstance();
-                await p.setInt('wifi_exit_timeout_sec', int.tryParse(v) ?? 35);
-              },
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _gpsIdleMinCtrl,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Timeout spegnimento GPS senza avvicinamento (minuti)',
-                helperText: 'Default: 12m. Spegne il GPS se non ti avvicini all\u0027auto.',
-                border: OutlineInputBorder(),
-              ),
-              onChanged: (v) async {
-                final p = await SharedPreferences.getInstance();
-                await p.setInt('gps_idle_timeout_min', int.tryParse(v) ?? 12);
-              },
-            ),
+          controller: _xtRitNotSecCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Xt.rit.not — Ritardo notifica disconnessione Wi-Fi (sec)',
+            helperText: 'Default: 15s. Verifica che il Wi-Fi resti scollegato prima della push.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _xtGpsAttivoSecCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Xt.gps.attivo — Attesa prima di attivare GPS alta precisione (sec)',
+            helperText: 'Default: 10s (0-10s). Tempo per confermare/rifiutare la notifica.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _xtGpsMaxAttivoMinCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Xt.gps.max_attivo — Timeout massimo GPS alta precisione (min)',
+            helperText: 'Default: 5 min. Limite massimo di sicurezza per analisi uscita.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _xtGpsDisattivoSecCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Xt.gps.disattivo — Ritardo rientro GPS risparmio energetico (sec)',
+            helperText: 'Default: 15s. Stabilizzazione prima di riportare il GPS standard.',
+            border: OutlineInputBorder(),
+          ),
+        ),
                 const SizedBox(height: 14),
                 TextField(
                   controller: _autoReleaseDelayCtrl,

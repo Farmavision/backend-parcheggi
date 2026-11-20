@@ -1,270 +1,515 @@
 package com.parkadvisor.parkadvisor_app
 
-import android.app.*
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
-import android.net.*
+import android.media.AudioAttributes
+import android.media.RingtoneManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
-import android.os.*
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.google.android.gms.location.Geofence
+import com.google.android.gms.location.GeofencingClient
+import com.google.android.gms.location.GeofencingEvent
+import com.google.android.gms.location.GeofencingRequest
+import com.google.android.gms.location.LocationServices
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import org.json.JSONObject
 
-class FixedWifiMonitorService : Service() {
+class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener {
+
     companion object {
-        const val CHANNEL_MONITOR = "parknow_bg_monitor"
+        const val CHANNEL_FG = "parknow_fg_service_v1"
         const val CHANNEL_ALERT = "parknow_urgent_alert_v2"
-        const val NOTIF_FOREGROUND_ID = 4101
-        const val NOTIF_WIFI_EXIT_ID = 4102
-        const val NOTIF_100M_ID = 4103
+        const val FG_NOTIF_ID = 4101
+        const val PROMPT_NOTIF_ID = 4102
+        const val RELEASED_NOTIF_ID = 4104
 
-        const val ACTION_START = "ACTION_START_MONITOR"
-        const val ACTION_WIFI_DISCONNECTED = "ACTION_WIFI_DISCONNECTED"
-        const val ACTION_USER_CONFIRM_RELEASE = "ACTION_USER_CONFIRM_RELEASE"
-        const val ACTION_USER_IGNORE_WALK = "ACTION_USER_IGNORE_WALK"
+        const val ACTION_CONFIRM_RELEASE = "com.parkadvisor.ACTION_CONFIRM_RELEASE"
+        const val ACTION_DENY_RELEASE = "com.parkadvisor.ACTION_DENY_RELEASE"
+        const val ACTION_GEOFENCE_TRANSITION = "com.parkadvisor.ACTION_GEOFENCE_TRANSITION"
+        const val GEOFENCE_REQ_ID = "parknow_active_stall_geofence"
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private var escalationRunnable: Runnable? = null
-    private var gpsTimeoutRunnable: Runnable? = null
-    private var gpsActive = false
-    private var vehicularSamples = 0
+    private lateinit var prefs: SharedPreferences
+    private lateinit var locationManager: LocationManager
+    private lateinit var geofencingClient: GeofencingClient
+    private var sensorManager: SensorManager? = null
+    private var stepDetector: Sensor? = null
+
+    private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var locationListener: LocationListener? = null
+
+    private var wasOnFixedWifi = false
+    private var promptShownForCurrentSession = false
+    private var activeScenario = "NONE"
+    private var gpsHighAccuracyActive = false
+    private var inExitAnalysis = false
+    private var passedThroughStall = false
+    private var vehicularSamples = 0
+    private var initialGpsDistanceMeters: Float? = null
+
+    private var hasStepSensor = false
+    private var lastStepTimestampMs = 0L
+    private var recentStepCount = 0
+    private var isCarBtConnected = false
+
+    private var wifiDebounceRunnable: Runnable? = null
+    private var gpsActivateDelayRunnable: Runnable? = null
+    private var gpsMaxTimeoutRunnable: Runnable? = null
+    private var gpsDeactivateRunnable: Runnable? = null
+    private var geofenceWatchdogRunnable: Runnable? = null
+
+    private val internalReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_CONFIRM_RELEASE -> handleUserConfirmRelease()
+                ACTION_DENY_RELEASE -> handleUserDenyRelease()
+                ACTION_GEOFENCE_TRANSITION -> handleGeofenceEnterEvent(intent)
+                BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                    val dev: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    val targetMac = prefs.getString("flutter.car_bt_mac", null)?.uppercase()
+                    if (!targetMac.isNullOrEmpty() && dev?.address?.uppercase() == targetMac) {
+                        isCarBtConnected = true
+                        evaluateFastPathBluetooth()
+                    }
+                }
+                BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                    isCarBtConnected = false
+                }
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
-        createChannels()
-        registerWifiCallback()
+        prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        geofencingClient = LocationServices.getGeofencingClient(this)
+
+        createNotificationChannels()
+        startForegroundCompat()
+
+        registerStepSensor()
+        registerInternalReceivers()
+        registerWifiNetworkCallback()
+        startGeofenceSyncWatchdog()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_START
-        when (action) {
-            ACTION_START -> {
-                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Monitoraggio Wi-Fi fisse e sosta attivo"))
-            }
-            ACTION_WIFI_DISCONNECTED -> {
-                val disconnectedSsid = intent?.getStringExtra("ssid") ?: "Wi-Fi fissa"
-                handleFixedWifiDisconnected(disconnectedSsid)
-            }
-            ACTION_USER_CONFIRM_RELEASE -> {
-                cancelEscalation()
-                stopGpsTracking()
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.cancel(NOTIF_WIFI_EXIT_ID)
-                triggerServerRelease(4)
-                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Rilascio stallo confermato (4 min)"))
-            }
-            ACTION_USER_IGNORE_WALK -> {
-                cancelEscalation()
-                stopGpsTracking()
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.cancel(NOTIF_WIFI_EXIT_ID)
-                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                prefs.edit().putLong("flutter.walk_snooze_until", System.currentTimeMillis() + 30 * 60 * 1000L).apply()
-                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita a piedi: monitoraggio in pausa 30 min"))
-            }
-        }
+        syncNativeGeofenceWithActiveParking()
         return START_STICKY
     }
 
-    private fun registerWifiCallback() {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cancelAllRunnables()
+        stopHighAccuracyGpsImmediate()
+        try {
+            sensorManager?.unregisterListener(this)
+            unregisterReceiver(internalReceiver)
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+            geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID))
+        } catch (_: Exception) {}
+    }
+
+    private fun getXtRitNotSec(): Long = (prefs.getInt("flutter.xt_rit_not_sec", 15)).coerceAtLeast(0).toLong()
+    private fun getXtGpsAttivoSec(): Long = (prefs.getInt("flutter.xt_gps_attivo_sec", 10)).coerceAtLeast(0).toLong()
+    private fun getXtGpsMaxAttivoMin(): Long = (prefs.getInt("flutter.xt_gps_max_attivo_min", 5)).coerceAtLeast(1).toLong()
+    private fun getXtGpsDisattivoSec(): Long = (prefs.getInt("flutter.xt_gps_disattivo_sec", 15)).coerceAtLeast(0).toLong()
+
+    private fun hasActiveParking(): Boolean {
+        return prefs.contains("flutter.parked_lat") && prefs.contains("flutter.parked_lon")
+    }
+
+    private fun getParkedLatLon(): Pair<Double, Double>? {
+        if (!hasActiveParking()) return null
+        val lat = java.lang.Double.longBitsToDouble(prefs.getLong("flutter.parked_lat", 0L))
+        val lon = java.lang.Double.longBitsToDouble(prefs.getLong("flutter.parked_lon", 0L))
+        if (lat == 0.0 && lon == 0.0) return null
+        return Pair(lat, lon)
+    }
+
+    private fun registerStepSensor() {
+        try {
+            sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+            stepDetector = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            if (stepDetector != null) {
+                hasStepSensor = true
+                sensorManager?.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_NORMAL)
+            }
+        } catch (_: Exception) {
+            hasStepSensor = false
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event?.sensor?.type == Sensor.TYPE_STEP_DETECTOR) {
+            val now = System.currentTimeMillis()
+            if (now - lastStepTimestampMs > 180_000L) {
+                recentStepCount = 0
+            }
+            lastStepTimestampMs = now
+            recentStepCount++
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    private fun hasRecentHumanWalking(): Boolean {
+        if (!hasStepSensor) return true
+        val elapsed = System.currentTimeMillis() - lastStepTimestampMs
+        return elapsed <= 180_000L && recentStepCount >= 5
+    }
+
+    private fun isStepStoppedAfterWalking(): Boolean {
+        if (!hasStepSensor) return true
+        val elapsedSinceLastStep = System.currentTimeMillis() - lastStepTimestampMs
+        return recentStepCount >= 3 && elapsedSinceLastStep >= 6_000L
+    }
+
+    private fun getConnectedFixedWifiSsid(): String? {
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
+            val info = wifiManager.connectionInfo ?: return null
+            val rawSsid = info.ssid?.replace("\"", "") ?: return null
+            if (rawSsid == "<unknown ssid>" || rawSsid.isEmpty()) return null
+
+            val homeSsid = prefs.getString("flutter.home_wifi_ssid", "") ?: ""
+            val workSsid = prefs.getString("flutter.work_wifi_ssid", "") ?: ""
+            val fixedList = prefs.getString("flutter.fixed_wifi_ssids", "") ?: ""
+
+            val registered = (listOf(homeSsid, workSsid) + fixedList.split(","))
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+
+            return if (registered.any { it.equals(rawSsid, ignoreCase = true) }) rawSsid else null
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun registerWifiNetworkCallback() {
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        wasOnFixedWifi = getConnectedFixedWifiSsid() != null
+
+        val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                handler.postDelayed({ checkCurrentWifiAndStore() }, 1500)
+                handler.post {
+                    if (getConnectedFixedWifiSsid() != null) {
+                        wasOnFixedWifi = true
+                        wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
+                    }
+                }
             }
 
             override fun onLost(network: Network) {
-                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                val wasOnFixed = prefs.getBoolean("flutter.was_on_fixed_wifi", false)
-                val lastSsid = prefs.getString("flutter.last_fixed_wifi_name", "Wi-Fi fissa") ?: "Wi-Fi fissa"
-                if (wasOnFixed) {
-                    prefs.edit().putBoolean("flutter.was_on_fixed_wifi", false).apply()
-                    handler.post { handleFixedWifiDisconnected(lastSsid) }
+                handler.post {
+                    if (wasOnFixedWifi && hasActiveParking()) {
+                        wasOnFixedWifi = false
+                        scheduleScenarioAWifiDebounce()
+                    }
                 }
             }
         }
         try {
-            cm.registerNetworkCallback(request, networkCallback!!)
+            connectivityManager?.registerNetworkCallback(req, networkCallback!!)
         } catch (_: Exception) {}
     }
 
-    private fun checkCurrentWifiAndStore() {
-        try {
-            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-            val rawList = prefs.getString("flutter.home_wifi_ssid", "") ?: ""
-            val fixedList = rawList.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-            if (fixedList.isEmpty()) return
-
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val info = wm.connectionInfo
-            val ssid = (info?.ssid ?: "").replace("\"", "").trim()
-            if (ssid.isNotEmpty() && ssid != "<unknown ssid>" && fixedList.contains(ssid.lowercase())) {
-                prefs.edit()
-                    .putBoolean("flutter.was_on_fixed_wifi", true)
-                    .putString("flutter.last_fixed_wifi_name", ssid)
-                    .apply()
-                cancelEscalation()
-                stopGpsTracking()
-                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Connesso a $ssid (GPS in stand-by)"))
+    private fun scheduleScenarioAWifiDebounce() {
+        wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
+        val delayMs = getXtRitNotSec() * 1000L
+        wifiDebounceRunnable = Runnable {
+            if (getConnectedFixedWifiSsid() == null && hasActiveParking() && !promptShownForCurrentSession) {
+                activeScenario = "A"
+                triggerReleaseConfirmationPrompt()
             }
+        }
+        handler.postDelayed(wifiDebounceRunnable!!, delayMs)
+    }
+
+    private fun startGeofenceSyncWatchdog() {
+        geofenceWatchdogRunnable = object : Runnable {
+            override fun run() {
+                syncNativeGeofenceWithActiveParking()
+                handler.postDelayed(this, 30_000L)
+            }
+        }
+        handler.post(geofenceWatchdogRunnable!!)
+    }
+
+    private fun syncNativeGeofenceWithActiveParking() {
+        val coords = getParkedLatLon()
+        if (coords == null) {
+            promptShownForCurrentSession = false
+            activeScenario = "NONE"
+            try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
+            return
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+
+        val geofence = Geofence.Builder()
+            .setRequestId(GEOFENCE_REQ_ID)
+            .setCircularRegion(coords.first, coords.second, 100f)
+            .setExpirationDuration(Geofence.NEVER_EXPIRE)
+            .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER)
+            .build()
+
+        val geoReq = GeofencingRequest.Builder()
+            .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
+            .addGeofence(geofence)
+            .build()
+
+        val pi = PendingIntent.getBroadcast(
+            this,
+            5101,
+            Intent(ACTION_GEOFENCE_TRANSITION).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+
+        try {
+            geofencingClient.addGeofences(geoReq, pi)
         } catch (_: Exception) {}
     }
 
-    private fun handleFixedWifiDisconnected(ssidName: String) {
-        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-        val hasParkedCar = prefs.contains("flutter.parked_lat") && prefs.contains("flutter.parked_lon")
-        if (!hasParkedCar) return
+    private fun handleGeofenceEnterEvent(intent: Intent) {
+        val event = GeofencingEvent.fromIntent(intent)
+        if (event != null && event.hasError()) return
+        if (!hasActiveParking()) return
 
-        val snoozeUntil = prefs.getLong("flutter.walk_snooze_until", 0L)
-        if (System.currentTimeMillis() < snoozeUntil) return
-
-        safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Uscita da $ssidName rilevata: in attesa risposta..."))
-        showWifiExitNotification(ssidName)
-
-        val waitSec = prefs.getInt("flutter.wifi_exit_timeout_sec", 35).coerceIn(5, 300)
-        cancelEscalation()
-        escalationRunnable = Runnable {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.cancel(NOTIF_WIFI_EXIT_ID)
-            safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("Notifica ignorata (${waitSec}s): GPS avvicinamento attivo"))
-            startGpsTracking()
+        if (activeScenario == "A" && promptShownForCurrentSession) {
+            inExitAnalysis = true
+            if (!gpsHighAccuracyActive) {
+                startHighAccuracyGpsTracking()
+            }
+            return
         }
-        handler.postDelayed(escalationRunnable!!, waitSec * 1000L)
+
+        if (getConnectedFixedWifiSsid() == null && !promptShownForCurrentSession) {
+            if (hasRecentHumanWalking()) {
+                activeScenario = "B"
+                triggerReleaseConfirmationPrompt()
+            }
+        }
     }
 
-    private fun cancelEscalation() {
-        escalationRunnable?.let { handler.removeCallbacks(it) }
-        escalationRunnable = null
+    private fun triggerReleaseConfirmationPrompt() {
+        promptShownForCurrentSession = true
+        showReleasePromptNotification()
+
+        gpsActivateDelayRunnable?.let { handler.removeCallbacks(it) }
+        val waitMs = getXtGpsAttivoSec() * 1000L
+        gpsActivateDelayRunnable = Runnable {
+            if (hasActiveParking()) {
+                if (activeScenario == "B") {
+                    inExitAnalysis = true
+                }
+                startHighAccuracyGpsTracking()
+            }
+        }
+        handler.postDelayed(gpsActivateDelayRunnable!!, waitMs)
     }
 
-    private fun startGpsTracking() {
-        if (gpsActive) return
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        locationListener = object : LocationListener {
-            override fun onLocationChanged(loc: Location) {
-                val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-                if (!prefs.contains("flutter.parked_lat") || !prefs.contains("flutter.parked_lon")) {
-                    stopGpsTracking()
+    private fun handleUserConfirmRelease() {
+        cancelAllRunnables()
+        cancelPromptNotification()
+        triggerServerRelease(2)
+        resetSessionFlagsAndClearParking()
+        stopHighAccuracyGpsImmediate()
+    }
+
+    private fun handleUserDenyRelease() {
+        gpsActivateDelayRunnable?.let { handler.removeCallbacks(it) }
+        gpsMaxTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        cancelPromptNotification()
+        inExitAnalysis = false
+        passedThroughStall = false
+        vehicularSamples = 0
+
+        if (gpsHighAccuracyActive) {
+            scheduleGpsPowerSaveAfterXtDisattivo()
+        }
+    }
+
+    private fun startHighAccuracyGpsTracking() {
+        if (gpsHighAccuracyActive) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+
+        gpsDeactivateRunnable?.let { handler.removeCallbacks(it) }
+        gpsHighAccuracyActive = true
+        initialGpsDistanceMeters = null
+        vehicularSamples = 0
+
+        try {
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 2000L, 2f, this, Looper.getMainLooper())
+            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 3000L, 5f, this, Looper.getMainLooper())
+        } catch (_: Exception) {}
+
+        gpsMaxTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        val maxMs = getXtGpsMaxAttivoMin() * 60_000L
+        gpsMaxTimeoutRunnable = Runnable {
+            closeTrackingAndSchedulePowerSave()
+        }
+        handler.postDelayed(gpsMaxTimeoutRunnable!!, maxMs)
+    }
+
+    private fun closeTrackingAndSchedulePowerSave() {
+        gpsMaxTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        inExitAnalysis = false
+        passedThroughStall = false
+        vehicularSamples = 0
+        scheduleGpsPowerSaveAfterXtDisattivo()
+    }
+
+    private fun scheduleGpsPowerSaveAfterXtDisattivo() {
+        gpsDeactivateRunnable?.let { handler.removeCallbacks(it) }
+        val disattivoMs = getXtGpsDisattivoSec() * 1000L
+        gpsDeactivateRunnable = Runnable {
+            stopHighAccuracyGpsImmediate()
+        }
+        handler.postDelayed(gpsDeactivateRunnable!!, disattivoMs)
+    }
+
+    private fun stopHighAccuracyGpsImmediate() {
+        gpsHighAccuracyActive = false
+        try {
+            locationManager.removeUpdates(this)
+        } catch (_: Exception) {}
+    }
+
+    override fun onLocationChanged(loc: Location) {
+        val coords = getParkedLatLon() ?: run {
+            stopHighAccuracyGpsImmediate()
+            return
+        }
+
+        val results = FloatArray(1)
+        Location.distanceBetween(loc.latitude, loc.longitude, coords.first, coords.second, results)
+        val distMeters = results[0]
+
+        if (initialGpsDistanceMeters == null) {
+            initialGpsDistanceMeters = distMeters
+        }
+
+        if (distMeters <= 100f) {
+            inExitAnalysis = true
+        }
+
+        val initDist = initialGpsDistanceMeters ?: distMeters
+        if (!inExitAnalysis && distMeters > initDist + 50f && distMeters > 160f) {
+            closeTrackingAndSchedulePowerSave()
+            return
+        }
+
+        if (distMeters <= 30f) {
+            passedThroughStall = true
+        }
+
+        if (inExitAnalysis) {
+            if (passedThroughStall && isCarBtConnected && distMeters > 15f) {
+                completeAutomaticVehicleDeparture()
+                return
+            }
+
+            val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6f else 0f
+            if (passedThroughStall && isStepStoppedAfterWalking() && speedKmh >= 16f && distMeters > 40f) {
+                vehicularSamples++
+                if (vehicularSamples >= 2) {
+                    completeAutomaticVehicleDeparture()
                     return
                 }
-                val carLat = java.lang.Double.longBitsToDouble(prefs.getLong("flutter.parked_lat", 0L))
-                val carLon = java.lang.Double.longBitsToDouble(prefs.getLong("flutter.parked_lon", 0L))
-                if (carLat == 0.0 || carLon == 0.0) return
-
-                val results = FloatArray(1)
-                Location.distanceBetween(loc.latitude, loc.longitude, carLat, carLon, results)
-                val distMeters = results[0]
-                val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6f else 0f
-
-                if (speedKmh >= 10f && distMeters > 120f) {
-                    vehicularSamples++
-                    if (vehicularSamples >= 2) {
-                        vehicularSamples = 0
-                        prefs.edit().remove("flutter.parked_lat").remove("flutter.parked_lon").apply()
-                        triggerServerRelease(0)
-                        showDepartureReleasedNotification()
-                        stopGpsTracking()
-                        return
-                    }
-                } else if (speedKmh < 6f) {
-                    vehicularSamples = 0
-                }
-
-                if (distMeters <= 100f) {
-                    showApproaching100mNotification(distMeters.toInt())
-                    val isBeta = prefs.getBoolean("flutter.is_beta_tester", false)
-                    if (isBeta) {
-                        triggerServerRelease(3)
-                    }
-                    stopGpsTracking()
-                }
+            } else if (speedKmh < 10f) {
+                vehicularSamples = 0
             }
         }
-        try {
-            lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 4000L, 5f, locationListener!!, Looper.getMainLooper())
-            gpsActive = true
-            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-            val idleMin = prefs.getInt("flutter.gps_idle_timeout_min", 12).coerceIn(1, 120)
-            gpsTimeoutRunnable?.let { handler.removeCallbacks(it) }
-            gpsTimeoutRunnable = Runnable {
-                stopGpsTracking()
-                safeStartForeground(NOTIF_FOREGROUND_ID, buildMonitorNotification("GPS spento dopo ${idleMin}m senza avvicinamento"))
+    }
+
+    private fun evaluateFastPathBluetooth() {
+        getParkedLatLon() ?: return
+        if (passedThroughStall && isCarBtConnected) {
+            if (!gpsHighAccuracyActive) {
+                inExitAnalysis = true
+                startHighAccuracyGpsTracking()
             }
-            handler.postDelayed(gpsTimeoutRunnable!!, idleMin * 60 * 1000L)
-        } catch (_: SecurityException) {}
+        }
     }
 
-    private fun stopGpsTracking() {
-        gpsTimeoutRunnable?.let { handler.removeCallbacks(it) }
-        gpsTimeoutRunnable = null
-        if (!gpsActive) return
-        try {
-            val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            locationListener?.let { lm.removeUpdates(it) }
-        } catch (_: Exception) {}
-        gpsActive = false
+    private fun completeAutomaticVehicleDeparture() {
+        cancelAllRunnables()
+        cancelPromptNotification()
+        triggerServerRelease(0)
+        showDepartureReleasedNotification()
+        resetSessionFlagsAndClearParking()
+        scheduleGpsPowerSaveAfterXtDisattivo()
     }
 
-    private fun showWifiExitNotification(ssidName: String) {
-        val confirmIntent = Intent(this, FixedWifiMonitorService::class.java).apply { action = ACTION_USER_CONFIRM_RELEASE }
-        val confirmPi = PendingIntent.getService(this, 11, confirmIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
-        val ignoreIntent = Intent(this, FixedWifiMonitorService::class.java).apply { action = ACTION_USER_IGNORE_WALK }
-        val ignorePi = PendingIntent.getService(this, 12, ignoreIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
-        val openAppIntent = Intent(this, MainActivity::class.java)
-        val openPi = PendingIntent.getActivity(this, 13, openAppIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
-        val notif = NotificationCompat.Builder(this, CHANNEL_ALERT)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Uscita da $ssidName")
-            .setContentText("Stai andando a riprendere l\u0027auto? (Se ignori, attivo il GPS)")
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setVibrate(longArrayOf(0, 500, 250, 500))
-            .setAutoCancel(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setFullScreenIntent(openPi, true)
-            .setContentIntent(openPi)
-            .addAction(android.R.drawable.ic_menu_send, "Sì, libero tra poco", confirmPi)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Resto a piedi", ignorePi)
-            .build()
-
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_WIFI_EXIT_ID, notif)
+    private fun resetSessionFlagsAndClearParking() {
+        prefs.edit().remove("flutter.parked_lat").remove("flutter.parked_lon").apply()
+        promptShownForCurrentSession = false
+        activeScenario = "NONE"
+        inExitAnalysis = false
+        passedThroughStall = false
+        vehicularSamples = 0
+        initialGpsDistanceMeters = null
+        try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
     }
 
-    private fun showApproaching100mNotification(meters: Int) {
-        val openAppIntent = Intent(this, MainActivity::class.java)
-        val openPi = PendingIntent.getActivity(this, 20, openAppIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
-        val notif = NotificationCompat.Builder(this, CHANNEL_ALERT)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("Sei a ${meters}m dalla tua auto!")
-            .setContentText("Rilascio stallo avviato automaticamente (Silenzio-Assenso).")
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setVibrate(longArrayOf(0, 700, 300, 700, 300, 700))
-            .setAutoCancel(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setFullScreenIntent(openPi, true)
-            .setContentIntent(openPi)
-            .build()
-
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_100M_ID, notif)
+    private fun cancelAllRunnables() {
+        wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
+        gpsActivateDelayRunnable?.let { handler.removeCallbacks(it) }
+        gpsMaxTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        gpsDeactivateRunnable?.let { handler.removeCallbacks(it) }
     }
+
+    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    override fun onProviderEnabled(provider: String) {}
+    override fun onProviderDisabled(provider: String) {}
 
     private fun triggerServerRelease(minutes: Int) {
         Thread {
@@ -280,74 +525,108 @@ class FixedWifiMonitorService : Service() {
                 }.toString()
                 conn.outputStream.use { it.write(body.toByteArray()) }
                 conn.responseCode
-                conn.disconnect()
             } catch (_: Exception) {}
         }.start()
     }
 
-    private fun buildMonitorNotification(text: String): Notification {
-        val openPi = PendingIntent.getActivity(
-            this, 1, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(this, CHANNEL_MONITOR)
-            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setContentTitle("ParkNow! Attivo")
-            .setContentText(text)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setFullScreenIntent(openPi, true)
-            .setContentIntent(openPi)
-            .build()
+    private fun registerInternalReceivers() {
+        val filter = IntentFilter().apply {
+            addAction(ACTION_CONFIRM_RELEASE)
+            addAction(ACTION_DENY_RELEASE)
+            addAction(ACTION_GEOFENCE_TRANSITION)
+            addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+            addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+        }
+        ContextCompat.registerReceiver(this, internalReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
-    private fun createChannels() {
+    private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val chMonitor = NotificationChannel(CHANNEL_MONITOR, "Monitoraggio Sosta Background", NotificationManager.IMPORTANCE_LOW)
-            val chAlert = NotificationChannel(CHANNEL_ALERT, "Avvisi Rilascio Parcheggio", NotificationManager.IMPORTANCE_HIGH).apply {
+            val fgChannel = NotificationChannel(CHANNEL_FG, "Monitoraggio Parcheggio Attivo", NotificationManager.IMPORTANCE_LOW)
+            nm.createNotificationChannel(fgChannel)
+
+            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val audioAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            val alertChannel = NotificationChannel(CHANNEL_ALERT, "Avvisi Urgenti Rilascio Parcheggio", NotificationManager.IMPORTANCE_HIGH).apply {
                 enableVibration(true)
-                vibrationPattern = longArrayOf(0, 500, 250, 500)
+                vibrationPattern = longArrayOf(0, 700, 250, 700, 250, 900)
+                setSound(alarmUri, audioAttrs)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
-            nm.createNotificationChannel(chMonitor)
-            nm.createNotificationChannel(chAlert)
+            nm.createNotificationChannel(alertChannel)
         }
     }
 
-    private fun safeStartForeground(id: Int, notif: Notification) {
-        try {
-            startForeground(id, notif)
-        } catch (_: Exception) {
-            stopSelf()
+    private fun startForegroundCompat() {
+        val openPi = PendingIntent.getActivity(this, 10, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notif = NotificationCompat.Builder(this, CHANNEL_FG)
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentTitle("ParkAdvisor attivo in background")
+            .setContentText("Rilevamento uscita parcheggio a basso consumo")
+            .setOngoing(true)
+            .setContentIntent(openPi)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(FG_NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        } else {
+            startForeground(FG_NOTIF_ID, notif)
         }
     }
 
-    override fun onDestroy() {
-        cancelEscalation()
-        stopGpsTracking()
-        try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            networkCallback?.let { cm.unregisterNetworkCallback(it) }
-        } catch (_: Exception) {}
-        super.onDestroy()
+    private fun showReleasePromptNotification() {
+        val openPi = PendingIntent.getActivity(this, 20, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val confirmPi = PendingIntent.getBroadcast(
+            this, 21,
+            Intent(ACTION_CONFIRM_RELEASE).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val denyPi = PendingIntent.getBroadcast(
+            this, 22,
+            Intent(ACTION_DENY_RELEASE).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notif = NotificationCompat.Builder(this, CHANNEL_ALERT)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("Stai lasciando il parcheggio?")
+            .setContentText("Conferma per segnalare lo stallo in rilascio oppure rifiuta.")
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setVibrate(longArrayOf(0, 700, 250, 700, 250, 900))
+            .setAutoCancel(true)
+            .setFullScreenIntent(openPi, true)
+            .setContentIntent(openPi)
+            .addAction(android.R.drawable.ic_menu_send, "Conferma Rilascio", confirmPi)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Rifiuta / Non parto", denyPi)
+            .build()
+
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(PROMPT_NOTIF_ID, notif)
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun cancelPromptNotification() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(PROMPT_NOTIF_ID)
+    }
 
     private fun showDepartureReleasedNotification() {
         val openPi = PendingIntent.getActivity(this, 25, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notif = NotificationCompat.Builder(this, CHANNEL_ALERT)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Ripartenza in auto rilevata")
-            .setContentText("Parcheggio liberato automaticamente sulla mappa.")
+            .setContentText("Segnaposto P attivato: parcheggio liberato sulla mappa.")
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(true)
             .setContentIntent(openPi)
             .build()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(4104, notif)
+        nm.notify(RELEASED_NOTIF_ID, notif)
     }
-
 }

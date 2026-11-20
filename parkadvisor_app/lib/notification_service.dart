@@ -9,6 +9,8 @@ class NotificationService {
   final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
   Function()? onCancelReleaseAction;
   Function()? onConfirmReleaseAction;
+  Function()? onDenyReleaseAction;
+  Function()? onConfirmReleaseAction;
 
   Future<void> init({Function()? onCancelAction}) async {
     onCancelReleaseAction = onCancelAction;
@@ -20,7 +22,7 @@ class NotificationService {
     await flutterLocalNotificationsPlugin.initialize(
       settings: initializationSettings,
       onDidReceiveNotificationResponse: (NotificationResponse response) {
-        if (response.actionId == 'CONFIRM_RELEASE_NOW') { onConfirmReleaseAction?.call(); } else if (response.actionId == 'CANCEL_RELEASE') {
+        if (response.actionId == 'CONFIRM_RELEASE_NOW') { onConfirmReleaseAction?.call(); } else if (response.actionId == 'DENY_RELEASE') { onDenyReleaseAction?.call(); } else if (response.actionId == 'CANCEL_RELEASE') {
           onCancelReleaseAction?.call();
         }
       },
@@ -39,6 +41,12 @@ class NotificationService {
           'CONFIRM_RELEASE_NOW',
           'Conferma Rilascio Ora',
           showsUserInterface: true,
+          cancelNotification: true,
+        ),
+        AndroidNotificationAction(
+          'DENY_RELEASE',
+          'Rifiuta / Non parto',
+          showsUserInterface: false,
           cancelNotification: true,
         ),
         AndroidNotificationAction(
