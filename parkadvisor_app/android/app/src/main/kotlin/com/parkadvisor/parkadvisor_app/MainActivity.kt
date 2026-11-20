@@ -29,11 +29,7 @@ class MainActivity : FlutterActivity() {
             @Suppress("DEPRECATION")
             window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            if (!nm.canUseFullScreenIntent()) {
-                try { startActivity(android.content.Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName"))) } catch (_: Exception) {}
-            }
+
         }
         startBgServiceIfPermitted()
     }
@@ -42,6 +38,22 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parknow/bg_service")
             .setMethodCallHandler { call, result ->
+            if (call.method == "requestFullScreenIntentPermission") {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    if (!nm.canUseFullScreenIntent()) {
+                        try {
+                            startActivity(android.content.Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+                        } catch (_: Exception) {}
+                        result.success(false)
+                    } else {
+                        result.success(true)
+                    }
+                } else {
+                    result.success(true)
+                }
+                return@setMethodCallHandler
+            }
                 if (call.method == "startMonitorService") {
                     startBgServiceIfPermitted()
                     result.success(true)

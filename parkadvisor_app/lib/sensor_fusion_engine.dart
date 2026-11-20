@@ -15,6 +15,7 @@ import 'auto_release_manager.dart';
 enum VehicleState { stayAtHome, driving, stopping, parked, leavingSoon }
 
 class SensorFusionEngine extends ChangeNotifier {
+  static final Completer<void> initialPermissionsCompleter = Completer<void>();
   static const MethodChannel _classicBtChannel = MethodChannel('com.parknow.app/classic_bt');
   VehicleState currentState = VehicleState.driving;
 
@@ -138,6 +139,7 @@ class SensorFusionEngine extends ChangeNotifier {
     _startGyroscopeStream();
     _startPedometerStreams();
     _startBleBluetoothMonitor();
+    if (!initialPermissionsCompleter.isCompleted) initialPermissionsCompleter.complete();
     notifyListeners();
   }
 

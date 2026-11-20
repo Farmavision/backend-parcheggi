@@ -98,6 +98,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _initApp() async {
     await _loadLocalAndRemoteUser();
     await Geolocator.requestPermission();
+    SensorFusionEngine.initialPermissionsCompleter.future
+        .timeout(const Duration(seconds: 5), onTimeout: () {})
+        .then((_) => Future.delayed(const Duration(milliseconds: 600)))
+        .then((_) => const MethodChannel('parknow/bg_service').invokeMethod('requestFullScreenIntentPermission'))
+        .catchError((_) {});
     await _sensorEngine.initialize();
   }
 
