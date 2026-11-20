@@ -153,11 +153,26 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         } catch (_: Exception) {}
     }
 
-    private fun getXtRitNotSec(): Long = (prefs.getInt("flutter.xt_rit_not_sec", 15)).coerceAtLeast(0).toLong()
-    private fun getXtGpsAttivoSec(): Long = (prefs.getInt("flutter.xt_gps_attivo_sec", 10)).coerceAtLeast(0).toLong()
-    private fun getXtGpsMaxAttivoMin(): Long = (prefs.getInt("flutter.xt_gps_max_attivo_min", 5)).coerceAtLeast(1).toLong()
-    private fun getXtGpsDisattivoSec(): Long = (prefs.getInt("flutter.xt_gps_disattivo_sec", 15)).coerceAtLeast(0).toLong()
-    private fun getGeofenceRadiusMeters(): Float = (prefs.getInt("flutter.geofence_radius_m", 100)).coerceIn(20, 2000).toFloat()
+    private fun getXtRitNotSec(): Long = (safeGetInt("flutter.xt_rit_not_sec", 15)).coerceAtLeast(0).toLong()
+    private fun getXtGpsAttivoSec(): Long = (safeGetInt("flutter.xt_gps_attivo_sec", 10)).coerceAtLeast(0).toLong()
+    private fun getXtGpsMaxAttivoMin(): Long = (safeGetInt("flutter.xt_gps_max_attivo_min", 5)).coerceAtLeast(1).toLong()
+    private fun getXtGpsDisattivoSec(): Long = (safeGetInt("flutter.xt_gps_disattivo_sec", 15)).coerceAtLeast(0).toLong()
+    
+    private fun safeGetInt(key: String, def: Int): Int {
+        return try {
+            when (val v = prefs.all[key]) {
+                is Int -> v
+                is Long -> v.toInt()
+                is Number -> v.toInt()
+                is String -> v.toIntOrNull() ?: def
+                else -> def
+            }
+        } catch (_: Throwable) {
+            def
+        }
+    }
+
+    private fun getGeofenceRadiusMeters(): Float = (safeGetInt("flutter.geofence_radius_m", 100)).coerceIn(20, 2000).toFloat()
 
     private fun hasActiveParking(): Boolean {
         return prefs.contains("flutter.parked_lat") && prefs.contains("flutter.parked_lon")
