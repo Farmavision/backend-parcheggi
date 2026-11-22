@@ -66,6 +66,8 @@ private fun readSafeDouble(prefs: android.content.SharedPreferences, key: String
     }
 }
 
+
+
 class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener {
 
     companion object {
