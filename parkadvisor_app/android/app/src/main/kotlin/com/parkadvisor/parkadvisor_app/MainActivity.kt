@@ -70,7 +70,7 @@ class MainActivity : FlutterActivity() {
                 action = FixedWifiMonitorService.ACTION_START
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(svcIntent)
+                try { startForegroundService(svcIntent) } catch (_: Throwable) {}
             } else {
                 startService(svcIntent)
             }

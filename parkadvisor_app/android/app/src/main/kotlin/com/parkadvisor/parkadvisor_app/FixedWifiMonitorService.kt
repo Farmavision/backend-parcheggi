@@ -158,6 +158,29 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun getXtGpsMaxAttivoMin(): Long = (safeGetInt("flutter.xt_gps_max_attivo_min", 5)).coerceAtLeast(1).toLong()
     private fun getXtGpsDisattivoSec(): Long = (safeGetInt("flutter.xt_gps_disattivo_sec", 15)).coerceAtLeast(0).toLong()
     
+    
+    private fun safeGetDouble(key: String, def: Double): Double {
+        return try {
+            val prefix = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu"
+            when (val v = prefs.all[key]) {
+                is Double -> v
+                is Float -> v.toDouble()
+                is String -> {
+                    val clean = if (v.startsWith(prefix)) v.removePrefix(prefix) else v
+                    clean.toDoubleOrNull() ?: def
+                }
+                is Long -> {
+                    if (kotlin.math.abs(v) > 1_000_000_000L) java.lang.Double.longBitsToDouble(v)
+                    else v.toDouble()
+                }
+                is Number -> v.toDouble()
+                else -> def
+            }
+        } catch (_: Throwable) {
+            def
+        }
+    }
+
     private fun safeGetInt(key: String, def: Int): Int {
         return try {
             when (val v = prefs.all[key]) {
@@ -180,8 +203,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private fun getParkedLatLon(): Pair<Double, Double>? {
         if (!hasActiveParking()) return null
-        val lat = java.lang.Double.longBitsToDouble(prefs.getLong("flutter.parked_lat", 0L))
-        val lon = java.lang.Double.longBitsToDouble(prefs.getLong("flutter.parked_lon", 0L))
+        val lat = java.lang.safeGetDouble("flutter.parked_lat", 0.0)
+        val lon = java.lang.safeGetDouble("flutter.parked_lon", 0.0)
         if (lat == 0.0 && lon == 0.0) return null
         return Pair(lat, lon)
     }
@@ -601,7 +624,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(FG_NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            try { startForeground(FG_NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION) } catch (_: Throwable) { try { startForeground(FG_NOTIF_ID, notif) } catch (_: Throwable) {} }
         } else {
             startForeground(FG_NOTIF_ID, notif)
         }
