@@ -44,6 +44,28 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
+private fun readSafeDouble(prefs: android.content.SharedPreferences, key: String, def: Double): Double {
+    return try {
+        val prefix = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu"
+        when (val v = prefs.all[key]) {
+            is Double -> v
+            is Float -> v.toDouble()
+            is String -> {
+                val clean = if (v.startsWith(prefix)) v.removePrefix(prefix) else v
+                clean.toDoubleOrNull() ?: def
+            }
+            is Long -> {
+                if (kotlin.math.abs(v) > 1_000_000_000L) java.lang.Double.longBitsToDouble(v)
+                else v.toDouble()
+            }
+            is Number -> v.toDouble()
+            else -> def
+        }
+    } catch (_: Throwable) {
+        def
+    }
+}
+
 class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener {
 
     companion object {
@@ -119,27 +141,6 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
-        private fun safeGetDouble(key: String, def: Double): Double {
-        return try {
-            val prefix = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu"
-            when (val v = prefs.all[key]) {
-                is Double -> v
-                is Float -> v.toDouble()
-                is String -> {
-                    val clean = if (v.startsWith(prefix)) v.removePrefix(prefix) else v
-                    clean.toDoubleOrNull() ?: def
-                }
-                is Long -> {
-                    if (kotlin.math.abs(v) > 1_000_000_000L) java.lang.Double.longBitsToDouble(v)
-                    else v.toDouble()
-                }
-                is Number -> v.toDouble()
-                else -> def
-            }
-        } catch (_: Throwable) {
-            def
-        }
-    }
 
     override fun onCreate() {
         super.onCreate()
@@ -204,8 +205,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private fun getParkedLatLon(): Pair<Double, Double>? {
         if (!hasActiveParking()) return null
-        val lat = java.lang.safeGetDouble("flutter.parked_lat", 0.0)
-        val lon = java.lang.safeGetDouble("flutter.parked_lon", 0.0)
+        val lat = java.lang.readSafeDouble(prefs, "flutter.parked_lat", 0.0)
+        val lon = java.lang.readSafeDouble(prefs, "flutter.parked_lon", 0.0)
         if (lat == 0.0 && lon == 0.0) return null
         return Pair(lat, lon)
     }
