@@ -207,8 +207,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private fun getParkedLatLon(): Pair<Double, Double>? {
         if (!hasActiveParking()) return null
-        val lat = java.lang.readSafeDouble(prefs, "flutter.parked_lat", 0.0)
-        val lon = java.lang.readSafeDouble(prefs, "flutter.parked_lon", 0.0)
+        val lat = readSafeDouble(prefs, "flutter.parked_lat", 0.0)
+        val lon = readSafeDouble(prefs, "flutter.parked_lon", 0.0)
         if (lat == 0.0 && lon == 0.0) return null
         return Pair(lat, lon)
     }
