@@ -119,6 +119,28 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
+        private fun safeGetDouble(key: String, def: Double): Double {
+        return try {
+            val prefix = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu"
+            when (val v = prefs.all[key]) {
+                is Double -> v
+                is Float -> v.toDouble()
+                is String -> {
+                    val clean = if (v.startsWith(prefix)) v.removePrefix(prefix) else v
+                    clean.toDoubleOrNull() ?: def
+                }
+                is Long -> {
+                    if (kotlin.math.abs(v) > 1_000_000_000L) java.lang.Double.longBitsToDouble(v)
+                    else v.toDouble()
+                }
+                is Number -> v.toDouble()
+                else -> def
+            }
+        } catch (_: Throwable) {
+            def
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -159,27 +181,6 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun getXtGpsDisattivoSec(): Long = (safeGetInt("flutter.xt_gps_disattivo_sec", 15)).coerceAtLeast(0).toLong()
     
     
-    private fun safeGetDouble(key: String, def: Double): Double {
-        return try {
-            val prefix = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu"
-            when (val v = prefs.all[key]) {
-                is Double -> v
-                is Float -> v.toDouble()
-                is String -> {
-                    val clean = if (v.startsWith(prefix)) v.removePrefix(prefix) else v
-                    clean.toDoubleOrNull() ?: def
-                }
-                is Long -> {
-                    if (kotlin.math.abs(v) > 1_000_000_000L) java.lang.Double.longBitsToDouble(v)
-                    else v.toDouble()
-                }
-                is Number -> v.toDouble()
-                else -> def
-            }
-        } catch (_: Throwable) {
-            def
-        }
-    }
 
     private fun safeGetInt(key: String, def: Int): Int {
         return try {
