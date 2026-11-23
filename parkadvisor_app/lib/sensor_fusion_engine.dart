@@ -329,12 +329,25 @@ class SensorFusionEngine extends ChangeNotifier {
         currentState = VehicleState.stayAtHome;
       }
       _autoReleaseManager.cancelCountdown();
-    } else if (!isOnKnownPrivateWifi && currentState == VehicleState.stayAtHome) {
-      currentState = VehicleState.driving;
+      _posSub?.cancel();
+      _posSub = null;
+    } else {
+      if (currentState == VehicleState.stayAtHome) {
+        currentState = VehicleState.driving;
+      }
+      if (_posSub == null) {
+        _startGpsStream();
+      }
     }
   }
 
   void _startGpsStream() {
+    if (isOnKnownPrivateWifi) {
+      _posSub?.cancel();
+      _posSub = null;
+      return;
+    }
+    _posSub?.cancel();
     _posSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 5),
     ).listen((pos) async {
@@ -415,7 +428,12 @@ class SensorFusionEngine extends ChangeNotifier {
     if (isOnKnownPrivateWifi && method != 'SIMULATION') return;
     if (currentUserLat == null || currentUserLon == null) {
       try {
-        final pos = await Geolocator.getCurrentPosition();
+        final pos = isOnKnownPrivateWifi
+            ? (await Geolocator.getLastKnownPosition() ??
+                await Geolocator.getCurrentPosition(
+                  locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
+                ))
+            : await Geolocator.getCurrentPosition();
         currentUserLat = pos.latitude;
         currentUserLon = pos.longitude;
       } catch (_) {

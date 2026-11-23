@@ -323,6 +323,9 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             pendingUnknownWifiSsid = null
             inExitAnalysis = false
             wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
+            gpsActivateDelayRunnable?.let { handler.removeCallbacks(it) }
+            gpsMaxTimeoutRunnable?.let { handler.removeCallbacks(it) }
+            stopHighAccuracyGpsImmediate()
             cancelReleasePromptNotification()
             return
         }
