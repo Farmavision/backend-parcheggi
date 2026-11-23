@@ -400,9 +400,37 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         } catch (_: Exception) {}
     }
 
+    private var prefsChangeListener: android.content.SharedPreferences.OnSharedPreferenceChangeListener? = null
+
     private fun registerWifiNetworkCallback() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         wasOnFixedWifi = getConnectedFixedWifiSsid() != null
+        if (prefsChangeListener == null) {
+            prefsChangeListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                handler.post {
+                    when (key) {
+                        "flutter.parked_lat" -> {
+                            if (prefs.contains("flutter.parked_lat")) {
+                                promptShownForCurrentSession = false
+                                activeScenario = "NONE"
+                                inExitAnalysis = false
+                                passedThroughStall = false
+                                vehicularSamples = 0
+                                initialGpsDistanceMeters = null
+                                wasOnFixedWifi = getConnectedFixedWifiSsid() != null
+                            } else {
+                                cancelAllRunnables()
+                                cancelReleasePromptNotification()
+                                resetSessionFlagsAndClearParking()
+                                stopHighAccuracyGpsImmediate()
+                            }
+                        }
+                        "flutter.home_wifi_ssid", "flutter.work_wifi_ssid" -> evaluateConnectedWifiState()
+                    }
+                }
+            }
+            prefs.registerOnSharedPreferenceChangeListener(prefsChangeListener)
+        }
 
         val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -416,9 +444,15 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                 }
             }
 
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                handler.post { evaluateConnectedWifiState() }
+            }
+
             override fun onLost(network: Network) {
                 handler.post {
-                    if (wasOnFixedWifi && hasActiveParking()) {
+                    val hasFixedConfigured = !(prefs.getString("flutter.home_wifi_ssid", null).isNullOrBlank() &&
+                        prefs.getString("flutter.work_wifi_ssid", null).isNullOrBlank())
+                    if ((wasOnFixedWifi || hasFixedConfigured) && hasActiveParking()) {
                         wasOnFixedWifi = false
                         scheduleScenarioAWifiDebounce()
                     }

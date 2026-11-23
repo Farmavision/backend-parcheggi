@@ -306,6 +306,10 @@ class SensorFusionEngine extends ChangeNotifier {
       } else {
         currentConnectedWifiSsid = null;
         _pendingWifiConfirmationSsid = null;
+        _evaluateWifiStateTransition();
+        if (isCarParked && distanceFromCarMeters != null && distanceFromCarMeters! <= geofenceRadiusMeters) {
+          _autoReleaseManager.startCountdownIfBetaTester();
+        }
       }
     } catch (_) {}
   }
@@ -405,7 +409,7 @@ class SensorFusionEngine extends ChangeNotifier {
       }
       return;
     }
-    if (isOnKnownPrivateWifi) return;
+    if (isOnKnownPrivateWifi && method != 'SIMULATION') return;
     if (currentUserLat == null || currentUserLon == null) {
       try {
         final pos = await Geolocator.getCurrentPosition();
