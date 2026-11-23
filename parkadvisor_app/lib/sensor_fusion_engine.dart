@@ -307,8 +307,10 @@ class SensorFusionEngine extends ChangeNotifier {
         currentConnectedWifiSsid = null;
         _pendingWifiConfirmationSsid = null;
         _evaluateWifiStateTransition();
-        if (isCarParked && distanceFromCarMeters != null && distanceFromCarMeters! <= geofenceRadiusMeters) {
+        if (isCarParked && distanceFromCarMeters != null && distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m) {
+          _notified100m = true;
           _autoReleaseManager.startCountdownIfBetaTester();
+          await onApproachingCar100m(estimatedMinutesToRelease);
         }
       }
     } catch (_) {}
@@ -342,9 +344,9 @@ class SensorFusionEngine extends ChangeNotifier {
 
       if (isCarParked && parkedLat != null && parkedLon != null) {
         distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
-        if (distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m) {
+        if (distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m && !isOnKnownPrivateWifi && _pendingWifiConfirmationSsid == null) {
           _notified100m = true;
-          if (!isOnKnownPrivateWifi && _pendingWifiConfirmationSsid == null) { _autoReleaseManager.startCountdownIfBetaTester(); }
+          _autoReleaseManager.startCountdownIfBetaTester();
           await onApproachingCar100m(estimatedMinutesToRelease);
         } else if (distanceFromCarMeters! > 130.0) {
           _notified100m = false; _passedThroughStall = false; _vehicularSpeedSamples = 0; _passedThroughStall = false; _vehicularSpeedSamples = 0;
@@ -402,6 +404,7 @@ class SensorFusionEngine extends ChangeNotifier {
   }
 
   Future<void> _recordParkingSpot(String method) async {
+    await _checkCurrentWifi(promptIfUnknown: false);
     if (!autoShareEnabled) {
       if (!_autoShareSkippedNotified) {
         _autoShareSkippedNotified = true;
