@@ -81,6 +81,10 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         const val ACTION_CONFIRM_RELEASE = "com.parkadvisor.ACTION_CONFIRM_RELEASE"
         const val ACTION_DENY_RELEASE = "com.parkadvisor.ACTION_DENY_RELEASE"
         const val ACTION_GEOFENCE_TRANSITION = "com.parkadvisor.ACTION_GEOFENCE_TRANSITION"
+        const val ACTION_SAVE_WIFI_HOME = "com.parkadvisor.ACTION_SAVE_WIFI_HOME"
+        const val ACTION_SAVE_WIFI_WORK = "com.parkadvisor.ACTION_SAVE_WIFI_WORK"
+        const val ACTION_IGNORE_WIFI = "com.parkadvisor.ACTION_IGNORE_WIFI"
+        const val WIFI_PROMPT_NOTIF_ID = 9042
         const val GEOFENCE_REQ_ID = "parknow_active_stall_geofence"
     }
 
@@ -95,6 +99,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private var wasOnFixedWifi = false
+    @Volatile private var pendingUnknownWifiSsid: String? = null
+    private var lastPromptedWifiSsid: String? = null
     private var promptShownForCurrentSession = false
     private var activeScenario = "NONE"
     private var gpsHighAccuracyActive = false
@@ -123,6 +129,9 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                 ACTION_CONFIRM_RELEASE -> handleUserConfirmRelease()
                 ACTION_DENY_RELEASE -> handleUserDenyRelease()
                 ACTION_GEOFENCE_TRANSITION -> handleGeofenceEnterEvent(intent)
+                ACTION_SAVE_WIFI_HOME -> handleSaveWifiAction(intent.getStringExtra("wifi_ssid"), isHome = true)
+                ACTION_SAVE_WIFI_WORK -> handleSaveWifiAction(intent.getStringExtra("wifi_ssid"), isHome = false)
+                ACTION_IGNORE_WIFI -> handleIgnoreWifiAction(intent.getStringExtra("wifi_ssid"))
                 BluetoothDevice.ACTION_ACL_CONNECTED -> {
                     val dev: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
@@ -251,7 +260,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         return recentStepCount >= 3 && elapsedSinceLastStep >= 6_000L
     }
 
-    private fun getConnectedFixedWifiSsid(): String? {
+    private fun getCurrentRawWifiSsid(): String? {
         try {
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
             val info = wifiManager.connectionInfo ?: return null
@@ -272,6 +281,125 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
+    private fun getConnectedFixedWifiSsid(): String? {
+        val rawSsid = getCurrentRawWifiSsid() ?: return null
+        return try {
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val homeSsid = prefs.getString("flutter.home_wifi_ssid", "") ?: ""
+            val workSsid = prefs.getString("flutter.work_wifi_ssid", "") ?: ""
+            val fixedList = prefs.getString("flutter.fixed_wifi_ssids", "") ?: ""
+            val registered = (listOf(homeSsid, workSsid) + fixedList.split(","))
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+            if (registered.any { it.equals(rawSsid, ignoreCase = true) }) rawSsid else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun isIgnoredWifiSsid(ssid: String): Boolean {
+        return try {
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val nativeIgnored = prefs.getStringSet("native_ignored_wifis", emptySet()) ?: emptySet()
+            if (nativeIgnored.any { it.equals(ssid, ignoreCase = true) }) return true
+            val rawFlutterList = prefs.getString("flutter.ignored_wifis", "") ?: ""
+            rawFlutterList.contains(ssid, ignoreCase = true)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun cancelReleasePromptNotification() {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            nm.cancel(PROMPT_NOTIF_ID)
+        } catch (_: Exception) {}
+    }
+
+    private fun evaluateConnectedWifiState() {
+        val knownSsid = getConnectedFixedWifiSsid()
+        if (knownSsid != null) {
+            wasOnFixedWifi = true
+            pendingUnknownWifiSsid = null
+            inExitAnalysis = false
+            wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
+            cancelReleasePromptNotification()
+            return
+        }
+        val rawSsid = getCurrentRawWifiSsid() ?: return
+        if (isIgnoredWifiSsid(rawSsid) || rawSsid.equals(lastPromptedWifiSsid, ignoreCase = true)) return
+        pendingUnknownWifiSsid = rawSsid
+        lastPromptedWifiSsid = rawSsid
+        inExitAnalysis = false
+        cancelReleasePromptNotification()
+        showUnknownWifiPromptNotification(rawSsid)
+    }
+
+    private fun showUnknownWifiPromptNotification(ssid: String) {
+        try {
+            val homePi = PendingIntent.getBroadcast(
+                this, 31,
+                Intent(ACTION_SAVE_WIFI_HOME).setPackage(packageName).putExtra("wifi_ssid", ssid),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val workPi = PendingIntent.getBroadcast(
+                this, 32,
+                Intent(ACTION_SAVE_WIFI_WORK).setPackage(packageName).putExtra("wifi_ssid", ssid),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val ignorePi = PendingIntent.getBroadcast(
+                this, 33,
+                Intent(ACTION_IGNORE_WIFI).setPackage(packageName).putExtra("wifi_ssid", ssid),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notif = NotificationCompat.Builder(this, CHANNEL_ALERT)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("Nuova rete Wi-Fi: $ssid")
+                .setContentText("È Casa o Lavoro? Impostala per bloccare gli avvisi di rilascio.")
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .addAction(0, "Casa", homePi)
+                .addAction(0, "Lavoro", workPi)
+                .addAction(0, "Ignora", ignorePi)
+                .build()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            nm.notify(WIFI_PROMPT_NOTIF_ID, notif)
+        } catch (_: Exception) {}
+    }
+
+    private fun handleSaveWifiAction(ssid: String?, isHome: Boolean) {
+        val clean = ssid?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        try {
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val key = if (isHome) "flutter.home_wifi_ssid" else "flutter.work_wifi_ssid"
+            prefs.edit().putString(key, clean).apply()
+        } catch (_: Exception) {}
+        wasOnFixedWifi = true
+        pendingUnknownWifiSsid = null
+        inExitAnalysis = false
+        wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
+        cancelReleasePromptNotification()
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            nm.cancel(WIFI_PROMPT_NOTIF_ID)
+        } catch (_: Exception) {}
+    }
+
+    private fun handleIgnoreWifiAction(ssid: String?) {
+        val clean = ssid?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        try {
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val current = (prefs.getStringSet("native_ignored_wifis", emptySet()) ?: emptySet()).toMutableSet()
+            current.add(clean)
+            prefs.edit().putStringSet("native_ignored_wifis", current).apply()
+        } catch (_: Exception) {}
+        pendingUnknownWifiSsid = null
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            nm.cancel(WIFI_PROMPT_NOTIF_ID)
+        } catch (_: Exception) {}
+    }
+
     private fun registerWifiNetworkCallback() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         wasOnFixedWifi = getConnectedFixedWifiSsid() != null
@@ -283,10 +411,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 handler.post {
-                    if (getConnectedFixedWifiSsid() != null) {
-                        wasOnFixedWifi = true
-                        wifiDebounceRunnable?.let { handler.removeCallbacks(it) }
-                    }
+                    evaluateConnectedWifiState()
+                    handler.postDelayed({ evaluateConnectedWifiState() }, 1200L)
                 }
             }
 
@@ -393,6 +519,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     }
 
     private fun triggerReleaseConfirmationPrompt() {
+        if (getConnectedFixedWifiSsid() != null || pendingUnknownWifiSsid != null) return
         promptShownForCurrentSession = true
         showReleasePromptNotification()
 
@@ -590,6 +717,9 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             addAction(ACTION_CONFIRM_RELEASE)
             addAction(ACTION_DENY_RELEASE)
             addAction(ACTION_GEOFENCE_TRANSITION)
+            addAction(ACTION_SAVE_WIFI_HOME)
+            addAction(ACTION_SAVE_WIFI_WORK)
+            addAction(ACTION_IGNORE_WIFI)
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
         }

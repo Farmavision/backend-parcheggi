@@ -35,6 +35,7 @@ class SensorFusionEngine extends ChangeNotifier {
   List<String> _ignoredWifis = [];
   List<String> _ignoredBtMacs = [];
   String? _lastPromptedWifi;
+  String? _pendingWifiConfirmationSsid;
   String? _lastPromptedBtMac;
 
   double currentSpeedKmh = 0.0;
@@ -232,6 +233,8 @@ class SensorFusionEngine extends ChangeNotifier {
     homeWifiSsid = ssid.replaceAll('"', '').trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('home_wifi_ssid', homeWifiSsid!);
+    _pendingWifiConfirmationSsid = null;
+    _evaluateWifiStateTransition();
     _evaluateWifiStateTransition();
     notifyListeners();
   }
@@ -240,6 +243,8 @@ class SensorFusionEngine extends ChangeNotifier {
     workWifiSsid = ssid.replaceAll('"', '').trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('work_wifi_ssid', workWifiSsid!);
+    _pendingWifiConfirmationSsid = null;
+    _evaluateWifiStateTransition();
     _evaluateWifiStateTransition();
     notifyListeners();
   }
@@ -250,6 +255,7 @@ class SensorFusionEngine extends ChangeNotifier {
       _ignoredWifis.add(clean);
       final prefs = await SharedPreferences.getInstance();
       await prefs.setStringList('ignored_wifis', _ignoredWifis);
+      _pendingWifiConfirmationSsid = null;
     }
   }
 
@@ -278,18 +284,28 @@ class SensorFusionEngine extends ChangeNotifier {
 
   Future<void> _checkCurrentWifi({bool promptIfUnknown = false}) async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+      homeWifiSsid = prefs.getString('home_wifi_ssid');
+      workWifiSsid = prefs.getString('work_wifi_ssid');
       final info = NetworkInfo();
       final ssid = await info.getWifiName();
       if (ssid != null && ssid.isNotEmpty && ssid != '<unknown ssid>') {
         final clean = ssid.replaceAll('"', '').trim();
         currentConnectedWifiSsid = clean;
         _evaluateWifiStateTransition();
-        if (promptIfUnknown && !isOnKnownPrivateWifi && !_ignoredWifis.contains(clean) && _lastPromptedWifi != clean) {
+        if (isOnKnownPrivateWifi) {
+          _pendingWifiConfirmationSsid = null;
+          _autoReleaseManager.cancelCountdown();
+        } else if (promptIfUnknown && !_ignoredWifis.contains(clean) && _lastPromptedWifi != clean) {
           _lastPromptedWifi = clean;
+          _pendingWifiConfirmationSsid = clean;
+          _autoReleaseManager.cancelCountdown();
           onUnknownWifiDetected?.call(clean);
         }
       } else {
         currentConnectedWifiSsid = null;
+        _pendingWifiConfirmationSsid = null;
       }
     } catch (_) {}
   }
@@ -302,8 +318,11 @@ class SensorFusionEngine extends ChangeNotifier {
   }
 
   void _evaluateWifiStateTransition() {
-    if (isOnKnownPrivateWifi && currentState == VehicleState.driving) {
-      currentState = VehicleState.stayAtHome;
+    if (isOnKnownPrivateWifi) {
+      if (currentState != VehicleState.stayAtHome) {
+        currentState = VehicleState.stayAtHome;
+      }
+      _autoReleaseManager.cancelCountdown();
     } else if (!isOnKnownPrivateWifi && currentState == VehicleState.stayAtHome) {
       currentState = VehicleState.driving;
     }
@@ -321,7 +340,7 @@ class SensorFusionEngine extends ChangeNotifier {
         distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
         if (distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m) {
           _notified100m = true;
-          _autoReleaseManager.startCountdownIfBetaTester();
+          if (!isOnKnownPrivateWifi && _pendingWifiConfirmationSsid == null) { _autoReleaseManager.startCountdownIfBetaTester(); }
           await onApproachingCar100m(estimatedMinutesToRelease);
         } else if (distanceFromCarMeters! > 130.0) {
           _notified100m = false; _passedThroughStall = false; _vehicularSpeedSamples = 0; _passedThroughStall = false; _vehicularSpeedSamples = 0;
@@ -438,7 +457,7 @@ class SensorFusionEngine extends ChangeNotifier {
     if (!isCarParked) await simulateParkHere();
     distanceFromCarMeters = 45.0;
     _notified100m = true;
-    _autoReleaseManager.startCountdownIfBetaTester();
+    if (!isOnKnownPrivateWifi && _pendingWifiConfirmationSsid == null) { _autoReleaseManager.startCountdownIfBetaTester(); }
     await onApproachingCar100m(estimatedMinutesToRelease);
     notifyListeners();
   }
