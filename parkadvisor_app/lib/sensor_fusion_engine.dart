@@ -431,7 +431,7 @@ class SensorFusionEngine extends ChangeNotifier {
         final pos = isOnKnownPrivateWifi
             ? (await Geolocator.getLastKnownPosition() ??
                 await Geolocator.getCurrentPosition(
-                  locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
+                  desiredAccuracy: LocationAccuracy.low,
                 ))
             : await Geolocator.getCurrentPosition();
         currentUserLat = pos.latitude;
