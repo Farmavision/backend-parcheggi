@@ -114,6 +114,7 @@ class MainActivity : FlutterActivity() {
             }
         }
         if (args["clearPromptInCar"] == true) ed.putBoolean("prompt_in_car", false)
+        if (args["clearPromptRelease"] == true || args["dismissReleaseNotif"] == true) ed.putBoolean("prompt_release", false)
         (args["forceUserState"] as? String)?.trim()?.let {
             if (it.isNotEmpty()) ed.putString("user_state", it)
         }

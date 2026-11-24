@@ -57,7 +57,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     companion object {
         const val PREFS_NAME = "parknow_native_store"
         const val CHANNEL_FG = "parknow_fg_service_v1"
-        const val CHANNEL_ALERT = "parknow_urgent_alarm_v3"
+        const val CHANNEL_ALERT = "parknow_urgent_alarm_v4"
         const val FG_NOTIF_ID = 4101
         const val PROMPT_NOTIF_ID = 4102
         const val IN_CAR_PROMPT_NOTIF_ID = 4103
@@ -97,6 +97,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 "sessionSteps" to p.getInt("session_steps", 0),
                 "carBtConnected" to false,
                 "promptInCar" to p.getBoolean("prompt_in_car", false),
+                "promptRelease" to p.getBoolean("prompt_release", false),
                 "hasParked" to hasParked,
                 "parkedLat" to if (hasParked) p.getString("parked_lat", null)?.toDoubleOrNull() else null,
                 "parkedLon" to if (hasParked) p.getString("parked_lon", null)?.toDoubleOrNull() else null,
@@ -322,6 +323,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             "sessionSteps" to sessionSteps,
             "carBtConnected" to isCarBtConnected,
             "promptInCar" to prefs.getBoolean("prompt_in_car", false),
+            "promptRelease" to prefs.getBoolean("prompt_release", false),
             "hasParked" to (coords != null),
             "parkedLat" to coords?.first,
             "parkedLon" to coords?.second,
@@ -375,16 +377,27 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             val lon = (args["parkedLon"] as? Number)?.toDouble()
             if (lat != null && lon != null) {
                 val hadBefore = hasActiveParking()
+                val isSim = args["isSimulation"] == true
                 ed.putString("parked_lat", lat.toString())
                 ed.putString("parked_lon", lon.toString())
-                if (!hadBefore) {
+                if (!hadBefore || isSim) {
                     promptShownForCurrentSession = false
                     passedThroughStall = false
                     armedForDeparturePrompt = true
+                    ed.putBoolean("prompt_release", false)
+                    if (isSim) {
+                        isWalking = false
+                        boutStepsSinceStationary = 0
+                        recentWindowSteps = 0
+                        if (!isOnFixedWifi() && userActivityState == STATE_MOVING) {
+                            userActivityState = STATE_STILL
+                        }
+                    }
                 }
             } else {
                 ed.remove("parked_lat")
                 ed.remove("parked_lon")
+                ed.putBoolean("prompt_release", false)
                 promptShownForCurrentSession = false
                 passedThroughStall = false
                 cancelPromptNotification()
@@ -394,6 +407,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (args["clearPromptInCar"] == true) {
             ed.putBoolean("prompt_in_car", false)
             cancelInCarPromptNotification()
+        }
+        if (args["clearPromptRelease"] == true) {
+            ed.putBoolean("prompt_release", false)
+        }
+        if (args["dismissReleaseNotif"] == true) {
+            ed.putBoolean("prompt_release", false)
+            cancelPromptNotification()
         }
 
         val forced = (args["forceUserState"] as? String)?.trim()
@@ -812,16 +832,14 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
 
         val inMotion = (newState == STATE_MOVING || newState == STATE_IN_CAR)
-        if (inMotion && armedForDeparturePrompt && !isOnFixedWifi()) {
+        if (inMotion && armedForDeparturePrompt && !isOnFixedWifi() && hasActiveParking() && !promptShownForCurrentSession) {
             val enoughMovement = (newState == STATE_IN_CAR) || !hasStepHardware || (boutStepsSinceStationary >= 3) || !isWalking
             if (enoughMovement) {
                 armedForDeparturePrompt = false
-                if (hasActiveParking() && !promptShownForCurrentSession) {
-                    if (newState == STATE_IN_CAR && isCarBtConnected) {
-                        completeAutomaticVehicleDeparture()
-                    } else {
-                        triggerReleaseConfirmationPrompt()
-                    }
+                if (newState == STATE_IN_CAR && isCarBtConnected) {
+                    completeAutomaticVehicleDeparture()
+                } else {
+                    triggerReleaseConfirmationPrompt()
                 }
             }
         }
@@ -1015,12 +1033,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun triggerReleaseConfirmationPrompt() {
-        if (isOnFixedWifi() || pendingUnknownWifiSsid != null) return
+        if (isOnFixedWifi()) return
         promptShownForCurrentSession = true
+        prefs.edit().putBoolean("prompt_release", true).apply()
         showReleasePromptNotification()
+        persistAndBroadcastState(forceNotification = true)
     }
 
     private fun handleUserConfirmRelease() {
+        prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
         triggerServerRelease(2)
         resetSessionFlagsAndClearParking()
@@ -1028,6 +1049,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun handleUserDenyRelease() {
+        prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
         passedThroughStall = false
         persistAndBroadcastState(forceNotification = false)
@@ -1066,6 +1088,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             .remove("parked_lat")
             .remove("parked_lon")
             .putBoolean("prompt_in_car", false)
+            .putBoolean("prompt_release", false)
             .apply()
         promptShownForCurrentSession = false
         passedThroughStall = false
@@ -1446,7 +1469,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         )
 
         val notif = NotificationCompat.Builder(this, CHANNEL_ALERT)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentTitle("Stai lasciando il parcheggio?")
             .setContentText("Rilevato stato In Movimento. Conferma per segnalare lo stallo in rilascio.")
             .setPriority(NotificationCompat.PRIORITY_MAX)

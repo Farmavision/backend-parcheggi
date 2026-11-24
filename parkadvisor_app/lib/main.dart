@@ -248,8 +248,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       context: context,
       builder: (ctx) => AlertDialog(
         icon: const Icon(Icons.notifications_active, color: Colors.orange, size: 34),
-        title: const Text('Ti stai avvicinando all\'auto!'),
-        content: Text('Sei entro 100m dal tuo veicolo (arrivo stimato in $minLabel).\n\nSe ignori questo avviso, il rilascio scatterà automaticamente solo alla ripartenza in auto.'),
+        title: const Text('Stai lasciando il parcheggio?'),
+        content: Text('Rilevato stato In Movimento (arrivo stimato in $minLabel).\n\nConferma per segnalare lo stallo in rilascio o rifiuta se non stai prendendo l\'auto.'),
         actions: [
           TextButton(
             onPressed: () {
@@ -475,9 +475,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             runSpacing: 8,
             children: [
               OutlinedButton.icon(
-                onPressed: () => _sensorEngine.simulateParkHere(),
-                icon: const Icon(Icons.pin_drop),
-                label: const Text('1. Simula Parcheggio'),
+                onPressed: () async {
+                  await _sensorEngine.simulateParkHere();
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        duration: Duration(seconds: 2),
+                        content: Text('Parcheggio simulato attivo! Fai 3+ passi fuori Wi-Fi per testare il rilascio.'),
+                      ),
+                    );
+                  }
+                },
+                icon: Icon(
+                  _sensorEngine.isCarParked ? Icons.check_circle : Icons.pin_drop,
+                  color: _sensorEngine.isCarParked ? Colors.green.shade700 : null,
+                ),
+                label: Text(_sensorEngine.isCarParked ? '1. Parcheggio Attivo (Riarma)' : '1. Simula Parcheggio'),
               ),
               OutlinedButton.icon(
                 onPressed: () => _sensorEngine.simulateApproach100m(),

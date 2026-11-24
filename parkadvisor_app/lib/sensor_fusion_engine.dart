@@ -55,6 +55,7 @@ class SensorFusionEngine extends ChangeNotifier {
   int gpsWindowRemainingSec = 0;
   int _noStepGpsCycleCount = 0;
   bool _inCarPromptDeliveredInUi = false;
+  bool _releasePromptDeliveredInUi = false;
   bool _isAppInForeground = true;
 
   final Future<void> Function(double lat, double lon, String method) onCarParked;
@@ -111,6 +112,8 @@ class SensorFusionEngine extends ChangeNotifier {
     if (isCarParked) {
       final dist = distanceFromCarMeters != null ? ' (${distanceFromCarMeters!.round()}m)' : '';
       segments.add('Parcheggio attivo$dist');
+    } else {
+      segments.add('Nessun parcheggio attivo');
     }
     return segments.join(' • ');
   }
@@ -241,9 +244,18 @@ class SensorFusionEngine extends ChangeNotifier {
     } else if (!pendingInCar) {
       _inCarPromptDeliveredInUi = false;
     }
+
+    final pendingRelease = snap['promptRelease'] == true;
+    if (pendingRelease && !_releasePromptDeliveredInUi) {
+      _releasePromptDeliveredInUi = true;
+      _bgServiceChannel.invokeMethod('syncConfigToNative', {'clearPromptRelease': true});
+      onApproachingCar100m(estimatedMinutesToRelease);
+    } else if (!pendingRelease) {
+      _releasePromptDeliveredInUi = false;
+    }
   }
 
-  Future<void> _pushConfigToNative({String? forceUserState}) async {
+  Future<void> _pushConfigToNative({String? forceUserState, bool isSimulation = false}) async {
     try {
       final rawRes = await _bgServiceChannel.invokeMethod('syncConfigToNative', {
         'homeWifiSsid': homeWifiSsid ?? '',
@@ -254,6 +266,7 @@ class SensorFusionEngine extends ChangeNotifier {
         'geofenceRadiusM': geofenceRadiusMeters.round(),
         'parkedLat': parkedLat,
         'parkedLon': parkedLon,
+        if (isSimulation) 'isSimulation': true,
         if (forceUserState != null) 'forceUserState': forceUserState,
       });
       if (rawRes is Map) {
@@ -387,6 +400,7 @@ class SensorFusionEngine extends ChangeNotifier {
   Future<void> confirmManualRelease([int? customMinutes]) async {
     _manualReleaseConfirmed = true;
     currentState = VehicleState.leavingSoon;
+    _bgServiceChannel.invokeMethod('syncConfigToNative', {'dismissReleaseNotif': true});
     final eta = customMinutes ?? estimatedMinutesToRelease;
     if (onManualReleaseConfirmed != null) await onManualReleaseConfirmed!(eta);
     notifyListeners();
@@ -394,6 +408,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
   void cancelAutoRelease() {
     _autoReleaseManager.cancelCountdown();
+    _bgServiceChannel.invokeMethod('syncConfigToNative', {'dismissReleaseNotif': true});
     notifyListeners();
   }
 
@@ -572,12 +587,12 @@ class SensorFusionEngine extends ChangeNotifier {
     if (isOnKnownPrivateWifi && method != 'SIMULATION') return;
     if (currentUserLat == null || currentUserLon == null) {
       try {
-        final pos = isOnKnownPrivateWifi
+        final pos = (method == 'SIMULATION' || isOnKnownPrivateWifi)
             ? (await Geolocator.getLastKnownPosition() ??
-                await Geolocator.getCurrentPosition(
-                  desiredAccuracy: LocationAccuracy.low,
-                ))
-            : await Geolocator.getCurrentPosition();
+                await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.low)
+                    .timeout(const Duration(seconds: 2)))
+            : await Geolocator.getCurrentPosition()
+                .timeout(const Duration(seconds: 4));
         currentUserLat = pos.latitude;
         currentUserLon = pos.longitude;
       } catch (_) {
@@ -590,14 +605,15 @@ class SensorFusionEngine extends ChangeNotifier {
     distanceFromCarMeters = 0.0;
     currentState = VehicleState.parked;
     _manualReleaseConfirmed = false;
+    _releasePromptDeliveredInUi = false;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('parked_lat', parkedLat!);
     await prefs.setDouble('parked_lon', parkedLon!);
 
-    await _pushConfigToNative();
-    await onCarParked(parkedLat!, parkedLon!, method);
+    await _pushConfigToNative(isSimulation: method == 'SIMULATION');
     notifyListeners();
+    unawaited(onCarParked(parkedLat!, parkedLon!, method));
   }
 
   Future<void> _triggerCarReleased() async {
