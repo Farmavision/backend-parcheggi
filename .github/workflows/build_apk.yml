@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Scarica il codice sorgente
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configura Java JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'

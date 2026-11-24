@@ -22,8 +22,6 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.ConnectivityManager
@@ -33,56 +31,31 @@ import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingClient
 import com.google.android.gms.location.GeofencingEvent
 import com.google.android.gms.location.GeofencingRequest
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.max
 import kotlin.math.sqrt
 
-private fun readSafeDouble(prefs: SharedPreferences, key: String, def: Double): Double {
-    return try {
-        val prefix = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu"
-        when (val v = prefs.all[key]) {
-            is Double -> v
-            is Float -> v.toDouble()
-            is String -> {
-                val clean = if (v.startsWith(prefix)) v.removePrefix(prefix) else v
-                clean.toDoubleOrNull() ?: def
-            }
-            is Long -> {
-                if (kotlin.math.abs(v) > 1_000_000_000L) java.lang.Double.longBitsToDouble(v)
-                else v.toDouble()
-            }
-            is Number -> v.toDouble()
-            else -> def
-        }
-    } catch (_: Throwable) {
-        def
-    }
-}
-
-private data class NativeGpsSample(
-    val timestampMs: Long,
-    val lat: Double,
-    val lon: Double,
-    val speedKmh: Float,
-    val accuracy: Float
-)
-
-class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener {
+class FixedWifiMonitorService : Service(), SensorEventListener {
 
     companion object {
+        const val PREFS_NAME = "parknow_native_store"
         const val CHANNEL_FG = "parknow_fg_service_v1"
         const val CHANNEL_ALERT = "parknow_urgent_alarm_v3"
         const val FG_NOTIF_ID = 4101
@@ -100,7 +73,6 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         const val ACTION_SAVE_WIFI_HOME = "com.parkadvisor.ACTION_SAVE_WIFI_HOME"
         const val ACTION_SAVE_WIFI_WORK = "com.parkadvisor.ACTION_SAVE_WIFI_WORK"
         const val ACTION_IGNORE_WIFI = "com.parkadvisor.ACTION_IGNORE_WIFI"
-        const val ACTION_STATE_UPDATED = "com.parkadvisor.ACTION_STATE_UPDATED"
 
         const val GEOFENCE_REQ_ID = "parknow_active_stall_geofence"
 
@@ -109,32 +81,72 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         const val STATE_STILL = "still"
         const val STATE_MOVING = "moving"
         const val STATE_IN_CAR = "inCar"
+
+        @Volatile var instance: FixedWifiMonitorService? = null
+        @Volatile var uiStateListener: ((HashMap<String, Any?>) -> Unit)? = null
+
+        fun buildFallbackSnapshot(ctx: Context): HashMap<String, Any?> {
+            val p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val hasParked = p.contains("parked_lat") && p.contains("parked_lon")
+            return hashMapOf(
+                "userActivityState" to (p.getString("user_state", STATE_STILL) ?: STATE_STILL),
+                "gpsActive" to false,
+                "gpsRemainingSec" to 0,
+                "gpsCycle" to 0,
+                "speedKmh" to 0.0,
+                "sessionSteps" to p.getInt("session_steps", 0),
+                "carBtConnected" to false,
+                "promptInCar" to p.getBoolean("prompt_in_car", false),
+                "hasParked" to hasParked,
+                "parkedLat" to if (hasParked) p.getString("parked_lat", null)?.toDoubleOrNull() else null,
+                "parkedLon" to if (hasParked) p.getString("parked_lon", null)?.toDoubleOrNull() else null,
+                "homeWifiSsid" to (p.getString("home_wifi_ssid", "") ?: ""),
+                "workWifiSsid" to (p.getString("work_wifi_ssid", "") ?: ""),
+                "connectedWifiSsid" to (p.getString("ui_wifi_ssid", "") ?: "")
+            )
+        }
     }
+
+    private data class NativeGpsSample(
+        val timestampMs: Long,
+        val lat: Double,
+        val lon: Double,
+        val speedKmh: Float,
+        val accuracy: Float
+    )
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
-    private lateinit var locationManager: LocationManager
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var geofencingClient: GeofencingClient
     private var sensorManager: SensorManager? = null
-    private var stepDetector: Sensor? = null
-    private var accelerometer: Sensor? = null
+    private var stepCounterSensor: Sensor? = null
+    private var stepDetectorSensor: Sensor? = null
+    private var accelerometerSensor: Sensor? = null
+
+    private var stepCounterRegistered = false
+    private var stepDetectorRegistered = false
+    private var accelListenerRegistered = false
 
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var prefsChangeListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
-    // Stato macchina utente 24/7
     private var userActivityState: String = STATE_STILL
+    private var lastNotifiedTitleState: String = ""
+    private var lastNotifiedGpsMode: Boolean? = null
     private var currentConnectedWifiSsid: String? = null
     @Volatile private var lastCallbackWifiSsid: String? = null
     @Volatile private var pendingUnknownWifiSsid: String? = null
     private var lastPromptedWifiSsid: String? = null
     private var promptShownForCurrentSession = false
+    private var armedForDeparturePrompt = true
 
-    // Sensori passo e inerziali
-    private var hasStepSensor = false
+    private var hasStepHardware = false
+    private var lastStepCounterHardwareVal: Int? = null
+    private var lastStepCounterEventMs = 0L
     private var lastStepTimestampMs = 0L
     private var sessionSteps = 0
+    private var recentWindowSteps = 0
     private var boutStepsSinceStationary = 0
     private var isWalking = false
 
@@ -145,26 +157,31 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private var inertialWakeupHits = 0
     private var lastInertialHitMs = 0L
 
-    // Finestra GPS Tgps_senzapasso (default 30s)
     private var gpsHighAccuracyActive = false
     private var gpsWindowRemainingSec = 0
-    private var noStepGpsCycleCount = 0 // 0 = analisi 30s, 1 = conferma 30s
+    private var noStepGpsCycleCount = 0
     private var gpsRestingAfterAnalysis = false
     private var carPromptShownInCurrentBout = false
     private var currentSpeedKmh = 0f
     private val gpsWindowSamples = mutableListOf<NativeGpsSample>()
 
-    // Bluetooth e geofence
     private var isCarBtConnected = false
     private var passedThroughStall = false
     private var lastGeofenceCoords: Pair<Double, Double>? = null
     private var lastGeofenceRadiusMeters: Float = -1f
     private var activeRingtone: android.media.Ringtone? = null
 
-    // Timers / Runnables
     private var gpsWindowTickRunnable: Runnable? = null
     private var stepStoppedRunnable: Runnable? = null
     private var geofenceWatchdogRunnable: Runnable? = null
+    private var homeRearmRunnable: Runnable? = null
+
+    private val fusedLocationCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            val loc = result.lastLocation ?: return
+            handleFusedLocation(loc)
+        }
+    }
 
     private val internalReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -181,7 +198,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
-    private val systemBtReceiver = object : BroadcastReceiver() {
+    private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == WifiManager.WIFI_STATE_CHANGED_ACTION) {
                 val wifiState = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, WifiManager.WIFI_STATE_UNKNOWN)
@@ -189,8 +206,11 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                     lastCallbackWifiSsid = null
                     currentConnectedWifiSsid = null
                     pendingUnknownWifiSsid = null
+                    prefs.edit().remove("ui_wifi_ssid").apply()
                     gpsRestingAfterAnalysis = false
                     evaluateNoFixedWifiAlgorithm()
+                } else if (wifiState == WifiManager.WIFI_STATE_ENABLED) {
+                    handler.postDelayed({ evaluateConnectedWifiState() }, 1500L)
                 }
                 return
             }
@@ -201,7 +221,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                 @Suppress("DEPRECATION")
                 intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
             }
-            val targetMac = prefs.getString("flutter.car_bt_mac", null)?.uppercase()
+            val targetMac = prefs.getString("car_bt_mac", null)?.uppercase()
             if (targetMac.isNullOrEmpty() || dev?.address?.uppercase() != targetMac) return
 
             when (intent?.action) {
@@ -219,14 +239,18 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     override fun onCreate() {
         super.onCreate()
-        prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        instance = this
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        migrateLegacyPrefsIfNeeded()
+
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         geofencingClient = LocationServices.getGeofencingClient(this)
 
         createNotificationChannels()
         startForegroundCompat()
 
-        registerSensors()
+        checkInitialBluetoothConnection()
+        registerStepSensors()
         registerReceivers()
         registerWifiNetworkCallback()
         startGeofenceSyncWatchdog()
@@ -235,7 +259,11 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        registerSensors()
+        instance = this
+        registerStepSensors()
+        if (networkCallback == null) {
+            registerWifiNetworkCallback()
+        }
         syncNativeGeofenceWithActiveParking()
         evaluateConnectedWifiState()
         return START_STICKY
@@ -244,53 +272,190 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        super.onDestroy()
+        if (instance === this) instance = null
         stopNoStepGpsWindow()
+        updateDynamicAccelerometerRegistration(shouldListen = false)
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
         geofenceWatchdogRunnable?.let { handler.removeCallbacks(it) }
+        homeRearmRunnable?.let { handler.removeCallbacks(it) }
         try {
             sensorManager?.unregisterListener(this)
             unregisterReceiver(internalReceiver)
-            unregisterReceiver(systemBtReceiver)
+            unregisterReceiver(systemReceiver)
             networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
-            prefsChangeListener?.let { prefs.unregisterOnSharedPreferenceChangeListener(it) }
             geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID))
+        } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    private fun migrateLegacyPrefsIfNeeded() {
+        try {
+            val legacy = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val ed = prefs.edit()
+            if (!prefs.contains("home_wifi_ssid")) {
+                legacy.getString("flutter.home_wifi_ssid", null)?.takeIf { it.isNotBlank() }?.let {
+                    ed.putString("home_wifi_ssid", it.replace("\"", "").trim())
+                }
+            }
+            if (!prefs.contains("work_wifi_ssid")) {
+                legacy.getString("flutter.work_wifi_ssid", null)?.takeIf { it.isNotBlank() }?.let {
+                    ed.putString("work_wifi_ssid", it.replace("\"", "").trim())
+                }
+            }
+            if (!prefs.contains("car_bt_mac")) {
+                legacy.getString("flutter.car_bt_mac", null)?.takeIf { it.isNotBlank() }?.let {
+                    ed.putString("car_bt_mac", it.trim().uppercase())
+                }
+            }
+            ed.apply()
         } catch (_: Exception) {}
     }
 
-    private fun safeGetInt(key: String, def: Int): Int {
-        return try {
-            when (val v = prefs.all[key]) {
-                is Int -> v
-                is Long -> v.toInt()
-                is Number -> v.toInt()
-                is String -> v.toIntOrNull() ?: def
-                else -> def
-            }
-        } catch (_: Throwable) {
-            def
-        }
+    fun buildSnapshotMap(): HashMap<String, Any?> {
+        val coords = getParkedLatLon()
+        return hashMapOf(
+            "userActivityState" to userActivityState,
+            "gpsActive" to gpsHighAccuracyActive,
+            "gpsRemainingSec" to gpsWindowRemainingSec,
+            "gpsCycle" to noStepGpsCycleCount,
+            "speedKmh" to currentSpeedKmh.toDouble(),
+            "sessionSteps" to sessionSteps,
+            "carBtConnected" to isCarBtConnected,
+            "promptInCar" to prefs.getBoolean("prompt_in_car", false),
+            "hasParked" to (coords != null),
+            "parkedLat" to coords?.first,
+            "parkedLon" to coords?.second,
+            "homeWifiSsid" to (prefs.getString("home_wifi_ssid", "") ?: ""),
+            "workWifiSsid" to (prefs.getString("work_wifi_ssid", "") ?: ""),
+            "connectedWifiSsid" to (currentConnectedWifiSsid ?: "")
+        )
     }
 
-    private fun getTGpsNoStepSec(): Int = safeGetInt("flutter.tgps_senzapasso_sec", 30).coerceIn(10, 180)
-    private fun getGeofenceRadiusMeters(): Float = safeGetInt("flutter.geofence_radius_m", 100).coerceIn(20, 2000).toFloat()
+    fun refreshAndGetSnapshot(): HashMap<String, Any?> {
+        registerStepSensors()
+        evaluateConnectedWifiState()
+        return buildSnapshotMap()
+    }
+
+    fun onFlutterConfigSynced(args: Map<String, Any?>): HashMap<String, Any?> {
+        val ed = prefs.edit()
+        (args["homeWifiSsid"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("home_wifi_ssid", it.replace("\"", ""))
+        }
+        if (args["clearHomeWifi"] == true) ed.remove("home_wifi_ssid")
+
+        (args["workWifiSsid"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("work_wifi_ssid", it.replace("\"", ""))
+        }
+        if (args["clearWorkWifi"] == true) ed.remove("work_wifi_ssid")
+
+        if (args.containsKey("uiDetectedWifiSsid")) {
+            val uiSsid = (args["uiDetectedWifiSsid"] as? String)?.replace("\"", "")?.trim()
+            if (!uiSsid.isNullOrEmpty() && uiSsid != "<unknown ssid>") {
+                lastCallbackWifiSsid = uiSsid
+                ed.putString("ui_wifi_ssid", uiSsid)
+            } else if (uiSsid != null && uiSsid.isEmpty() && !isWifiTransportConnected()) {
+                lastCallbackWifiSsid = null
+                ed.remove("ui_wifi_ssid")
+            }
+        }
+
+        (args["carBtMac"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("car_bt_mac", it.uppercase())
+        }
+        (args["tGpsNoStepSec"] as? Number)?.let {
+            ed.putInt("tgps_senzapasso_sec", it.toInt().coerceIn(10, 180))
+        }
+        (args["geofenceRadiusM"] as? Number)?.let {
+            ed.putInt("geofence_radius_m", it.toInt().coerceIn(20, 2000))
+        }
+
+        if (args.containsKey("parkedLat") && args.containsKey("parkedLon")) {
+            val lat = (args["parkedLat"] as? Number)?.toDouble()
+            val lon = (args["parkedLon"] as? Number)?.toDouble()
+            if (lat != null && lon != null) {
+                val hadBefore = hasActiveParking()
+                ed.putString("parked_lat", lat.toString())
+                ed.putString("parked_lon", lon.toString())
+                if (!hadBefore) {
+                    promptShownForCurrentSession = false
+                    passedThroughStall = false
+                    armedForDeparturePrompt = true
+                }
+            } else {
+                ed.remove("parked_lat")
+                ed.remove("parked_lon")
+                promptShownForCurrentSession = false
+                passedThroughStall = false
+                cancelPromptNotification()
+            }
+        }
+
+        if (args["clearPromptInCar"] == true) {
+            ed.putBoolean("prompt_in_car", false)
+            cancelInCarPromptNotification()
+        }
+
+        val forced = (args["forceUserState"] as? String)?.trim()
+        ed.apply()
+
+        registerStepSensors()
+        syncNativeGeofenceWithActiveParking()
+
+        if (forced == STATE_IN_CAR) {
+            gpsRestingAfterAnalysis = true
+            stopNoStepGpsWindow()
+            updateDynamicAccelerometerRegistration(shouldListen = false)
+            userActivityState = STATE_IN_CAR
+            persistAndBroadcastState(forceNotification = true)
+        } else {
+            evaluateConnectedWifiState()
+        }
+        return buildSnapshotMap()
+    }
+
+    private fun getTGpsNoStepSec(): Int = prefs.getInt("tgps_senzapasso_sec", 30).coerceIn(10, 180)
+    private fun getGeofenceRadiusMeters(): Float = prefs.getInt("geofence_radius_m", 100).coerceIn(20, 2000).toFloat()
 
     private fun hasActiveParking(): Boolean {
-        return prefs.contains("flutter.parked_lat") && prefs.contains("flutter.parked_lon")
+        return prefs.contains("parked_lat") && prefs.contains("parked_lon")
     }
 
     private fun getParkedLatLon(): Pair<Double, Double>? {
-        if (!hasActiveParking()) return null
-        val lat = readSafeDouble(prefs, "flutter.parked_lat", 0.0)
-        val lon = readSafeDouble(prefs, "flutter.parked_lon", 0.0)
+        val lat = prefs.getString("parked_lat", null)?.toDoubleOrNull() ?: return null
+        val lon = prefs.getString("parked_lon", null)?.toDoubleOrNull() ?: return null
         if (lat == 0.0 && lon == 0.0) return null
         return Pair(lat, lon)
     }
 
-    private var stepListenerRegistered = false
-    private var accelListenerRegistered = false
+    private fun checkInitialBluetoothConnection() {
+        val targetMac = prefs.getString("car_bt_mac", null)?.uppercase() ?: return
+        if (targetMac.isEmpty()) return
+        try {
+            val hasBtPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+            if (!hasBtPerm) return
+            val bm = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
+            val gattConnected = bm.getConnectedDevices(BluetoothProfile.GATT).any { it.address?.uppercase() == targetMac }
+            if (gattConnected) {
+                isCarBtConnected = true
+                return
+            }
+            val adapter: BluetoothAdapter? = bm.adapter
+            val bonded = adapter?.bondedDevices?.firstOrNull { it.address?.uppercase() == targetMac }
+            if (bonded != null) {
+                val m = bonded.javaClass.getMethod("isConnected")
+                if (m.invoke(bonded) == true) {
+                    isCarBtConnected = true
+                }
+            }
+        } catch (_: Exception) {}
+    }
 
-    private fun registerSensors() {
+    private fun registerStepSensors() {
         try {
             if (sensorManager == null) {
                 sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
@@ -300,63 +465,144 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             } else {
                 true
             }
-            if (stepDetector == null) {
-                stepDetector = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            if (!hasActivityPerm) return
+
+            if (stepCounterSensor == null) {
+                stepCounterSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
             }
-            if (stepDetector != null && hasActivityPerm && !stepListenerRegistered) {
-                val ok = sensorManager?.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_NORMAL) ?: false
+            if (stepCounterSensor != null && !stepCounterRegistered) {
+                val ok = sensorManager?.registerListener(this, stepCounterSensor, SensorManager.SENSOR_DELAY_FASTEST) ?: false
                 if (ok) {
-                    hasStepSensor = true
-                    stepListenerRegistered = true
+                    stepCounterRegistered = true
+                    hasStepHardware = true
                 }
             }
-            if (accelerometer == null) {
-                accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+            if (stepDetectorSensor == null) {
+                stepDetectorSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
             }
-            if (accelerometer != null && !accelListenerRegistered) {
-                val ok = sensorManager?.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_NORMAL) ?: false
+            if (stepDetectorSensor != null && !stepDetectorRegistered) {
+                val ok = sensorManager?.registerListener(this, stepDetectorSensor, SensorManager.SENSOR_DELAY_FASTEST) ?: false
                 if (ok) {
-                    accelListenerRegistered = true
+                    stepDetectorRegistered = true
+                    hasStepHardware = true
                 }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun updateDynamicAccelerometerRegistration(shouldListen: Boolean) {
+        try {
+            if (sensorManager == null) {
+                sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+            }
+            if (shouldListen && !accelListenerRegistered) {
+                if (accelerometerSensor == null) {
+                    accelerometerSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+                }
+                if (accelerometerSensor != null) {
+                    gravInitialized = false
+                    inertialWakeupHits = 0
+                    accelListenerRegistered = sensorManager?.registerListener(
+                        this,
+                        accelerometerSensor,
+                        SensorManager.SENSOR_DELAY_NORMAL
+                    ) ?: false
+                }
+            } else if (!shouldListen && accelListenerRegistered) {
+                accelerometerSensor?.let { sensorManager?.unregisterListener(this, it) }
+                accelListenerRegistered = false
+                gravInitialized = false
+                inertialWakeupHits = 0
             }
         } catch (_: Exception) {}
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
         when (event?.sensor?.type) {
-            Sensor.TYPE_STEP_DETECTOR -> handleStepDetected()
-            Sensor.TYPE_ACCELEROMETER -> handleAccelerometerSample(event.values[0], event.values[1], event.values[2])
+            Sensor.TYPE_STEP_COUNTER -> {
+                val rawTotal = event.values[0].toInt()
+                val prev = lastStepCounterHardwareVal
+                lastStepCounterHardwareVal = rawTotal
+                lastStepCounterEventMs = System.currentTimeMillis()
+                if (prev != null) {
+                    val delta = (rawTotal - prev).coerceIn(0, 25)
+                    if (delta > 0) {
+                        onHardwareStepsDetected(delta)
+                    }
+                }
+            }
+            Sensor.TYPE_STEP_DETECTOR -> {
+                val now = System.currentTimeMillis()
+                if (stepCounterSensor == null || (now - lastStepCounterEventMs) > 2500L) {
+                    onHardwareStepsDetected(1)
+                }
+            }
+            Sensor.TYPE_ACCELEROMETER -> {
+                handleAccelerometerSample(event.values[0], event.values[1], event.values[2])
+            }
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    private fun handleStepDetected() {
+    private fun onHardwareStepsDetected(stepDelta: Int) {
         val now = System.currentTimeMillis()
+        sessionSteps += stepDelta
+        boutStepsSinceStationary += stepDelta
+
+        if (now - lastStepTimestampMs > 5_000L) {
+            recentWindowSteps = stepDelta
+        } else {
+            recentWindowSteps += stepDelta
+        }
         lastStepTimestampMs = now
-        sessionSteps++
-        boutStepsSinceStationary++
-        isWalking = true
 
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
         stepStoppedRunnable = Runnable {
             isWalking = false
+            recentWindowSteps = 0
             boutStepsSinceStationary = 0
-            if (!isOnFixedWifi()) {
+            if (!isOnFixedWifi() && userActivityState != STATE_IN_CAR) {
                 gpsRestingAfterAnalysis = false
                 evaluateNoFixedWifiAlgorithm()
             }
         }
         handler.postDelayed(stepStoppedRunnable!!, 6_000L)
 
-        if (!isOnFixedWifi()) {
+        if (isOnFixedWifi()) {
+            persistAndBroadcastState(forceNotification = false)
+            return
+        }
+
+        if (isCarBtConnected) {
+            persistAndBroadcastState(forceNotification = false)
+            return
+        }
+
+        if (userActivityState == STATE_IN_CAR) {
+            if (recentWindowSteps >= 6) {
+                isWalking = true
+                gpsRestingAfterAnalysis = false
+                evaluateNoFixedWifiAlgorithm()
+            } else {
+                persistAndBroadcastState(forceNotification = false)
+            }
+            return
+        }
+
+        if (recentWindowSteps >= 3) {
+            isWalking = true
             evaluateNoFixedWifiAlgorithm()
         } else {
-            persistAndBroadcastState()
+            persistAndBroadcastState(forceNotification = false)
         }
     }
 
     private fun handleAccelerometerSample(ax: Float, ay: Float, az: Float) {
+        if (isOnFixedWifi() || isWalking || gpsHighAccuracyActive || userActivityState == STATE_IN_CAR || !gpsRestingAfterAnalysis) {
+            return
+        }
         if (!gravInitialized) {
             gravX = ax
             gravY = ay
@@ -372,21 +618,19 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         val lz = az - gravZ
         val linearAcc = sqrt(lx * lx + ly * ly + lz * lz)
 
-        // Risveglio affidabile dallo stato "Attualmente fermo" (o riposo post-ciclo)
-        if (!isOnFixedWifi() && !isWalking && !gpsHighAccuracyActive && gpsRestingAfterAnalysis) {
-            if (linearAcc > 1.35f) {
-                val now = System.currentTimeMillis()
-                if (now - lastInertialHitMs > 3_000L) {
-                    inertialWakeupHits = 1
-                } else {
-                    inertialWakeupHits++
-                }
-                lastInertialHitMs = now
-                if (inertialWakeupHits >= 2) {
-                    inertialWakeupHits = 0
-                    gpsRestingAfterAnalysis = false
-                    startNoStepGpsWindow(cycleIndex = 0)
-                }
+        if (linearAcc > 1.35f) {
+            val now = System.currentTimeMillis()
+            if (now - lastInertialHitMs > 3_000L) {
+                inertialWakeupHits = 1
+            } else {
+                inertialWakeupHits++
+            }
+            lastInertialHitMs = now
+            if (inertialWakeupHits >= 2) {
+                inertialWakeupHits = 0
+                gpsRestingAfterAnalysis = false
+                updateDynamicAccelerometerRegistration(shouldListen = false)
+                startNoStepGpsWindow(cycleIndex = 0)
             }
         }
     }
@@ -394,31 +638,29 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun isWifiTransportConnected(): Boolean {
         return try {
             val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
-            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            val net = cm?.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         } catch (_: Exception) {
             false
         }
     }
 
     private fun detectActiveWifiSsid(): String? {
-        val cached = lastCallbackWifiSsid?.replace("\"", "")?.trim()
-        if (!cached.isNullOrEmpty() && cached != "<unknown ssid>") return cached
+        if (!isWifiTransportConnected()) {
+            lastCallbackWifiSsid = null
+            return null
+        }
 
         try {
             val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-            if (cm != null) {
-                val net = cm.activeNetwork
-                val caps = cm.getNetworkCapabilities(net)
-                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        val wifiInfo = caps.transportInfo as? WifiInfo
-                        val s = wifiInfo?.ssid?.replace("\"", "")?.trim()
-                        if (!s.isNullOrEmpty() && s != "<unknown ssid>") {
-                            lastCallbackWifiSsid = s
-                            return s
-                        }
-                    }
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val wifiInfo = caps.transportInfo as? WifiInfo
+                val s = wifiInfo?.ssid?.replace("\"", "")?.trim()
+                if (!s.isNullOrEmpty() && s != "<unknown ssid>") {
+                    lastCallbackWifiSsid = s
+                    return s
                 }
             }
         } catch (_: Exception) {}
@@ -433,45 +675,45 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             }
         } catch (_: Exception) {}
 
-        if (isWifiTransportConnected()) {
-            val uiSsid = prefs.getString("flutter.ui_detected_wifi_ssid", null)?.replace("\"", "")?.trim()
-            if (!uiSsid.isNullOrEmpty() && uiSsid != "<unknown ssid>") {
-                return uiSsid
-            }
-        }
+        val cached = lastCallbackWifiSsid?.replace("\"", "")?.trim()
+        if (!cached.isNullOrEmpty() && cached != "<unknown ssid>") return cached
+
+        val uiSsid = prefs.getString("ui_wifi_ssid", null)?.replace("\"", "")?.trim()
+        if (!uiSsid.isNullOrEmpty() && uiSsid != "<unknown ssid>") return uiSsid
+
         return null
     }
 
     private fun isHomeWifi(ssid: String?): Boolean {
         if (ssid.isNullOrBlank()) return false
-        val home = prefs.getString("flutter.home_wifi_ssid", "")?.replace("\"", "")?.trim() ?: ""
+        val home = prefs.getString("home_wifi_ssid", "")?.replace("\"", "")?.trim() ?: ""
         return home.isNotEmpty() && home.equals(ssid, ignoreCase = true)
     }
 
     private fun isWorkWifi(ssid: String?): Boolean {
         if (ssid.isNullOrBlank()) return false
-        val work = prefs.getString("flutter.work_wifi_ssid", "")?.replace("\"", "")?.trim() ?: ""
+        val work = prefs.getString("work_wifi_ssid", "")?.replace("\"", "")?.trim() ?: ""
         return work.isNotEmpty() && work.equals(ssid, ignoreCase = true)
     }
 
     private fun isOnFixedWifi(): Boolean {
-        val s = currentConnectedWifiSsid ?: detectActiveWifiSsid()
-        return isHomeWifi(s) || isWorkWifi(s)
+        val s = detectActiveWifiSsid()
+        currentConnectedWifiSsid = s
+        if (isHomeWifi(s) || isWorkWifi(s)) return true
+        if (s == null && isWifiTransportConnected() && (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK)) {
+            return true
+        }
+        return false
     }
 
     private fun isIgnoredWifiSsid(ssid: String): Boolean {
-        return try {
-            val nativeIgnored = prefs.getStringSet("native_ignored_wifis", emptySet()) ?: emptySet()
-            if (nativeIgnored.any { it.equals(ssid, ignoreCase = true) }) return true
-            val rawFlutterList = prefs.getString("flutter.ignored_wifis", "") ?: ""
-            rawFlutterList.contains(ssid, ignoreCase = true)
-        } catch (_: Exception) {
-            false
-        }
+        val set = prefs.getStringSet("ignored_wifis", emptySet()) ?: emptySet()
+        return set.any { it.equals(ssid, ignoreCase = true) }
     }
 
     private fun evaluateConnectedWifiState() {
-        val ssid = detectActiveWifiSsid()
+        val wifiConnected = isWifiTransportConnected()
+        val ssid = if (wifiConnected) detectActiveWifiSsid() else null
         currentConnectedWifiSsid = ssid
 
         if (isHomeWifi(ssid) || isWorkWifi(ssid)) {
@@ -481,10 +723,34 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             gpsRestingAfterAnalysis = false
             carPromptShownInCurrentBout = false
             boutStepsSinceStationary = 0
+            recentWindowSteps = 0
+            currentSpeedKmh = 0f
             stopNoStepGpsWindow()
+            updateDynamicAccelerometerRegistration(shouldListen = false)
             cancelReleasePromptNotification()
+
+            if (promptShownForCurrentSession && homeRearmRunnable == null) {
+                homeRearmRunnable = Runnable {
+                    homeRearmRunnable = null
+                    if (isOnFixedWifi()) {
+                        promptShownForCurrentSession = false
+                    }
+                }
+                handler.postDelayed(homeRearmRunnable!!, 90_000L)
+            }
+
             transitionUserState(targetState)
             return
+        }
+
+        if (ssid == null && wifiConnected && (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK)) {
+            persistAndBroadcastState(forceNotification = false)
+            return
+        }
+
+        homeRearmRunnable?.let {
+            handler.removeCallbacks(it)
+            homeRearmRunnable = null
         }
 
         if (!ssid.isNullOrEmpty() && !isIgnoredWifiSsid(ssid) && !ssid.equals(lastPromptedWifiSsid, ignoreCase = true)) {
@@ -501,38 +767,44 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun evaluateNoFixedWifiAlgorithm() {
         if (isOnFixedWifi()) return
 
-        // Punto 3: Non connesso a Wi-Fi fissa + presenza di passo -> "In Movimento" senza analisi GPS accurata
+        if (isCarBtConnected) {
+            stopNoStepGpsWindow()
+            updateDynamicAccelerometerRegistration(shouldListen = false)
+            transitionUserState(STATE_IN_CAR)
+            return
+        }
+
         if (isWalking) {
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = false
             stopNoStepGpsWindow()
+            updateDynamicAccelerometerRegistration(shouldListen = false)
             transitionUserState(STATE_MOVING)
             return
         }
 
-        // Se confermato In Auto con BT collegato, resta "In Auto" con GPS in risparmio
-        if (userActivityState == STATE_IN_CAR && isCarBtConnected) {
+        if (userActivityState == STATE_IN_CAR) {
             stopNoStepGpsWindow()
-            persistAndBroadcastState()
+            updateDynamicAccelerometerRegistration(shouldListen = false)
+            persistAndBroadcastState(forceNotification = false)
             return
         }
 
-        // Appena scollegato da Casa/Lavoro senza passi, esci subito dallo stato Wi-Fi verso Attualmente fermo
         if (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK) {
             transitionUserState(STATE_STILL)
         }
 
-        // Punto 2: Non connesso a Wi-Fi fissa + mancanza di passo -> finestra GPS Tgps_senzapasso (30s)
         if (!gpsHighAccuracyActive && !gpsRestingAfterAnalysis) {
+            updateDynamicAccelerometerRegistration(shouldListen = false)
             startNoStepGpsWindow(cycleIndex = 0)
         } else {
-            persistAndBroadcastState()
+            updateDynamicAccelerometerRegistration(shouldListen = gpsRestingAfterAnalysis)
+            persistAndBroadcastState(forceNotification = false)
         }
     }
 
-    private var armedForDeparturePrompt = true
-
     private fun transitionUserState(newState: String) {
+        val changed = (userActivityState != newState)
         userActivityState = newState
 
         if (newState == STATE_AT_HOME || newState == STATE_AT_WORK || newState == STATE_STILL) {
@@ -541,7 +813,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
         val inMotion = (newState == STATE_MOVING || newState == STATE_IN_CAR)
         if (inMotion && armedForDeparturePrompt && !isOnFixedWifi()) {
-            val enoughMovement = (newState == STATE_IN_CAR) || !hasStepSensor || (boutStepsSinceStationary >= 3) || !isWalking
+            val enoughMovement = (newState == STATE_IN_CAR) || !hasStepHardware || (boutStepsSinceStationary >= 3) || !isWalking
             if (enoughMovement) {
                 armedForDeparturePrompt = false
                 if (hasActiveParking() && !promptShownForCurrentSession) {
@@ -554,12 +826,14 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             }
         }
 
-        persistAndBroadcastState()
+        persistAndBroadcastState(forceNotification = changed)
     }
 
     private fun startNoStepGpsWindow(cycleIndex: Int) {
-        if (isOnFixedWifi() || isWalking) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+        if (isOnFixedWifi() || isWalking || userActivityState == STATE_IN_CAR) return
+        val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine && !hasCoarse) {
             transitionUserState(STATE_STILL)
             return
         }
@@ -572,13 +846,15 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         currentSpeedKmh = 0f
 
         try {
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, Looper.getMainLooper())
-            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 2000L, 0f, this, Looper.getMainLooper())
-        } catch (_: Exception) {}
+            val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+                .setMinUpdateIntervalMillis(500L)
+                .build()
+            fusedLocationClient.requestLocationUpdates(req, fusedLocationCallback, Looper.getMainLooper())
+        } catch (_: SecurityException) {} catch (_: Exception) {}
 
         gpsWindowTickRunnable = object : Runnable {
             override fun run() {
-                if (isOnFixedWifi() || isWalking) {
+                if (isOnFixedWifi() || isWalking || userActivityState == STATE_IN_CAR) {
                     stopNoStepGpsWindow()
                     evaluateConnectedWifiState()
                     return
@@ -587,12 +863,12 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                 if (gpsWindowRemainingSec <= 0) {
                     evaluateNoStepGpsWindowResult()
                 } else {
-                    persistAndBroadcastState()
+                    persistAndBroadcastState(forceNotification = false)
                     handler.postDelayed(this, 1000L)
                 }
             }
         }
-        persistAndBroadcastState()
+        persistAndBroadcastState(forceNotification = true)
         handler.postDelayed(gpsWindowTickRunnable!!, 1000L)
     }
 
@@ -620,18 +896,17 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
         currentSpeedKmh = vIst
 
-        // Ramo 2a: vMedia <= 1 km/h -> "Attualmente fermo", poi GPS in risparmio
         if (vMedia <= 1.0f) {
             stopNoStepGpsWindow()
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = true
             carPromptShownInCurrentBout = false
             boutStepsSinceStationary = 0
+            updateDynamicAccelerometerRegistration(shouldListen = true)
             transitionUserState(STATE_STILL)
             return
         }
 
-        // Ramo 2b: vMedia > 1 km/h e vIst <= 10 km/h -> "In Movimento", secondo ciclo 30s poi riposo
         if (vIst <= 10.0f) {
             transitionUserState(STATE_MOVING)
             if (noStepGpsCycleCount == 0) {
@@ -640,28 +915,30 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                 stopNoStepGpsWindow()
                 noStepGpsCycleCount = 0
                 gpsRestingAfterAnalysis = true
-                persistAndBroadcastState()
+                updateDynamicAccelerometerRegistration(shouldListen = true)
+                persistAndBroadcastState(forceNotification = true)
             }
             return
         }
 
-        // Ramo 2c: vMedia > 1 km/h e vIst > 10 km/h -> controllo connessione Bluetooth auto
         stopNoStepGpsWindow()
         noStepGpsCycleCount = 0
         gpsRestingAfterAnalysis = true
 
         if (isCarBtConnected) {
+            updateDynamicAccelerometerRegistration(shouldListen = false)
             transitionUserState(STATE_IN_CAR)
             if (hasActiveParking()) {
                 completeAutomaticVehicleDeparture()
             }
         } else {
+            updateDynamicAccelerometerRegistration(shouldListen = true)
             transitionUserState(STATE_MOVING)
             if (!carPromptShownInCurrentBout) {
                 carPromptShownInCurrentBout = true
-                prefs.edit().putBoolean("flutter.native_prompt_in_car", true).apply()
+                prefs.edit().putBoolean("prompt_in_car", true).apply()
                 showAreYouInCarNotification()
-                persistAndBroadcastState()
+                persistAndBroadcastState(forceNotification = true)
             }
         }
     }
@@ -669,23 +946,28 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun stopNoStepGpsWindow() {
         gpsWindowTickRunnable?.let { handler.removeCallbacks(it) }
         gpsWindowTickRunnable = null
+        val wasActive = gpsHighAccuracyActive
         gpsHighAccuracyActive = false
         gpsWindowRemainingSec = 0
         try {
-            locationManager.removeUpdates(this)
+            fusedLocationClient.removeLocationUpdates(fusedLocationCallback)
         } catch (_: Exception) {}
+        if (wasActive) {
+            lastNotifiedGpsMode = null
+        }
     }
 
-    override fun onLocationChanged(loc: Location) {
+    private fun handleFusedLocation(loc: Location) {
         val instKmh = if (loc.hasSpeed()) max(0f, loc.speed * 3.6f) else 0f
         currentSpeedKmh = instKmh
 
         if (gpsHighAccuracyActive) {
-            if (loc.accuracy <= 25f || gpsWindowSamples.isEmpty()) {
+            if (loc.accuracy <= 35f || gpsWindowSamples.isEmpty()) {
                 gpsWindowSamples.add(
                     NativeGpsSample(System.currentTimeMillis(), loc.latitude, loc.longitude, instKmh, loc.accuracy)
                 )
             }
+            persistAndBroadcastState(forceNotification = false)
         }
 
         val coords = getParkedLatLon()
@@ -700,14 +982,11 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    override fun onProviderEnabled(provider: String) {}
-    override fun onProviderDisabled(provider: String) {}
-
     private fun onCarBluetoothConnected() {
         if (isOnFixedWifi()) return
         gpsRestingAfterAnalysis = true
         stopNoStepGpsWindow()
+        updateDynamicAccelerometerRegistration(shouldListen = false)
         transitionUserState(STATE_IN_CAR)
         if (hasActiveParking()) {
             completeAutomaticVehicleDeparture()
@@ -718,6 +997,10 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         gpsRestingAfterAnalysis = false
         carPromptShownInCurrentBout = false
         boutStepsSinceStationary = 0
+        recentWindowSteps = 0
+        if (userActivityState == STATE_IN_CAR) {
+            userActivityState = STATE_STILL
+        }
         evaluateConnectedWifiState()
     }
 
@@ -741,22 +1024,23 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         cancelPromptNotification()
         triggerServerRelease(2)
         resetSessionFlagsAndClearParking()
-        persistAndBroadcastState()
+        persistAndBroadcastState(forceNotification = true)
     }
 
     private fun handleUserDenyRelease() {
         cancelPromptNotification()
         passedThroughStall = false
-        persistAndBroadcastState()
+        persistAndBroadcastState(forceNotification = false)
     }
 
     private fun handleUserConfirmInCarFromNotif() {
         cancelInCarPromptNotification()
-        prefs.edit().putBoolean("flutter.native_prompt_in_car", false).apply()
+        prefs.edit().putBoolean("prompt_in_car", false).apply()
         gpsRestingAfterAnalysis = true
         stopNoStepGpsWindow()
+        updateDynamicAccelerometerRegistration(shouldListen = false)
         userActivityState = STATE_IN_CAR
-        persistAndBroadcastState()
+        persistAndBroadcastState(forceNotification = true)
         if (hasActiveParking()) {
             showReleasePromptNotification()
         }
@@ -764,8 +1048,8 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private fun handleUserDenyInCarFromNotif() {
         cancelInCarPromptNotification()
-        prefs.edit().putBoolean("flutter.native_prompt_in_car", false).apply()
-        persistAndBroadcastState()
+        prefs.edit().putBoolean("prompt_in_car", false).apply()
+        persistAndBroadcastState(forceNotification = false)
     }
 
     private fun completeAutomaticVehicleDeparture() {
@@ -774,35 +1058,35 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         triggerServerRelease(0)
         showDepartureReleasedNotification()
         resetSessionFlagsAndClearParking()
-        persistAndBroadcastState()
+        persistAndBroadcastState(forceNotification = true)
     }
 
     private fun resetSessionFlagsAndClearParking() {
         prefs.edit()
-            .remove("flutter.parked_lat")
-            .remove("flutter.parked_lon")
-            .putBoolean("flutter.native_prompt_in_car", false)
+            .remove("parked_lat")
+            .remove("parked_lon")
+            .putBoolean("prompt_in_car", false)
             .apply()
         promptShownForCurrentSession = false
         passedThroughStall = false
         try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
     }
 
-    private fun persistAndBroadcastState() {
+    private fun persistAndBroadcastState(forceNotification: Boolean) {
         try {
             prefs.edit()
-                .putString("flutter.native_user_state", userActivityState)
-                .putBoolean("flutter.native_gps_active", gpsHighAccuracyActive)
-                .putInt("flutter.native_gps_remaining_sec", gpsWindowRemainingSec)
-                .putInt("flutter.native_gps_cycle", noStepGpsCycleCount)
-                .putFloat("flutter.native_speed_kmh", currentSpeedKmh)
-                .putInt("flutter.native_session_steps", sessionSteps)
-                .putBoolean("flutter.native_car_bt_connected", isCarBtConnected)
+                .putString("user_state", userActivityState)
+                .putInt("session_steps", sessionSteps)
                 .apply()
 
-            updateForegroundStatusNotification()
+            if (forceNotification || lastNotifiedTitleState != userActivityState || lastNotifiedGpsMode != gpsHighAccuracyActive) {
+                lastNotifiedTitleState = userActivityState
+                lastNotifiedGpsMode = gpsHighAccuracyActive
+                updateForegroundStatusNotification()
+            }
 
-            sendBroadcast(Intent(ACTION_STATE_UPDATED).setPackage(packageName))
+            val snap = buildSnapshotMap()
+            uiStateListener?.invoke(snap)
         } catch (_: Exception) {}
     }
 
@@ -820,7 +1104,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun updateForegroundStatusNotification() {
         try {
             val openPi = PendingIntent.getActivity(this, 10, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            val gpsText = if (gpsHighAccuracyActive) "GPS alta precisione (${gpsWindowRemainingSec}s)" else "GPS in risparmio"
+            val gpsText = if (gpsHighAccuracyActive) "GPS alta precisione attivo" else "GPS in risparmio"
             val notif = NotificationCompat.Builder(this, CHANNEL_FG)
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                 .setContentTitle("Stato utente: ${userStateItalianLabel()}")
@@ -829,27 +1113,40 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                 .setOnlyAlertOnce(true)
                 .setContentIntent(openPi)
                 .build()
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(FG_NOTIF_ID, notif)
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(FG_NOTIF_ID, notif)
         } catch (_: Exception) {}
     }
 
     private fun handleSaveWifiAction(ssid: String?, isHome: Boolean) {
-        val clean = ssid?.trim()?.takeIf { it.isNotEmpty() } ?: return
-        val key = if (isHome) "flutter.home_wifi_ssid" else "flutter.work_wifi_ssid"
-        prefs.edit().putString(key, clean).apply()
+        val clean = ssid?.replace("\"", "")?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val key = if (isHome) "home_wifi_ssid" else "work_wifi_ssid"
+        val targetState = if (isHome) STATE_AT_HOME else STATE_AT_WORK
+        lastCallbackWifiSsid = clean
+        currentConnectedWifiSsid = clean
         pendingUnknownWifiSsid = null
+        noStepGpsCycleCount = 0
+        gpsRestingAfterAnalysis = false
+        carPromptShownInCurrentBout = false
+        boutStepsSinceStationary = 0
+        stopNoStepGpsWindow()
+        updateDynamicAccelerometerRegistration(shouldListen = false)
+        cancelReleasePromptNotification()
+        prefs.edit()
+            .putString(key, clean)
+            .putString("ui_wifi_ssid", clean)
+            .putString("user_state", targetState)
+            .apply()
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(WIFI_PROMPT_NOTIF_ID)
         } catch (_: Exception) {}
-        evaluateConnectedWifiState()
+        transitionUserState(targetState)
     }
 
     private fun handleIgnoreWifiAction(ssid: String?) {
-        val clean = ssid?.trim()?.takeIf { it.isNotEmpty() } ?: return
-        val current = (prefs.getStringSet("native_ignored_wifis", emptySet()) ?: emptySet()).toMutableSet()
+        val clean = ssid?.replace("\"", "")?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val current = (prefs.getStringSet("ignored_wifis", emptySet()) ?: emptySet()).toMutableSet()
         current.add(clean)
-        prefs.edit().putStringSet("native_ignored_wifis", current).apply()
+        prefs.edit().putStringSet("ignored_wifis", current).apply()
         pendingUnknownWifiSsid = null
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(WIFI_PROMPT_NOTIF_ID)
@@ -923,41 +1220,6 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private fun registerWifiNetworkCallback() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        if (prefsChangeListener == null) {
-            prefsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                handler.post {
-                    when (key) {
-                        "flutter.parked_lat" -> {
-                            if (prefs.contains("flutter.parked_lat")) {
-                                promptShownForCurrentSession = false
-                                passedThroughStall = false
-                                boutStepsSinceStationary = 0
-                            } else {
-                                cancelPromptNotification()
-                                cancelInCarPromptNotification()
-                                promptShownForCurrentSession = false
-                                passedThroughStall = false
-                            }
-                            persistAndBroadcastState()
-                        }
-                        "flutter.home_wifi_ssid", "flutter.work_wifi_ssid", "flutter.ui_detected_wifi_ssid" -> evaluateConnectedWifiState()
-                        "flutter.native_user_state" -> {
-                            val synced = prefs.getString("flutter.native_user_state", null)
-                            if (synced != null && synced != userActivityState) {
-                                userActivityState = synced
-                                if (userActivityState == STATE_IN_CAR) {
-                                    gpsRestingAfterAnalysis = true
-                                    stopNoStepGpsWindow()
-                                }
-                                updateForegroundStatusNotification()
-                            }
-                        }
-                    }
-                }
-            }
-            prefs.registerOnSharedPreferenceChangeListener(prefsChangeListener)
-        }
-
         val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
@@ -978,6 +1240,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             handler.post {
                 currentConnectedWifiSsid = null
                 pendingUnknownWifiSsid = null
+                prefs.edit().remove("ui_wifi_ssid").apply()
                 gpsRestingAfterAnalysis = false
                 evaluateNoFixedWifiAlgorithm()
             }
@@ -1008,12 +1271,15 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
         try {
             connectivityManager?.registerNetworkCallback(req, networkCallback!!)
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            networkCallback = null
+        }
     }
 
     private fun startGeofenceSyncWatchdog() {
         geofenceWatchdogRunnable = object : Runnable {
             override fun run() {
+                registerStepSensors()
                 syncNativeGeofenceWithActiveParking()
                 evaluateConnectedWifiState()
                 handler.postDelayed(this, 30_000L)
@@ -1095,14 +1361,14 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             addAction(ACTION_SAVE_WIFI_WORK)
             addAction(ACTION_IGNORE_WIFI)
         }
-        ContextCompat.registerReceiver(this, internalReceiver, internalFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        ContextCompat.registerReceiver(this, internalReceiver, internalFilter, ContextCompat.RECEIVER_EXPORTED)
 
-        val btFilter = IntentFilter().apply {
+        val sysFilter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
             addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
         }
-        ContextCompat.registerReceiver(this, systemBtReceiver, btFilter, ContextCompat.RECEIVER_EXPORTED)
+        ContextCompat.registerReceiver(this, systemReceiver, sysFilter, ContextCompat.RECEIVER_EXPORTED)
     }
 
     private fun createNotificationChannels() {
@@ -1195,7 +1461,6 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             .build()
 
         wakeUpScreenAndSoundAlarm()
-        prefs.edit().putBoolean("flutter.pending_lockscreen_alarm", true).apply()
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(PROMPT_NOTIF_ID, notif)
     }
 
@@ -1205,7 +1470,6 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private fun cancelPromptNotification() {
         stopAlarmRingtone()
-        prefs.edit().putBoolean("flutter.pending_lockscreen_alarm", false).apply()
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(PROMPT_NOTIF_ID)
     }
 

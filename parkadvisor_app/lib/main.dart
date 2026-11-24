@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'map_modes_screen.dart';
@@ -51,12 +49,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _sensorEngine.syncFromNativeBackgroundService();
-    }
-  }
 
     _sensorEngine = SensorFusionEngine(
       onCarParked: _handleCarParked,
@@ -74,6 +66,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
     _initApp();
     _antiFraudWatchTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkPendingReleaseExpiration());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _sensorEngine.setAppForegroundState(true);
+    } else if (state == AppLifecycleState.paused) {
+      _sensorEngine.setAppForegroundState(false);
+    }
   }
 
   Future<void> _loadLocalAndRemoteUser() async {
@@ -105,14 +106,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _initApp() async {
-    await _loadLocalAndRemoteUser();
-    await Geolocator.requestPermission();
-    SensorFusionEngine.initialPermissionsCompleter.future
-        .timeout(const Duration(seconds: 5), onTimeout: () {})
-        .then((_) => Future.delayed(const Duration(milliseconds: 600)))
-        .then((_) => const MethodChannel('parknow/bg_service').invokeMethod('requestFullScreenIntentPermission'))
-        .catchError((_) {});
+    unawaited(_loadLocalAndRemoteUser());
     await _sensorEngine.initialize();
+    try {
+      await Future.delayed(const Duration(milliseconds: 500));
+      await const MethodChannel('parknow/bg_service').invokeMethod('requestFullScreenIntentPermission');
+    } catch (_) {}
   }
 
   Future<void> _checkPendingReleaseExpiration() async {
@@ -353,6 +352,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             tooltip: 'Profilo e Impostazioni',
             onPressed: () async {
               await Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen()));
+              await _sensorEngine.reloadUserPreferences();
               _loadLocalAndRemoteUser();
             },
           ),

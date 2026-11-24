@@ -3,12 +3,14 @@ package com.parkadvisor.parkadvisor_app
 import android.Manifest
 import android.app.KeyguardManager
 import android.app.NotificationManager
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -20,7 +22,6 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private var bgChannel: MethodChannel? = null
-    private var stateReceiver: BroadcastReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -30,15 +31,107 @@ class MainActivity : FlutterActivity() {
             (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.requestDismissKeyguard(this, null)
         } else {
             @Suppress("DEPRECATION")
-            window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+            )
         }
         startBgServiceIfPermitted()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        startBgServiceIfPermitted()
+        pushForegroundWifiHintIfAvailable()
+        val snap = FixedWifiMonitorService.instance?.refreshAndGetSnapshot()
+            ?: FixedWifiMonitorService.buildFallbackSnapshot(this)
+        bgChannel?.invokeMethod("onNativeStateUpdated", snap)
+    }
+
+    private fun readForegroundWifiSsid(): String? {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val wifiInfo = caps.transportInfo as? WifiInfo
+                val s = wifiInfo?.ssid?.replace("\"", "")?.trim()
+                if (!s.isNullOrEmpty() && s != "<unknown ssid>") return s
+            }
+        } catch (_: Exception) {}
+        return try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            @Suppress("DEPRECATION")
+            val s = wm?.connectionInfo?.ssid?.replace("\"", "")?.trim()
+            if (!s.isNullOrEmpty() && s != "<unknown ssid>") s else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun pushForegroundWifiHintIfAvailable() {
+        val fgSsid = readForegroundWifiSsid()
+        if (!fgSsid.isNullOrEmpty()) {
+            val p = getSharedPreferences(FixedWifiMonitorService.PREFS_NAME, Context.MODE_PRIVATE)
+            p.edit().putString("ui_wifi_ssid", fgSsid).apply()
+            FixedWifiMonitorService.instance?.onFlutterConfigSynced(mapOf("uiDetectedWifiSsid" to fgSsid))
+        }
+    }
+
+    private fun persistFallbackConfig(args: Map<String, Any?>) {
+        val p = getSharedPreferences(FixedWifiMonitorService.PREFS_NAME, Context.MODE_PRIVATE)
+        val ed = p.edit()
+        (args["homeWifiSsid"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("home_wifi_ssid", it.replace("\"", ""))
+        }
+        if (args["clearHomeWifi"] == true) ed.remove("home_wifi_ssid")
+        (args["workWifiSsid"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("work_wifi_ssid", it.replace("\"", ""))
+        }
+        if (args["clearWorkWifi"] == true) ed.remove("work_wifi_ssid")
+        if (args.containsKey("uiDetectedWifiSsid")) {
+            val s = (args["uiDetectedWifiSsid"] as? String)?.replace("\"", "")?.trim()
+            if (!s.isNullOrEmpty() && s != "<unknown ssid>") ed.putString("ui_wifi_ssid", s)
+        }
+        (args["carBtMac"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("car_bt_mac", it.uppercase())
+        }
+        (args["tGpsNoStepSec"] as? Number)?.let {
+            ed.putInt("tgps_senzapasso_sec", it.toInt().coerceIn(10, 180))
+        }
+        (args["geofenceRadiusM"] as? Number)?.let {
+            ed.putInt("geofence_radius_m", it.toInt().coerceIn(20, 2000))
+        }
+        if (args.containsKey("parkedLat") && args.containsKey("parkedLon")) {
+            val lat = (args["parkedLat"] as? Number)?.toDouble()
+            val lon = (args["parkedLon"] as? Number)?.toDouble()
+            if (lat != null && lon != null) {
+                ed.putString("parked_lat", lat.toString())
+                ed.putString("parked_lon", lon.toString())
+            } else {
+                ed.remove("parked_lat")
+                ed.remove("parked_lon")
+            }
+        }
+        if (args["clearPromptInCar"] == true) ed.putBoolean("prompt_in_car", false)
+        (args["forceUserState"] as? String)?.trim()?.let {
+            if (it.isNotEmpty()) ed.putString("user_state", it)
+        }
+        ed.apply()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parknow/bg_service")
         bgChannel = channel
+
+        FixedWifiMonitorService.uiStateListener = { snap ->
+            runOnUiThread {
+                try {
+                    bgChannel?.invokeMethod("onNativeStateUpdated", snap)
+                } catch (_: Exception) {}
+            }
+        }
 
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -59,7 +152,24 @@ class MainActivity : FlutterActivity() {
                 }
                 "startMonitorService" -> {
                     startBgServiceIfPermitted()
+                    pushForegroundWifiHintIfAvailable()
                     result.success(true)
+                }
+                "getNativeStateSnapshot" -> {
+                    startBgServiceIfPermitted()
+                    pushForegroundWifiHintIfAvailable()
+                    val snap = FixedWifiMonitorService.instance?.refreshAndGetSnapshot()
+                        ?: FixedWifiMonitorService.buildFallbackSnapshot(this)
+                    result.success(snap)
+                }
+                "syncConfigToNative" -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val args = (call.arguments as? Map<String, Any?>) ?: emptyMap()
+                    persistFallbackConfig(args)
+                    startBgServiceIfPermitted()
+                    val snap = FixedWifiMonitorService.instance?.onFlutterConfigSynced(args)
+                        ?: FixedWifiMonitorService.buildFallbackSnapshot(this)
+                    result.success(snap)
                 }
                 "confirmInCar" -> {
                     sendBroadcast(Intent(FixedWifiMonitorService.ACTION_CONFIRM_IN_CAR).setPackage(packageName))
@@ -72,29 +182,11 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
-
-        if (stateReceiver == null) {
-            stateReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    if (intent?.action == FixedWifiMonitorService.ACTION_STATE_UPDATED) {
-                        bgChannel?.invokeMethod("onNativeStateUpdated", null)
-                    }
-                }
-            }
-            ContextCompat.registerReceiver(
-                this,
-                stateReceiver,
-                IntentFilter(FixedWifiMonitorService.ACTION_STATE_UPDATED),
-                ContextCompat.RECEIVER_NOT_EXPORTED
-            )
-        }
     }
 
     override fun onDestroy() {
-        try {
-            stateReceiver?.let { unregisterReceiver(it) }
-            stateReceiver = null
-        } catch (_: Exception) {}
+        FixedWifiMonitorService.uiStateListener = null
+        bgChannel = null
         super.onDestroy()
     }
 

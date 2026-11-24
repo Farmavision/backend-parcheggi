@@ -55,6 +55,7 @@ class SensorFusionEngine extends ChangeNotifier {
   int gpsWindowRemainingSec = 0;
   int _noStepGpsCycleCount = 0;
   bool _inCarPromptDeliveredInUi = false;
+  bool _isAppInForeground = true;
 
   final Future<void> Function(double lat, double lon, String method) onCarParked;
   final Future<void> Function(int estimatedMinutes) onApproachingCar100m;
@@ -140,8 +141,8 @@ class SensorFusionEngine extends ChangeNotifier {
   bool get isOnKnownPrivateWifi {
     if (currentConnectedWifiSsid == null || currentConnectedWifiSsid!.isEmpty) return false;
     final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-    return (homeWifiSsid != null && clean.toLowerCase() == homeWifiSsid!.toLowerCase()) ||
-        (workWifiSsid != null && clean.toLowerCase() == workWifiSsid!.toLowerCase());
+    return (homeWifiSsid != null && homeWifiSsid!.isNotEmpty && clean.toLowerCase() == homeWifiSsid!.toLowerCase()) ||
+        (workWifiSsid != null && workWifiSsid!.isNotEmpty && clean.toLowerCase() == workWifiSsid!.toLowerCase());
   }
 
   UserActivityState _parseNativeState(String? code) {
@@ -160,102 +161,182 @@ class SensorFusionEngine extends ChangeNotifier {
     }
   }
 
+  void setAppForegroundState(bool inForeground) {
+    _isAppInForeground = inForeground;
+    if (inForeground) {
+      _startFallbackSyncTimer();
+      syncFromNativeBackgroundService();
+    } else {
+      _nativeSyncFallbackTimer?.cancel();
+      _nativeSyncFallbackTimer = null;
+    }
+  }
+
+  void _startFallbackSyncTimer() {
+    _nativeSyncFallbackTimer?.cancel();
+    _nativeSyncFallbackTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_isAppInForeground) {
+        syncFromNativeBackgroundService();
+      }
+    });
+  }
+
+  void _applyNativeSnapshotMap(Map<String, dynamic> snap) {
+    final nativeHome = (snap['homeWifiSsid'] as String?)?.trim() ?? '';
+    if (nativeHome.isNotEmpty && homeWifiSsid != nativeHome) {
+      homeWifiSsid = nativeHome;
+      SharedPreferences.getInstance().then((p) => p.setString('home_wifi_ssid', nativeHome));
+    }
+    final nativeWork = (snap['workWifiSsid'] as String?)?.trim() ?? '';
+    if (nativeWork.isNotEmpty && workWifiSsid != nativeWork) {
+      workWifiSsid = nativeWork;
+      SharedPreferences.getInstance().then((p) => p.setString('work_wifi_ssid', nativeWork));
+    }
+
+    final nativeConnectedWifi = (snap['connectedWifiSsid'] as String?)?.trim() ?? '';
+    if (nativeConnectedWifi.isNotEmpty) {
+      currentConnectedWifiSsid = nativeConnectedWifi;
+    }
+
+    final nativeState = snap['userActivityState'] as String?;
+    isHighAccuracyGpsActive = snap['gpsActive'] == true;
+    gpsWindowRemainingSec = (snap['gpsRemainingSec'] as num?)?.toInt() ?? 0;
+    _noStepGpsCycleCount = (snap['gpsCycle'] as num?)?.toInt() ?? 0;
+    currentSpeedKmh = (snap['speedKmh'] as num?)?.toDouble() ?? 0.0;
+    sessionSteps = (snap['sessionSteps'] as num?)?.toInt() ?? 0;
+    if (snap['carBtConnected'] != null) {
+      isCarBtConnected = snap['carBtConnected'] == true;
+    }
+
+    if (isOnKnownPrivateWifi) {
+      final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
+      final isWork = workWifiSsid != null && workWifiSsid!.isNotEmpty && clean.toLowerCase() == workWifiSsid!.toLowerCase();
+      userActivityState = isWork ? UserActivityState.atWork : UserActivityState.atHome;
+      isHighAccuracyGpsActive = false;
+      gpsWindowRemainingSec = 0;
+    } else if (nativeState != null) {
+      userActivityState = _parseNativeState(nativeState);
+    }
+
+    final hasParked = snap['hasParked'] == true;
+    if (hasParked) {
+      parkedLat = (snap['parkedLat'] as num?)?.toDouble() ?? parkedLat;
+      parkedLon = (snap['parkedLon'] as num?)?.toDouble() ?? parkedLon;
+      if (currentState != VehicleState.leavingSoon) {
+        currentState = VehicleState.parked;
+      }
+    } else if (snap.containsKey('hasParked')) {
+      parkedLat = null;
+      parkedLon = null;
+      if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
+        currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
+      }
+    }
+
+    final pendingInCar = snap['promptInCar'] == true;
+    if (pendingInCar && !_inCarPromptDeliveredInUi) {
+      _inCarPromptDeliveredInUi = true;
+      _bgServiceChannel.invokeMethod('syncConfigToNative', {'clearPromptInCar': true});
+      onPromptAreYouInCar?.call();
+    } else if (!pendingInCar) {
+      _inCarPromptDeliveredInUi = false;
+    }
+  }
+
+  Future<void> _pushConfigToNative({String? forceUserState}) async {
+    try {
+      final rawRes = await _bgServiceChannel.invokeMethod('syncConfigToNative', {
+        'homeWifiSsid': homeWifiSsid ?? '',
+        'workWifiSsid': workWifiSsid ?? '',
+        'uiDetectedWifiSsid': currentConnectedWifiSsid ?? '',
+        'carBtMac': targetCarBluetoothMac ?? '',
+        'tGpsNoStepSec': tGpsNoStepSec,
+        'geofenceRadiusM': geofenceRadiusMeters.round(),
+        'parkedLat': parkedLat,
+        'parkedLon': parkedLon,
+        if (forceUserState != null) 'forceUserState': forceUserState,
+      });
+      if (rawRes is Map) {
+        _applyNativeSnapshotMap(Map<String, dynamic>.from(rawRes));
+      }
+    } catch (_) {}
+  }
+
   Future<void> syncFromNativeBackgroundService() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.reload();
-
       await _checkCurrentWifi(promptIfUnknown: false);
-
-      final nativeState = prefs.getString('native_user_state');
-      isHighAccuracyGpsActive = prefs.getBool('native_gps_active') ?? false;
-      gpsWindowRemainingSec = prefs.getInt('native_gps_remaining_sec') ?? 0;
-      _noStepGpsCycleCount = prefs.getInt('native_gps_cycle') ?? 0;
-      currentSpeedKmh = prefs.getDouble('native_speed_kmh') ?? 0.0;
-      sessionSteps = prefs.getInt('native_session_steps') ?? 0;
-      if (prefs.containsKey('native_car_bt_connected')) {
-        isCarBtConnected = prefs.getBool('native_car_bt_connected') ?? isCarBtConnected;
-      }
-
-      if (isOnKnownPrivateWifi) {
+      final rawSnap = await _bgServiceChannel.invokeMethod('getNativeStateSnapshot');
+      if (rawSnap is Map) {
+        _applyNativeSnapshotMap(Map<String, dynamic>.from(rawSnap));
+      } else if (isOnKnownPrivateWifi) {
         final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-        final isWork = workWifiSsid != null && clean.toLowerCase() == workWifiSsid!.toLowerCase();
+        final isWork = workWifiSsid != null && workWifiSsid!.isNotEmpty && clean.toLowerCase() == workWifiSsid!.toLowerCase();
         userActivityState = isWork ? UserActivityState.atWork : UserActivityState.atHome;
         isHighAccuracyGpsActive = false;
         gpsWindowRemainingSec = 0;
-        final expectedNative = isWork ? 'atWork' : 'atHome';
-        if (nativeState != expectedNative) {
-          await prefs.setString('native_user_state', expectedNative);
-          await prefs.setBool('native_gps_active', false);
-        }
-      } else if (nativeState != null) {
-        userActivityState = _parseNativeState(nativeState);
       }
-
-      parkedLat = prefs.getDouble('parked_lat');
-      parkedLon = prefs.getDouble('parked_lon');
-      if (parkedLat != null && parkedLon != null) {
-        if (currentState != VehicleState.leavingSoon) {
-          currentState = VehicleState.parked;
-        }
-      } else if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
-        currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
-      }
-
-      final pendingInCar = prefs.getBool('native_prompt_in_car') ?? false;
-      if (pendingInCar && !_inCarPromptDeliveredInUi) {
-        _inCarPromptDeliveredInUi = true;
-        await prefs.setBool('native_prompt_in_car', false);
-        onPromptAreYouInCar?.call();
-      } else if (!pendingInCar) {
-        _inCarPromptDeliveredInUi = false;
-      }
-
       notifyListeners();
     } catch (_) {}
   }
 
   Future<void> initialize() async {
-    await [Permission.activityRecognition, Permission.bluetoothConnect, Permission.locationWhenInUse, Permission.notification].request();
-
     _bgServiceChannel.setMethodCallHandler((call) async {
       if (call.method == 'onNativeStateUpdated') {
-        await syncFromNativeBackgroundService();
+        if (call.arguments is Map) {
+          _applyNativeSnapshotMap(Map<String, dynamic>.from(call.arguments as Map));
+          notifyListeners();
+        } else {
+          await syncFromNativeBackgroundService();
+        }
       }
     });
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+      parkedLat = prefs.getDouble('parked_lat');
+      parkedLon = prefs.getDouble('parked_lon');
+      autoShareEnabled = prefs.getBool('auto_share_enabled') ?? true;
+      targetCarBluetoothMac = prefs.getString('car_bt_mac');
+      targetCarBluetoothName = prefs.getString('car_bt_name');
+      final savedHome = prefs.getString('home_wifi_ssid');
+      if (savedHome != null && savedHome.isNotEmpty) homeWifiSsid = savedHome;
+      final savedWork = prefs.getString('work_wifi_ssid');
+      if (savedWork != null && savedWork.isNotEmpty) workWifiSsid = savedWork;
+      tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
+      geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
+      _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
+      _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
+      if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
+    } catch (_) {}
+
+    _setupClassicBluetoothListener();
+    _startBleBluetoothMonitor();
+    _startWifiMonitor();
+    _startFallbackSyncTimer();
+
+    for (final perm in [
+      Permission.locationWhenInUse,
+      Permission.activityRecognition,
+      Permission.bluetoothConnect,
+      Permission.notification,
+    ]) {
+      try {
+        await perm.request();
+      } catch (_) {}
+    }
 
     try {
       await _bgServiceChannel.invokeMethod('startMonitorService');
     } catch (_) {}
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.reload();
-    parkedLat = prefs.getDouble('parked_lat');
-    parkedLon = prefs.getDouble('parked_lon');
-    autoShareEnabled = prefs.getBool('auto_share_enabled') ?? true;
-    targetCarBluetoothMac = prefs.getString('car_bt_mac');
-    targetCarBluetoothName = prefs.getString('car_bt_name');
-    homeWifiSsid = prefs.getString('home_wifi_ssid');
-    workWifiSsid = prefs.getString('work_wifi_ssid');
-    tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
-    geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
-    _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
-    _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
-
-    if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
-
-    _setupClassicBluetoothListener();
-    _startBleBluetoothMonitor();
     await _checkCurrentWifi(promptIfUnknown: true);
-    _startWifiMonitor();
+    await _pushConfigToNative();
     await syncFromNativeBackgroundService();
 
-    _nativeSyncFallbackTimer?.cancel();
-    _nativeSyncFallbackTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      syncFromNativeBackgroundService();
-    });
-
-    if (!initialPermissionsCompleter.isCompleted) initialPermissionsCompleter.complete();
+    if (!initialPermissionsCompleter.isCompleted) {
+      initialPermissionsCompleter.complete();
+    }
     notifyListeners();
   }
 
@@ -272,24 +353,21 @@ class SensorFusionEngine extends ChangeNotifier {
     if (workWifi != null && workWifi.isNotEmpty) workWifiSsid = workWifi;
     tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
     geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
+    await _pushConfigToNative();
     await syncFromNativeBackgroundService();
   }
 
   Future<void> confirmUserInCarFromPrompt() async {
     userActivityState = UserActivityState.inCar;
     isHighAccuracyGpsActive = false;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('native_user_state', 'inCar');
-    await prefs.setBool('native_prompt_in_car', false);
     try {
       await _bgServiceChannel.invokeMethod('confirmInCar');
+      await _pushConfigToNative(forceUserState: 'inCar');
     } catch (_) {}
     notifyListeners();
   }
 
   Future<void> dismissUserInCarPrompt() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('native_prompt_in_car', false);
     try {
       await _bgServiceChannel.invokeMethod('denyInCar');
     } catch (_) {}
@@ -334,7 +412,7 @@ class SensorFusionEngine extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('car_bt_mac', targetCarBluetoothMac!);
     await prefs.setString('car_bt_name', name);
-    await prefs.setString('native_user_state', 'inCar');
+    await _pushConfigToNative(forceUserState: 'inCar');
     if (isCarParked) {
       await _triggerCarReleased();
     } else {
@@ -362,11 +440,8 @@ class SensorFusionEngine extends ChangeNotifier {
     _pendingWifiConfirmationSsid = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('home_wifi_ssid', clean);
-    await prefs.setString('ui_detected_wifi_ssid', clean);
-    await prefs.setString('native_user_state', 'atHome');
-    await prefs.setBool('native_gps_active', false);
+    await _pushConfigToNative(forceUserState: 'atHome');
     notifyListeners();
-    await syncFromNativeBackgroundService();
   }
 
   Future<void> saveWifiAsWork(String ssid) async {
@@ -379,11 +454,8 @@ class SensorFusionEngine extends ChangeNotifier {
     _pendingWifiConfirmationSsid = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('work_wifi_ssid', clean);
-    await prefs.setString('ui_detected_wifi_ssid', clean);
-    await prefs.setString('native_user_state', 'atWork');
-    await prefs.setBool('native_gps_active', false);
+    await _pushConfigToNative(forceUserState: 'atWork');
     notifyListeners();
-    await syncFromNativeBackgroundService();
   }
 
   Future<void> ignoreWifi(String ssid) async {
@@ -426,15 +498,19 @@ class SensorFusionEngine extends ChangeNotifier {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.reload();
-      homeWifiSsid = prefs.getString('home_wifi_ssid');
-      workWifiSsid = prefs.getString('work_wifi_ssid');
+      final savedHome = prefs.getString('home_wifi_ssid');
+      if (savedHome != null && savedHome.isNotEmpty) homeWifiSsid = savedHome;
+      final savedWork = prefs.getString('work_wifi_ssid');
+      if (savedWork != null && savedWork.isNotEmpty) workWifiSsid = savedWork;
+
       final info = NetworkInfo();
       final ssid = await info.getWifiName();
       if (ssid != null && ssid.isNotEmpty && ssid != '<unknown ssid>') {
         final clean = ssid.replaceAll('"', '').trim();
+        final changed = currentConnectedWifiSsid != clean;
         currentConnectedWifiSsid = clean;
-        if (prefs.getString('ui_detected_wifi_ssid') != clean) {
-          await prefs.setString('ui_detected_wifi_ssid', clean);
+        if (changed) {
+          await _bgServiceChannel.invokeMethod('syncConfigToNative', {'uiDetectedWifiSsid': clean});
         }
         if (isOnKnownPrivateWifi) {
           _pendingWifiConfirmationSsid = null;
@@ -445,23 +521,26 @@ class SensorFusionEngine extends ChangeNotifier {
           onUnknownWifiDetected?.call(clean);
         }
       } else {
-        currentConnectedWifiSsid = null;
-        _pendingWifiConfirmationSsid = null;
-        if (prefs.containsKey('ui_detected_wifi_ssid')) {
-          await prefs.remove('ui_detected_wifi_ssid');
+        final results = await Connectivity().checkConnectivity();
+        if (!results.contains(ConnectivityResult.wifi)) {
+          currentConnectedWifiSsid = null;
+          _pendingWifiConfirmationSsid = null;
         }
       }
     } catch (_) {}
   }
 
   void _startWifiMonitor() {
+    _connectivitySub?.cancel();
     _connectivitySub = Connectivity().onConnectivityChanged.listen((_) async {
       await _checkCurrentWifi(promptIfUnknown: true);
+      await _pushConfigToNative();
       await syncFromNativeBackgroundService();
     });
   }
 
   void _startBleBluetoothMonitor() {
+    _btCheckTimer?.cancel();
     _btCheckTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
       try {
         final connected = FlutterBluePlus.connectedDevices;
@@ -516,6 +595,7 @@ class SensorFusionEngine extends ChangeNotifier {
     await prefs.setDouble('parked_lat', parkedLat!);
     await prefs.setDouble('parked_lon', parkedLon!);
 
+    await _pushConfigToNative();
     await onCarParked(parkedLat!, parkedLon!, method);
     notifyListeners();
   }
@@ -532,6 +612,7 @@ class SensorFusionEngine extends ChangeNotifier {
     await prefs.remove('parked_lat');
     await prefs.remove('parked_lon');
 
+    await _pushConfigToNative();
     await onCarReleased();
     notifyListeners();
   }
