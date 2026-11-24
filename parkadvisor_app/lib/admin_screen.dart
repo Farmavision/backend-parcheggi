@@ -24,6 +24,7 @@ class _AdminScreenState extends State<AdminScreen> {
   final _xtGpsAttivoSecCtrl = TextEditingController(text: '10');
   final _xtGpsMaxAttivoMinCtrl = TextEditingController(text: '5');
   final _xtGpsDisattivoSecCtrl = TextEditingController(text: '15');
+  final _tGpsSenzaPassoCtrl = TextEditingController(text: '30');
   final _geofenceRadiusMCtrl = TextEditingController(text: '100');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
@@ -85,10 +86,10 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
     final gpsMax = int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5;
     final gpsDis = int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15;
     final geoRad = (int.tryParse(_geofenceRadiusMCtrl.text) ?? 100).clamp(20, 2000);
-    SharedPreferences.getInstance().then((s){s.setInt('xt_rit_not_sec',ritNot);s.setInt('xt_gps_attivo_sec',gpsAtt);s.setInt('xt_gps_max_attivo_min',gpsMax);s.setInt('xt_gps_disattivo_sec',gpsDis);s.setInt('geofence_radius_m',geoRad);});
+    SharedPreferences.getInstance().then((s){s.setInt('xt_rit_not_sec',ritNot);s.setInt('xt_gps_attivo_sec',gpsAtt);s.setInt('xt_gps_max_attivo_min',gpsMax);s.setInt('xt_gps_disattivo_sec',gpsDis);s.setInt('tgps_senzapasso_sec',(int.tryParse(_tGpsSenzaPassoCtrl.text)??30).clamp(10,180));s.setInt('geofence_radius_m',geoRad);});
           if (data['penalty_false_release'] != null) _penaltyCtrl.text = data['penalty_false_release'].toString();
           if (data['release_delta_minutes'] != null) _deltaCtrl.text = data['release_delta_minutes'].toString();
-      SharedPreferences.getInstance().then((spLoad) { _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString(); _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString(); _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString(); _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString();
+      SharedPreferences.getInstance().then((spLoad) { _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString(); _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString(); _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString(); _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString(); _tGpsSenzaPassoCtrl.text = (data['tgps_senzapasso_sec'] ?? spLoad.getInt('tgps_senzapasso_sec') ?? 30).toString();
           _geofenceRadiusMCtrl.text = (data['geofence_radius_m'] ?? spLoad.getInt('geofence_radius_m') ?? 100).toString(); });
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
@@ -106,6 +107,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       final delayVal = int.tryParse(_autoReleaseDelayCtrl.text) ?? 60;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt('auto_release_delay_s', delayVal);
+      await prefs.setInt('tgps_senzapasso_sec', (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180));
 
       final r = await _apiCall('POST', '/api/admin/settings', body: {
         'reward_release': int.tryParse(_rewardCtrl.text) ?? 10,
@@ -117,6 +119,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       'xt_gps_attivo_sec': int.tryParse(_xtGpsAttivoSecCtrl.text) ?? 10,
       'xt_gps_max_attivo_min': int.tryParse(_xtGpsMaxAttivoMinCtrl.text) ?? 5,
       'xt_gps_disattivo_sec': int.tryParse(_xtGpsDisattivoSecCtrl.text) ?? 15,
+      'tgps_senzapasso_sec': (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180),
       'geofence_radius_m': (int.tryParse(_geofenceRadiusMCtrl.text) ?? 100).clamp(20, 2000),
       'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
@@ -296,6 +299,16 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           decoration: const InputDecoration(
             labelText: 'Xt.gps.disattivo — Ritardo rientro GPS risparmio energetico (sec)',
             helperText: 'Default: 15s. Stabilizzazione prima di riportare il GPS standard.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _tGpsSenzaPassoCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Tgps_senzapasso — Analisi GPS senza passo (sec)',
+            helperText: 'Default: 30s. Finestra velocità media/istantanea senza Wi-Fi e senza passi.',
             border: OutlineInputBorder(),
           ),
         ),

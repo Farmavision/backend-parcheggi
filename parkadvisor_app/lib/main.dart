@@ -59,6 +59,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onAutoShareSkipped: _handleAutoShareSkipped,
       onUnknownWifiDetected: _promptSaveUnknownWifi,
       onUnknownBluetoothDetected: _promptSaveUnknownBluetooth,
+      onPromptAreYouInCar: _promptAreYouInCar,
     );
     _sensorEngine.addListener(() {
       if (mounted) setState(() {});
@@ -158,6 +159,61 @@ class _HomeScreenState extends State<HomeScreen> {
         actions: [
           TextButton(onPressed: () { _sensorEngine.ignoreBluetoothDevice(mac); Navigator.pop(ctx); }, child: const Text('Ignora')),
           ElevatedButton(onPressed: () async { await _sensorEngine.setCarBluetoothDevice(mac, name); if (ctx.mounted) Navigator.pop(ctx); }, child: const Text('Sì, è la mia auto')),
+        ],
+      ),
+    );
+  }
+
+  void _promptAreYouInCar() {
+    if (!mounted) return;
+    SystemSound.play(SystemSoundType.alert);
+    HapticFeedback.mediumImpact();
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.directions_car, color: Colors.deepPurple, size: 34),
+        title: const Text('Sei in auto?'),
+        content: const Text('Rilevato spostamento superiore a 10 km/h senza Bluetooth auto collegato.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('No'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              await _sensorEngine.confirmUserInCarFromPrompt();
+              if (ctx.mounted) Navigator.pop(ctx);
+              if (mounted) _promptDidYouLeaveParking();
+            },
+            child: const Text('Sì, sono in auto'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _promptDidYouLeaveParking() {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.local_parking, color: Colors.orange, size: 34),
+        title: const Text('Hai appena lasciato il parcheggio?'),
+        content: const Text('Confermi di aver lasciato lo stallo così da avviare la segnalazione di rilascio?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('No'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (ctx.mounted) Navigator.pop(ctx);
+              await _sensorEngine.confirmParkingLeftFromPrompt();
+            },
+            child: const Text('Sì, libera parcheggio'),
+          ),
         ],
       ),
     );
@@ -294,15 +350,52 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           Card(
-            color: _sensorEngine.isCarParked ? Colors.orange.shade50 : Colors.green.shade50,
+            color: () {
+              switch (_sensorEngine.userActivityState) {
+                case UserActivityState.atHome:
+                case UserActivityState.atWork:
+                  return Colors.indigo.shade50;
+                case UserActivityState.still:
+                  return Colors.amber.shade50;
+                case UserActivityState.moving:
+                  return Colors.green.shade50;
+                case UserActivityState.inCar:
+                  return Colors.deepPurple.shade50;
+              }
+            }(),
             child: ListTile(
               leading: Icon(
-                _sensorEngine.isCarParked ? Icons.local_parking : Icons.directions_car,
-                color: _sensorEngine.isCarParked ? Colors.orange.shade800 : Colors.green.shade800,
+                () {
+                  switch (_sensorEngine.userActivityState) {
+                    case UserActivityState.atHome:
+                      return Icons.home;
+                    case UserActivityState.atWork:
+                      return Icons.work;
+                    case UserActivityState.still:
+                      return Icons.person_pin_circle;
+                    case UserActivityState.moving:
+                      return Icons.directions_walk;
+                    case UserActivityState.inCar:
+                      return Icons.directions_car;
+                  }
+                }(),
+                color: () {
+                  switch (_sensorEngine.userActivityState) {
+                    case UserActivityState.atHome:
+                    case UserActivityState.atWork:
+                      return Colors.indigo.shade800;
+                    case UserActivityState.still:
+                      return Colors.amber.shade900;
+                    case UserActivityState.moving:
+                      return Colors.green.shade800;
+                    case UserActivityState.inCar:
+                      return Colors.deepPurple.shade800;
+                  }
+                }(),
                 size: 36,
               ),
               title: Text(
-                _sensorEngine.isCarParked ? 'Auto Parcheggiata' : 'In Movimento / Nessuna Sosta',
+                'Stato utente: ${_sensorEngine.userActivityLabel}',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
               subtitle: Text(_sensorEngine.statusMessage),
