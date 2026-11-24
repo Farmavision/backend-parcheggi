@@ -1,10 +1,7 @@
 import 'dart:async';
-import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:sensors_plus/sensors_plus.dart';
-import 'package:pedometer/pedometer.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -22,18 +19,10 @@ enum UserActivityState {
   inCar,       // "In Auto"
 }
 
-class _GpsWindowSample {
-  final DateTime timestamp;
-  final double lat;
-  final double lon;
-  final double speedKmh;
-  final double accuracy;
-  _GpsWindowSample(this.timestamp, this.lat, this.lon, this.speedKmh, this.accuracy);
-}
-
 class SensorFusionEngine extends ChangeNotifier {
   static final Completer<void> initialPermissionsCompleter = Completer<void>();
   static const MethodChannel _classicBtChannel = MethodChannel('com.parknow.app/classic_bt');
+  static const MethodChannel _bgServiceChannel = MethodChannel('parknow/bg_service');
 
   VehicleState currentState = VehicleState.driving;
   UserActivityState userActivityState = UserActivityState.still;
@@ -58,33 +47,14 @@ class SensorFusionEngine extends ChangeNotifier {
   String? _lastPromptedBtMac;
 
   double currentSpeedKmh = 0.0;
-  double lastWindowAvgSpeedKmh = 0.0;
-  double lastWindowInstSpeedKmh = 0.0;
-  double gyroscopeMagnitude = 0.0;
-  String pedestrianStatus = 'unknown';
   int sessionSteps = 0;
-  int? _initialStepCount;
   bool isCarBtConnected = false;
 
-  // Parametri algoritmo stato utente
-  int tGpsNoStepSec = 30; // Tgps_senzapasso parametrico (default 30s)
+  int tGpsNoStepSec = 30;
   bool isHighAccuracyGpsActive = false;
   int gpsWindowRemainingSec = 0;
-  int _noStepGpsCycleCount = 0; // 0 = primo ciclo 30s, 1 = ciclo di conferma 30s
-  bool _gpsRestingAfterNoStepAnalysis = false;
-  bool _carPromptShownInCurrentBout = false;
-
-  final List<_GpsWindowSample> _gpsWindowSamples = [];
-  Timer? _gpsWindowTimer;
-  Timer? _noStepIdleCheckTimer;
-
-  // Filtro gravità accelerometro per risveglio inerziale affidabile dallo stato "Attualmente fermo"
-  double _gravX = 0.0;
-  double _gravY = 0.0;
-  double _gravZ = 0.0;
-  bool _gravInitialized = false;
-  int _inertialWakeupHits = 0;
-  DateTime? _lastInertialHitAt;
+  int _noStepGpsCycleCount = 0;
+  bool _inCarPromptDeliveredInUi = false;
 
   final Future<void> Function(double lat, double lon, String method) onCarParked;
   final Future<void> Function(int estimatedMinutes) onApproachingCar100m;
@@ -96,35 +66,19 @@ class SensorFusionEngine extends ChangeNotifier {
   final void Function(String mac, String name)? onUnknownBluetoothDetected;
   final VoidCallback? onPromptAreYouInCar;
 
-  StreamSubscription<Position>? _posSub;
-  StreamSubscription<GyroscopeEvent>? _gyroSub;
-  StreamSubscription<AccelerometerEvent>? _accelSub;
-  StreamSubscription<PedestrianStatus>? _pedStatusSub;
-  StreamSubscription<StepCount>? _stepCountSub;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
   Timer? _btCheckTimer;
+  Timer? _nativeSyncFallbackTimer;
 
   bool _notified100m = false;
   double geofenceRadiusMeters = 100.0;
-  bool _passedThroughStall = false;
-  int _vehicularSpeedSamples = 0;
-  DateTime? _lastHumanStepAt;
   bool _manualReleaseConfirmed = false;
   bool _autoShareSkippedNotified = false;
-  int? _lastSentEta;
 
   late AutoReleaseManager _autoReleaseManager;
 
   bool get isCarParked => parkedLat != null && parkedLon != null;
   bool get isManualReleaseConfirmed => _manualReleaseConfirmed;
-
-  bool get _isStepDetected {
-    if (pedestrianStatus == 'walking') return true;
-    if (_lastHumanStepAt != null && DateTime.now().difference(_lastHumanStepAt!).inSeconds <= 5) {
-      return true;
-    }
-    return false;
-  }
 
   String get userActivityLabel {
     switch (userActivityState) {
@@ -187,13 +141,82 @@ class SensorFusionEngine extends ChangeNotifier {
   bool get isOnKnownPrivateWifi {
     if (currentConnectedWifiSsid == null || currentConnectedWifiSsid!.isEmpty) return false;
     final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-    return (homeWifiSsid != null && clean == homeWifiSsid) || (workWifiSsid != null && clean == workWifiSsid);
+    return (homeWifiSsid != null && clean.toLowerCase() == homeWifiSsid!.toLowerCase()) ||
+        (workWifiSsid != null && clean.toLowerCase() == workWifiSsid!.toLowerCase());
+  }
+
+  UserActivityState _parseNativeState(String? code) {
+    switch (code) {
+      case 'atHome':
+        return UserActivityState.atHome;
+      case 'atWork':
+        return UserActivityState.atWork;
+      case 'moving':
+        return UserActivityState.moving;
+      case 'inCar':
+        return UserActivityState.inCar;
+      case 'still':
+      default:
+        return UserActivityState.still;
+    }
+  }
+
+  Future<void> syncFromNativeBackgroundService() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+
+      final nativeState = prefs.getString('native_user_state');
+      if (nativeState != null) {
+        userActivityState = _parseNativeState(nativeState);
+      }
+      isHighAccuracyGpsActive = prefs.getBool('native_gps_active') ?? false;
+      gpsWindowRemainingSec = prefs.getInt('native_gps_remaining_sec') ?? 0;
+      _noStepGpsCycleCount = prefs.getInt('native_gps_cycle') ?? 0;
+      currentSpeedKmh = prefs.getDouble('native_speed_kmh') ?? 0.0;
+      sessionSteps = prefs.getInt('native_session_steps') ?? 0;
+      if (prefs.containsKey('native_car_bt_connected')) {
+        isCarBtConnected = prefs.getBool('native_car_bt_connected') ?? isCarBtConnected;
+      }
+
+      parkedLat = prefs.getDouble('parked_lat');
+      parkedLon = prefs.getDouble('parked_lon');
+      if (parkedLat != null && parkedLon != null) {
+        if (currentState != VehicleState.leavingSoon) {
+          currentState = VehicleState.parked;
+        }
+      } else if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
+        currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
+      }
+
+      final pendingInCar = prefs.getBool('native_prompt_in_car') ?? false;
+      if (pendingInCar && !_inCarPromptDeliveredInUi) {
+        _inCarPromptDeliveredInUi = true;
+        await prefs.setBool('native_prompt_in_car', false);
+        onPromptAreYouInCar?.call();
+      } else if (!pendingInCar) {
+        _inCarPromptDeliveredInUi = false;
+      }
+
+      notifyListeners();
+    } catch (_) {}
   }
 
   Future<void> initialize() async {
     await [Permission.activityRecognition, Permission.bluetoothConnect, Permission.locationWhenInUse, Permission.notification].request();
-    try { await const MethodChannel('parknow/bg_service').invokeMethod('startMonitorService'); } catch (_) {}
+
+    _bgServiceChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onNativeStateUpdated') {
+        await syncFromNativeBackgroundService();
+      }
+    });
+
+    try {
+      await _bgServiceChannel.invokeMethod('startMonitorService');
+    } catch (_) {}
+
     final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
     parkedLat = prefs.getDouble('parked_lat');
     parkedLon = prefs.getDouble('parked_lon');
     autoShareEnabled = prefs.getBool('auto_share_enabled') ?? true;
@@ -209,12 +232,16 @@ class SensorFusionEngine extends ChangeNotifier {
     if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
 
     _setupClassicBluetoothListener();
-    _startGyroscopeStream();
-    _startInertialWakeupMonitor();
-    _startPedometerStreams();
     _startBleBluetoothMonitor();
     await _checkCurrentWifi(promptIfUnknown: true);
     _startWifiMonitor();
+    await syncFromNativeBackgroundService();
+
+    _nativeSyncFallbackTimer?.cancel();
+    _nativeSyncFallbackTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      syncFromNativeBackgroundService();
+    });
+
     if (!initialPermissionsCompleter.isCompleted) initialPermissionsCompleter.complete();
     notifyListeners();
   }
@@ -232,22 +259,31 @@ class SensorFusionEngine extends ChangeNotifier {
     if (workWifi != null && workWifi.isNotEmpty) workWifiSsid = workWifi;
     tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
     geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
-    _evaluateWifiStateTransition();
-    notifyListeners();
+    await syncFromNativeBackgroundService();
   }
 
   Future<void> confirmUserInCarFromPrompt() async {
     userActivityState = UserActivityState.inCar;
-    _gpsRestingAfterNoStepAnalysis = true;
-    _noStepGpsCycleCount = 0;
-    _stopHighAccuracyGpsWindow();
+    isHighAccuracyGpsActive = false;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('native_user_state', 'inCar');
+    await prefs.setBool('native_prompt_in_car', false);
+    try {
+      await _bgServiceChannel.invokeMethod('confirmInCar');
+    } catch (_) {}
     notifyListeners();
   }
 
+  Future<void> dismissUserInCarPrompt() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('native_prompt_in_car', false);
+    try {
+      await _bgServiceChannel.invokeMethod('denyInCar');
+    } catch (_) {}
+  }
+
   Future<void> confirmParkingLeftFromPrompt() async {
-    userActivityState = UserActivityState.inCar;
-    _gpsRestingAfterNoStepAnalysis = true;
-    _stopHighAccuracyGpsWindow();
+    await confirmUserInCarFromPrompt();
     if (isCarParked) {
       await _triggerCarReleased();
     } else {
@@ -260,34 +296,7 @@ class SensorFusionEngine extends ChangeNotifier {
   Future<void> confirmManualRelease([int? customMinutes]) async {
     _manualReleaseConfirmed = true;
     currentState = VehicleState.leavingSoon;
-    if (parkedLat != null && parkedLon != null && currentUserLat != null && currentUserLon != null) {
-      distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
-      if (distanceFromCarMeters! <= 30.0) {
-        _passedThroughStall = true;
-      }
-      if (_passedThroughStall && isCarBtConnected && distanceFromCarMeters! > 15.0) {
-        _vehicularSpeedSamples = 0;
-        _passedThroughStall = false;
-        await _triggerCarReleased();
-        return;
-      }
-      final double speedKmh = currentSpeedKmh;
-      final bool stepsStopped = _lastHumanStepAt != null &&
-          DateTime.now().difference(_lastHumanStepAt!).inSeconds >= 6;
-      if (_passedThroughStall && stepsStopped && speedKmh >= 16.0 && distanceFromCarMeters! > 40.0) {
-        _vehicularSpeedSamples++;
-        if (_vehicularSpeedSamples >= 2) {
-          _vehicularSpeedSamples = 0;
-          _passedThroughStall = false;
-          await _triggerCarReleased();
-          return;
-        }
-      } else if (speedKmh < 10.0) {
-        _vehicularSpeedSamples = 0;
-      }
-    }
     final eta = customMinutes ?? estimatedMinutesToRelease;
-    _lastSentEta = eta;
     if (onManualReleaseConfirmed != null) await onManualReleaseConfirmed!(eta);
     notifyListeners();
   }
@@ -309,11 +318,11 @@ class SensorFusionEngine extends ChangeNotifier {
     targetCarBluetoothName = name;
     isCarBtConnected = true;
     userActivityState = UserActivityState.inCar;
-    _gpsRestingAfterNoStepAnalysis = true;
-    _stopHighAccuracyGpsWindow();
+    isHighAccuracyGpsActive = false;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('car_bt_mac', targetCarBluetoothMac!);
     await prefs.setString('car_bt_name', name);
+    await prefs.setString('native_user_state', 'inCar');
     if (isCarParked) {
       await _triggerCarReleased();
     } else {
@@ -336,8 +345,7 @@ class SensorFusionEngine extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('home_wifi_ssid', homeWifiSsid!);
     _pendingWifiConfirmationSsid = null;
-    _evaluateWifiStateTransition();
-    notifyListeners();
+    await syncFromNativeBackgroundService();
   }
 
   Future<void> saveWifiAsWork(String ssid) async {
@@ -345,8 +353,7 @@ class SensorFusionEngine extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('work_wifi_ssid', workWifiSsid!);
     _pendingWifiConfirmationSsid = null;
-    _evaluateWifiStateTransition();
-    notifyListeners();
+    await syncFromNativeBackgroundService();
   }
 
   Future<void> ignoreWifi(String ssid) async {
@@ -368,17 +375,10 @@ class SensorFusionEngine extends ChangeNotifier {
         final connected = args['connected'] == true;
         if (targetCarBluetoothMac != null && mac == targetCarBluetoothMac) {
           isCarBtConnected = connected;
-          if (!connected) {
-            if (!isCarParked && !isOnKnownPrivateWifi) {
-              await _recordParkingSpot('BLUETOOTH_DISCONNECT');
-            }
-            _gpsRestingAfterNoStepAnalysis = false;
-            _carPromptShownInCurrentBout = false;
-            _evaluateNoFixedWifiAlgorithm();
-          } else {
+          if (!connected && !isCarParked && !isOnKnownPrivateWifi) {
+            await _recordParkingSpot('BLUETOOTH_DISCONNECT');
+          } else if (connected) {
             userActivityState = UserActivityState.inCar;
-            _gpsRestingAfterNoStepAnalysis = true;
-            _stopHighAccuracyGpsWindow();
             if (isCarParked) {
               await _triggerCarReleased();
             }
@@ -398,31 +398,22 @@ class SensorFusionEngine extends ChangeNotifier {
       await prefs.reload();
       homeWifiSsid = prefs.getString('home_wifi_ssid');
       workWifiSsid = prefs.getString('work_wifi_ssid');
-      tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
       final info = NetworkInfo();
       final ssid = await info.getWifiName();
       if (ssid != null && ssid.isNotEmpty && ssid != '<unknown ssid>') {
         final clean = ssid.replaceAll('"', '').trim();
         currentConnectedWifiSsid = clean;
-        _evaluateWifiStateTransition();
         if (isOnKnownPrivateWifi) {
           _pendingWifiConfirmationSsid = null;
           _autoReleaseManager.cancelCountdown();
         } else if (promptIfUnknown && !_ignoredWifis.contains(clean) && _lastPromptedWifi != clean) {
           _lastPromptedWifi = clean;
           _pendingWifiConfirmationSsid = clean;
-          _autoReleaseManager.cancelCountdown();
           onUnknownWifiDetected?.call(clean);
         }
       } else {
         currentConnectedWifiSsid = null;
         _pendingWifiConfirmationSsid = null;
-        _evaluateWifiStateTransition();
-        if (isCarParked && distanceFromCarMeters != null && distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m) {
-          _notified100m = true;
-          _autoReleaseManager.startCountdownIfBetaTester();
-          await onApproachingCar100m(estimatedMinutesToRelease);
-        }
       }
     } catch (_) {}
   }
@@ -430,286 +421,8 @@ class SensorFusionEngine extends ChangeNotifier {
   void _startWifiMonitor() {
     _connectivitySub = Connectivity().onConnectivityChanged.listen((_) async {
       await _checkCurrentWifi(promptIfUnknown: true);
-      notifyListeners();
+      await syncFromNativeBackgroundService();
     });
-  }
-
-  // Punto 1: Connesso alla Wi-Fi fissa di casa o lavoro -> "A casa" o "Al lavoro" + GPS in risparmio
-  void _evaluateWifiStateTransition() {
-    if (isOnKnownPrivateWifi) {
-      final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-      userActivityState = (workWifiSsid != null && clean == workWifiSsid)
-          ? UserActivityState.atWork
-          : UserActivityState.atHome;
-      if (!isCarParked) {
-        currentState = VehicleState.stayAtHome;
-      }
-      _autoReleaseManager.cancelCountdown();
-      _noStepGpsCycleCount = 0;
-      _gpsRestingAfterNoStepAnalysis = false;
-      _carPromptShownInCurrentBout = false;
-      _stopHighAccuracyGpsWindow();
-    } else {
-      if (currentState == VehicleState.stayAtHome) {
-        currentState = isCarParked ? VehicleState.parked : VehicleState.driving;
-      }
-      _evaluateNoFixedWifiAlgorithm();
-    }
-  }
-
-  // Punti 2 e 3: Non connesso a Wi-Fi fissa -> analisi passi / finestra GPS Tgps_senzapasso (30s)
-  void _evaluateNoFixedWifiAlgorithm() {
-    if (isOnKnownPrivateWifi) return;
-
-    // Punto 3: Presenza di passo -> stato "In Movimento" senza attivazione di analisi GPS accurata
-    if (_isStepDetected) {
-      userActivityState = UserActivityState.moving;
-      _noStepGpsCycleCount = 0;
-      _gpsRestingAfterNoStepAnalysis = false;
-      _stopHighAccuracyGpsWindow();
-      return;
-    }
-
-    // Se già confermato In Auto con BT auto connesso, resta "In Auto" con GPS in risparmio
-    if (userActivityState == UserActivityState.inCar && isCarBtConnected) {
-      _stopHighAccuracyGpsWindow();
-      return;
-    }
-
-    // Punto 2: Mancanza di passo -> attiva GPS accurato per Tgps_senzapasso (30s)
-    if (!isHighAccuracyGpsActive && !_gpsRestingAfterNoStepAnalysis) {
-      _startNoStepGpsWindow(cycleIndex: 0);
-    }
-  }
-
-  void _startNoStepGpsWindow({required int cycleIndex}) {
-    if (isOnKnownPrivateWifi || _isStepDetected) return;
-
-    _stopHighAccuracyGpsWindow();
-    isHighAccuracyGpsActive = true;
-    _noStepGpsCycleCount = cycleIndex;
-    gpsWindowRemainingSec = tGpsNoStepSec;
-    _gpsWindowSamples.clear();
-    currentSpeedKmh = 0.0;
-
-    _posSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 0),
-    ).listen((pos) async {
-      currentUserLat = pos.latitude;
-      currentUserLon = pos.longitude;
-      final instKmh = max(0.0, pos.speed * 3.6);
-      currentSpeedKmh = instKmh;
-
-      if (pos.accuracy <= 25.0 || _gpsWindowSamples.isEmpty) {
-        _gpsWindowSamples.add(
-          _GpsWindowSample(DateTime.now(), pos.latitude, pos.longitude, instKmh, pos.accuracy),
-        );
-      }
-
-      if (isCarParked && parkedLat != null && parkedLon != null) {
-        distanceFromCarMeters = Geolocator.distanceBetween(currentUserLat!, currentUserLon!, parkedLat!, parkedLon!);
-        if (distanceFromCarMeters! <= geofenceRadiusMeters && !_notified100m && !isOnKnownPrivateWifi && _pendingWifiConfirmationSsid == null) {
-          _notified100m = true;
-          _autoReleaseManager.startCountdownIfBetaTester();
-          await onApproachingCar100m(estimatedMinutesToRelease);
-        } else if (distanceFromCarMeters! > 130.0) {
-          _notified100m = false;
-          _passedThroughStall = false;
-          _vehicularSpeedSamples = 0;
-          _autoReleaseManager.cancelCountdown();
-        }
-        if (_manualReleaseConfirmed && onEtaUpdated != null) {
-          final eta = estimatedMinutesToRelease;
-          if (_lastSentEta != eta) {
-            _lastSentEta = eta;
-            await onEtaUpdated!(eta);
-          }
-        }
-      }
-      notifyListeners();
-    });
-
-    _gpsWindowTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-      if (isOnKnownPrivateWifi || _isStepDetected) {
-        timer.cancel();
-        _evaluateNoFixedWifiAlgorithm();
-        notifyListeners();
-        return;
-      }
-      gpsWindowRemainingSec--;
-      if (gpsWindowRemainingSec <= 0) {
-        timer.cancel();
-        await _evaluateNoStepGpsWindowResult();
-      } else {
-        notifyListeners();
-      }
-    });
-
-    notifyListeners();
-  }
-
-  Future<void> _evaluateNoStepGpsWindowResult() async {
-    double vMedia = 0.0;
-    double vIst = currentSpeedKmh;
-
-    if (_gpsWindowSamples.length >= 2) {
-      final first = _gpsWindowSamples.first;
-      final last = _gpsWindowSamples.last;
-      final elapsedSec = max(1, last.timestamp.difference(first.timestamp).inSeconds);
-      final netMeters = Geolocator.distanceBetween(first.lat, first.lon, last.lat, last.lon);
-      final netAvgKmh = (netMeters / elapsedSec) * 3.6;
-      final dopplerAvgKmh = _gpsWindowSamples.map((s) => s.speedKmh).reduce((a, b) => a + b) / _gpsWindowSamples.length;
-      // Filtra rimbalzi GPS da fermo: spostamento netto <= 8m in 30s (< 1 km/h) usa la media Doppler
-      vMedia = netMeters > 8.0 ? max(netAvgKmh, dopplerAvgKmh) : dopplerAvgKmh;
-
-      final tail = _gpsWindowSamples.length >= 2
-          ? _gpsWindowSamples.sublist(_gpsWindowSamples.length - 2)
-          : _gpsWindowSamples;
-      vIst = tail.map((s) => s.speedKmh).reduce((a, b) => a + b) / tail.length;
-    } else if (_gpsWindowSamples.length == 1) {
-      vMedia = _gpsWindowSamples.first.speedKmh;
-      vIst = _gpsWindowSamples.first.speedKmh;
-    }
-
-    lastWindowAvgSpeedKmh = vMedia;
-    lastWindowInstSpeedKmh = vIst;
-    currentSpeedKmh = vIst;
-
-    // Ramo 2a: v_media <= 1 km/h -> stato "Attualmente fermo", poi GPS in risparmio
-    if (vMedia <= 1.0) {
-      _stopHighAccuracyGpsWindow();
-      userActivityState = UserActivityState.still;
-      _noStepGpsCycleCount = 0;
-      _gpsRestingAfterNoStepAnalysis = true;
-      _carPromptShownInCurrentBout = false;
-      notifyListeners();
-      return;
-    }
-
-    // Ramo 2b: v_media > 1 km/h e v_ist <= 10 km/h -> stato "In Movimento", secondo ciclo di 30s poi riposo
-    if (vIst <= 10.0) {
-      userActivityState = UserActivityState.moving;
-      if (_noStepGpsCycleCount == 0) {
-        _startNoStepGpsWindow(cycleIndex: 1);
-      } else {
-        _stopHighAccuracyGpsWindow();
-        _noStepGpsCycleCount = 0;
-        _gpsRestingAfterNoStepAnalysis = true;
-        notifyListeners();
-      }
-      return;
-    }
-
-    // Ramo 2c: v_media > 1 km/h e v_ist > 10 km/h -> verifica connessione Bluetooth auto
-    _stopHighAccuracyGpsWindow();
-    _noStepGpsCycleCount = 0;
-    _gpsRestingAfterNoStepAnalysis = true;
-
-    if (isCarBtConnected) {
-      userActivityState = UserActivityState.inCar;
-      if (isCarParked) {
-        await _triggerCarReleased();
-      } else {
-        notifyListeners();
-      }
-    } else {
-      userActivityState = UserActivityState.moving;
-      if (!_carPromptShownInCurrentBout) {
-        _carPromptShownInCurrentBout = true;
-        onPromptAreYouInCar?.call();
-      }
-      notifyListeners();
-    }
-  }
-
-  void _stopHighAccuracyGpsWindow() {
-    _gpsWindowTimer?.cancel();
-    _gpsWindowTimer = null;
-    _posSub?.cancel();
-    _posSub = null;
-    isHighAccuracyGpsActive = false;
-    gpsWindowRemainingSec = 0;
-  }
-
-  void _startGyroscopeStream() {
-    _gyroSub = gyroscopeEventStream().listen((event) {
-      gyroscopeMagnitude = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
-    });
-  }
-
-  // Risveglio affidabile dallo stato "Attualmente fermo" (o riposo post-ciclo) tramite accelerometro lineare
-  void _startInertialWakeupMonitor() {
-    _accelSub = accelerometerEventStream().listen((event) {
-      if (!_gravInitialized) {
-        _gravX = event.x;
-        _gravY = event.y;
-        _gravZ = event.z;
-        _gravInitialized = true;
-        return;
-      }
-      _gravX = 0.9 * _gravX + 0.1 * event.x;
-      _gravY = 0.9 * _gravY + 0.1 * event.y;
-      _gravZ = 0.9 * _gravZ + 0.1 * event.z;
-      final lx = event.x - _gravX;
-      final ly = event.y - _gravY;
-      final lz = event.z - _gravZ;
-      final linearAcc = sqrt(lx * lx + ly * ly + lz * lz);
-
-      if (!isOnKnownPrivateWifi && !_isStepDetected && !isHighAccuracyGpsActive && _gpsRestingAfterNoStepAnalysis) {
-        if (linearAcc > 1.35) {
-          final now = DateTime.now();
-          if (_lastInertialHitAt == null || now.difference(_lastInertialHitAt!).inSeconds > 3) {
-            _inertialWakeupHits = 1;
-          } else {
-            _inertialWakeupHits++;
-          }
-          _lastInertialHitAt = now;
-
-          if (_inertialWakeupHits >= 2) {
-            _inertialWakeupHits = 0;
-            _gpsRestingAfterNoStepAnalysis = false;
-            _startNoStepGpsWindow(cycleIndex: 0);
-          }
-        }
-      }
-    });
-  }
-
-  void _startPedometerStreams() {
-    _pedStatusSub = Pedometer.pedestrianStatusStream.listen((status) {
-      final previous = pedestrianStatus;
-      pedestrianStatus = status.status;
-      if (!isOnKnownPrivateWifi) {
-        if (pedestrianStatus == 'walking') {
-          _evaluateNoFixedWifiAlgorithm();
-        } else if (previous == 'walking' && pedestrianStatus == 'stopped') {
-          _gpsRestingAfterNoStepAnalysis = false;
-          _evaluateNoFixedWifiAlgorithm();
-        }
-      }
-      notifyListeners();
-    }, onError: (_) {});
-
-    _stepCountSub = Pedometer.stepCountStream.listen((event) {
-      _initialStepCount ??= event.steps;
-      final updatedSteps = event.steps - _initialStepCount!;
-      if (updatedSteps > sessionSteps) {
-        _lastHumanStepAt = DateTime.now();
-        _noStepIdleCheckTimer?.cancel();
-        _noStepIdleCheckTimer = Timer(const Duration(seconds: 6), () {
-          if (!isOnKnownPrivateWifi && !_isStepDetected) {
-            _gpsRestingAfterNoStepAnalysis = false;
-            _evaluateNoFixedWifiAlgorithm();
-            notifyListeners();
-          }
-        });
-        if (!isOnKnownPrivateWifi) {
-          _evaluateNoFixedWifiAlgorithm();
-        }
-      }
-      sessionSteps = updatedSteps;
-      notifyListeners();
-    }, onError: (_) {});
   }
 
   void _startBleBluetoothMonitor() {
@@ -721,8 +434,6 @@ class SensorFusionEngine extends ChangeNotifier {
           if (found) {
             isCarBtConnected = true;
             userActivityState = UserActivityState.inCar;
-            _gpsRestingAfterNoStepAnalysis = true;
-            _stopHighAccuracyGpsWindow();
             if (isCarParked) {
               await _triggerCarReleased();
             } else {
@@ -764,10 +475,7 @@ class SensorFusionEngine extends ChangeNotifier {
     distanceFromCarMeters = 0.0;
     currentState = VehicleState.parked;
     _notified100m = false;
-    _passedThroughStall = false;
-    _vehicularSpeedSamples = 0;
     _manualReleaseConfirmed = false;
-    _carPromptShownInCurrentBout = false;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('parked_lat', parkedLat!);
@@ -784,10 +492,7 @@ class SensorFusionEngine extends ChangeNotifier {
     distanceFromCarMeters = null;
     currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
     _notified100m = false;
-    _passedThroughStall = false;
-    _vehicularSpeedSamples = 0;
     _manualReleaseConfirmed = false;
-    _carPromptShownInCurrentBout = false;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('parked_lat');
@@ -818,12 +523,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
   @override
   void dispose() {
-    _stopHighAccuracyGpsWindow();
-    _noStepIdleCheckTimer?.cancel();
-    _gyroSub?.cancel();
-    _accelSub?.cancel();
-    _pedStatusSub?.cancel();
-    _stepCountSub?.cancel();
+    _nativeSyncFallbackTimer?.cancel();
     _connectivitySub?.cancel();
     _btCheckTimer?.cancel();
     _autoReleaseManager.dispose();

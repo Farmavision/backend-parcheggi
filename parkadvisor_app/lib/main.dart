@@ -36,7 +36,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const String _backendBaseUrl = 'https://parknow-api.onrender.com';
   static const String _userId = 'USER-001';
 
@@ -50,6 +50,14 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _sensorEngine.syncFromNativeBackgroundService();
+    }
+  }
+
     _sensorEngine = SensorFusionEngine(
       onCarParked: _handleCarParked,
       onApproachingCar100m: _handleApproachingCar100m,
@@ -177,7 +185,10 @@ class _HomeScreenState extends State<HomeScreen> {
         content: const Text('Rilevato spostamento superiore a 10 km/h senza Bluetooth auto collegato.'),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx),
+            onPressed: () {
+              _sensorEngine.dismissUserInCarPrompt();
+              Navigator.pop(ctx);
+            },
             child: const Text('No'),
           ),
           ElevatedButton(
@@ -317,6 +328,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _antiFraudWatchTimer?.cancel();
     _sensorEngine.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 

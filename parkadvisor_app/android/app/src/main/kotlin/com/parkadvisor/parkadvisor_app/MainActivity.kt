@@ -1,13 +1,15 @@
 package com.parkadvisor.parkadvisor_app
-import android.content.Context
 
 import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.os.Build
 import android.app.KeyguardManager
 import android.app.NotificationManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.WindowManager
@@ -17,7 +19,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-
+    private var bgChannel: MethodChannel? = null
+    private var stateReceiver: BroadcastReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,31 +37,65 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parknow/bg_service")
-            .setMethodCallHandler { call, result ->
-            if (call.method == "requestFullScreenIntentPermission") {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    if (!nm.canUseFullScreenIntent()) {
-                        try {
-                            startActivity(android.content.Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
-                        } catch (_: Exception) {}
-                        result.success(false)
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parknow/bg_service")
+        bgChannel = channel
+
+        channel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestFullScreenIntentPermission" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        if (!nm.canUseFullScreenIntent()) {
+                            try {
+                                startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+                            } catch (_: Exception) {}
+                            result.success(false)
+                        } else {
+                            result.success(true)
+                        }
                     } else {
                         result.success(true)
                     }
-                } else {
-                    result.success(true)
                 }
-                return@setMethodCallHandler
-            }
-                if (call.method == "startMonitorService") {
+                "startMonitorService" -> {
                     startBgServiceIfPermitted()
                     result.success(true)
-                } else {
-                    result.notImplemented()
+                }
+                "confirmInCar" -> {
+                    sendBroadcast(Intent(FixedWifiMonitorService.ACTION_CONFIRM_IN_CAR).setPackage(packageName))
+                    result.success(true)
+                }
+                "denyInCar" -> {
+                    sendBroadcast(Intent(FixedWifiMonitorService.ACTION_DENY_IN_CAR).setPackage(packageName))
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        if (stateReceiver == null) {
+            stateReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action == FixedWifiMonitorService.ACTION_STATE_UPDATED) {
+                        bgChannel?.invokeMethod("onNativeStateUpdated", null)
+                    }
                 }
             }
+            ContextCompat.registerReceiver(
+                this,
+                stateReceiver,
+                IntentFilter(FixedWifiMonitorService.ACTION_STATE_UPDATED),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            stateReceiver?.let { unregisterReceiver(it) }
+            stateReceiver = null
+        } catch (_: Exception) {}
+        super.onDestroy()
     }
 
     private fun startBgServiceIfPermitted() {
