@@ -183,6 +183,18 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
 
     private val systemBtReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == WifiManager.WIFI_STATE_CHANGED_ACTION) {
+                val wifiState = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, WifiManager.WIFI_STATE_UNKNOWN)
+                if (wifiState == WifiManager.WIFI_STATE_DISABLED || wifiState == WifiManager.WIFI_STATE_DISABLING) {
+                    lastCallbackWifiSsid = null
+                    currentConnectedWifiSsid = null
+                    pendingUnknownWifiSsid = null
+                    gpsRestingAfterAnalysis = false
+                    evaluateNoFixedWifiAlgorithm()
+                }
+                return
+            }
+
             val dev: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
             } else {
@@ -275,22 +287,36 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         return Pair(lat, lon)
     }
 
+    private var stepListenerRegistered = false
+    private var accelListenerRegistered = false
+
     private fun registerSensors() {
         try {
             if (sensorManager == null) {
                 sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
             }
+            val hasActivityPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
             if (stepDetector == null) {
                 stepDetector = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
-                if (stepDetector != null) {
+            }
+            if (stepDetector != null && hasActivityPerm && !stepListenerRegistered) {
+                val ok = sensorManager?.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_NORMAL) ?: false
+                if (ok) {
                     hasStepSensor = true
-                    sensorManager?.registerListener(this, stepDetector, SensorManager.SENSOR_DELAY_NORMAL)
+                    stepListenerRegistered = true
                 }
             }
             if (accelerometer == null) {
                 accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-                if (accelerometer != null) {
-                    sensorManager?.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_NORMAL)
+            }
+            if (accelerometer != null && !accelListenerRegistered) {
+                val ok = sensorManager?.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_NORMAL) ?: false
+                if (ok) {
+                    accelListenerRegistered = true
                 }
             }
         } catch (_: Exception) {}
@@ -315,6 +341,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
         stepStoppedRunnable = Runnable {
             isWalking = false
+            boutStepsSinceStationary = 0
             if (!isOnFixedWifi()) {
                 gpsRestingAfterAnalysis = false
                 evaluateNoFixedWifiAlgorithm()
@@ -490,6 +517,11 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             return
         }
 
+        // Appena scollegato da Casa/Lavoro senza passi, esci subito dallo stato Wi-Fi verso Attualmente fermo
+        if (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK) {
+            transitionUserState(STATE_STILL)
+        }
+
         // Punto 2: Non connesso a Wi-Fi fissa + mancanza di passo -> finestra GPS Tgps_senzapasso (30s)
         if (!gpsHighAccuracyActive && !gpsRestingAfterAnalysis) {
             startNoStepGpsWindow(cycleIndex = 0)
@@ -498,21 +530,26 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
+    private var armedForDeparturePrompt = true
+
     private fun transitionUserState(newState: String) {
-        val previous = userActivityState
         userActivityState = newState
 
-        // Collegamento diretto della prima richiesta di rilascio all'ingresso in "In Movimento" (o "In Auto")
-        val wasStationary = (previous == STATE_AT_HOME || previous == STATE_AT_WORK || previous == STATE_STILL)
-        val enteredMotion = (newState == STATE_MOVING || newState == STATE_IN_CAR)
+        if (newState == STATE_AT_HOME || newState == STATE_AT_WORK || newState == STATE_STILL) {
+            armedForDeparturePrompt = true
+        }
 
-        if (wasStationary && enteredMotion) {
+        val inMotion = (newState == STATE_MOVING || newState == STATE_IN_CAR)
+        if (inMotion && armedForDeparturePrompt && !isOnFixedWifi()) {
             val enoughMovement = (newState == STATE_IN_CAR) || !hasStepSensor || (boutStepsSinceStationary >= 3) || !isWalking
-            if (enoughMovement && hasActiveParking() && !promptShownForCurrentSession && !isOnFixedWifi()) {
-                if (newState == STATE_IN_CAR && isCarBtConnected) {
-                    completeAutomaticVehicleDeparture()
-                } else {
-                    triggerReleaseConfirmationPrompt()
+            if (enoughMovement) {
+                armedForDeparturePrompt = false
+                if (hasActiveParking() && !promptShownForCurrentSession) {
+                    if (newState == STATE_IN_CAR && isCarBtConnected) {
+                        completeAutomaticVehicleDeparture()
+                    } else {
+                        triggerReleaseConfirmationPrompt()
+                    }
                 }
             }
         }
@@ -523,6 +560,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     private fun startNoStepGpsWindow(cycleIndex: Int) {
         if (isOnFixedWifi() || isWalking) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            transitionUserState(STATE_STILL)
             return
         }
 
@@ -1062,6 +1100,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         val btFilter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
         }
         ContextCompat.registerReceiver(this, systemBtReceiver, btFilter, ContextCompat.RECEIVER_EXPORTED)
     }
