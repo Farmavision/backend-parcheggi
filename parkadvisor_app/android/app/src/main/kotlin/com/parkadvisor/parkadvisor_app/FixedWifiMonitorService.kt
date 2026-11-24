@@ -126,6 +126,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
     // Stato macchina utente 24/7
     private var userActivityState: String = STATE_STILL
     private var currentConnectedWifiSsid: String? = null
+    @Volatile private var lastCallbackWifiSsid: String? = null
     @Volatile private var pendingUnknownWifiSsid: String? = null
     private var lastPromptedWifiSsid: String? = null
     private var promptShownForCurrentSession = false
@@ -363,7 +364,20 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
         }
     }
 
+    private fun isWifiTransportConnected(): Boolean {
+        return try {
+            val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun detectActiveWifiSsid(): String? {
+        val cached = lastCallbackWifiSsid?.replace("\"", "")?.trim()
+        if (!cached.isNullOrEmpty() && cached != "<unknown ssid>") return cached
+
         try {
             val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
             if (cm != null) {
@@ -373,20 +387,32 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         val wifiInfo = caps.transportInfo as? WifiInfo
                         val s = wifiInfo?.ssid?.replace("\"", "")?.trim()
-                        if (!s.isNullOrEmpty() && s != "<unknown ssid>") return s
+                        if (!s.isNullOrEmpty() && s != "<unknown ssid>") {
+                            lastCallbackWifiSsid = s
+                            return s
+                        }
                     }
                 }
             }
         } catch (_: Exception) {}
 
-        return try {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             @Suppress("DEPRECATION")
-            val s = wm.connectionInfo?.ssid?.replace("\"", "")?.trim()
-            if (!s.isNullOrEmpty() && s != "<unknown ssid>") s else null
-        } catch (_: Exception) {
-            null
+            val s = wm?.connectionInfo?.ssid?.replace("\"", "")?.trim()
+            if (!s.isNullOrEmpty() && s != "<unknown ssid>") {
+                lastCallbackWifiSsid = s
+                return s
+            }
+        } catch (_: Exception) {}
+
+        if (isWifiTransportConnected()) {
+            val uiSsid = prefs.getString("flutter.ui_detected_wifi_ssid", null)?.replace("\"", "")?.trim()
+            if (!uiSsid.isNullOrEmpty() && uiSsid != "<unknown ssid>") {
+                return uiSsid
+            }
         }
+        return null
     }
 
     private fun isHomeWifi(ssid: String?): Boolean {
@@ -876,7 +902,7 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
                             }
                             persistAndBroadcastState()
                         }
-                        "flutter.home_wifi_ssid", "flutter.work_wifi_ssid" -> evaluateConnectedWifiState()
+                        "flutter.home_wifi_ssid", "flutter.work_wifi_ssid", "flutter.ui_detected_wifi_ssid" -> evaluateConnectedWifiState()
                         "flutter.native_user_state" -> {
                             val synced = prefs.getString("flutter.native_user_state", null)
                             if (synced != null && synced != userActivityState) {
@@ -898,25 +924,48 @@ class FixedWifiMonitorService : Service(), LocationListener, SensorEventListener
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
 
-        networkCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                handler.post {
-                    evaluateConnectedWifiState()
-                    handler.postDelayed({ evaluateConnectedWifiState() }, 1200L)
+        val handleCaps: (NetworkCapabilities) -> Unit = { caps ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val wifiInfo = caps.transportInfo as? WifiInfo
+                val raw = wifiInfo?.ssid?.replace("\"", "")?.trim()
+                if (!raw.isNullOrEmpty() && raw != "<unknown ssid>") {
+                    lastCallbackWifiSsid = raw
                 }
             }
+            handler.post { evaluateConnectedWifiState() }
+        }
 
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                handler.post { evaluateConnectedWifiState() }
+        val handleLost: () -> Unit = {
+            lastCallbackWifiSsid = null
+            handler.post {
+                currentConnectedWifiSsid = null
+                pendingUnknownWifiSsid = null
+                gpsRestingAfterAnalysis = false
+                evaluateNoFixedWifiAlgorithm()
             }
+        }
 
-            override fun onLost(network: Network) {
-                handler.post {
-                    currentConnectedWifiSsid = null
-                    pendingUnknownWifiSsid = null
-                    gpsRestingAfterAnalysis = false
-                    evaluateNoFixedWifiAlgorithm()
+        networkCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+                override fun onAvailable(network: Network) {
+                    handler.post {
+                        evaluateConnectedWifiState()
+                        handler.postDelayed({ evaluateConnectedWifiState() }, 1200L)
+                    }
                 }
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = handleCaps(caps)
+                override fun onLost(network: Network) = handleLost()
+            }
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    handler.post {
+                        evaluateConnectedWifiState()
+                        handler.postDelayed({ evaluateConnectedWifiState() }, 1200L)
+                    }
+                }
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = handleCaps(caps)
+                override fun onLost(network: Network) = handleLost()
             }
         }
         try {

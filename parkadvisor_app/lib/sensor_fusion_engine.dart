@@ -70,7 +70,6 @@ class SensorFusionEngine extends ChangeNotifier {
   Timer? _btCheckTimer;
   Timer? _nativeSyncFallbackTimer;
 
-  bool _notified100m = false;
   double geofenceRadiusMeters = 100.0;
   bool _manualReleaseConfirmed = false;
   bool _autoShareSkippedNotified = false;
@@ -166,10 +165,9 @@ class SensorFusionEngine extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       await prefs.reload();
 
+      await _checkCurrentWifi(promptIfUnknown: false);
+
       final nativeState = prefs.getString('native_user_state');
-      if (nativeState != null) {
-        userActivityState = _parseNativeState(nativeState);
-      }
       isHighAccuracyGpsActive = prefs.getBool('native_gps_active') ?? false;
       gpsWindowRemainingSec = prefs.getInt('native_gps_remaining_sec') ?? 0;
       _noStepGpsCycleCount = prefs.getInt('native_gps_cycle') ?? 0;
@@ -177,6 +175,21 @@ class SensorFusionEngine extends ChangeNotifier {
       sessionSteps = prefs.getInt('native_session_steps') ?? 0;
       if (prefs.containsKey('native_car_bt_connected')) {
         isCarBtConnected = prefs.getBool('native_car_bt_connected') ?? isCarBtConnected;
+      }
+
+      if (isOnKnownPrivateWifi) {
+        final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
+        final isWork = workWifiSsid != null && clean.toLowerCase() == workWifiSsid!.toLowerCase();
+        userActivityState = isWork ? UserActivityState.atWork : UserActivityState.atHome;
+        isHighAccuracyGpsActive = false;
+        gpsWindowRemainingSec = 0;
+        final expectedNative = isWork ? 'atWork' : 'atHome';
+        if (nativeState != expectedNative) {
+          await prefs.setString('native_user_state', expectedNative);
+          await prefs.setBool('native_gps_active', false);
+        }
+      } else if (nativeState != null) {
+        userActivityState = _parseNativeState(nativeState);
       }
 
       parkedLat = prefs.getDouble('parked_lat');
@@ -303,7 +316,6 @@ class SensorFusionEngine extends ChangeNotifier {
 
   void cancelAutoRelease() {
     _autoReleaseManager.cancelCountdown();
-    _notified100m = true;
     notifyListeners();
   }
 
@@ -341,18 +353,36 @@ class SensorFusionEngine extends ChangeNotifier {
   }
 
   Future<void> saveWifiAsHome(String ssid) async {
-    homeWifiSsid = ssid.replaceAll('"', '').trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('home_wifi_ssid', homeWifiSsid!);
+    final clean = ssid.replaceAll('"', '').trim();
+    homeWifiSsid = clean;
+    currentConnectedWifiSsid = clean;
+    userActivityState = UserActivityState.atHome;
+    isHighAccuracyGpsActive = false;
+    gpsWindowRemainingSec = 0;
     _pendingWifiConfirmationSsid = null;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('home_wifi_ssid', clean);
+    await prefs.setString('ui_detected_wifi_ssid', clean);
+    await prefs.setString('native_user_state', 'atHome');
+    await prefs.setBool('native_gps_active', false);
+    notifyListeners();
     await syncFromNativeBackgroundService();
   }
 
   Future<void> saveWifiAsWork(String ssid) async {
-    workWifiSsid = ssid.replaceAll('"', '').trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('work_wifi_ssid', workWifiSsid!);
+    final clean = ssid.replaceAll('"', '').trim();
+    workWifiSsid = clean;
+    currentConnectedWifiSsid = clean;
+    userActivityState = UserActivityState.atWork;
+    isHighAccuracyGpsActive = false;
+    gpsWindowRemainingSec = 0;
     _pendingWifiConfirmationSsid = null;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('work_wifi_ssid', clean);
+    await prefs.setString('ui_detected_wifi_ssid', clean);
+    await prefs.setString('native_user_state', 'atWork');
+    await prefs.setBool('native_gps_active', false);
+    notifyListeners();
     await syncFromNativeBackgroundService();
   }
 
@@ -403,6 +433,9 @@ class SensorFusionEngine extends ChangeNotifier {
       if (ssid != null && ssid.isNotEmpty && ssid != '<unknown ssid>') {
         final clean = ssid.replaceAll('"', '').trim();
         currentConnectedWifiSsid = clean;
+        if (prefs.getString('ui_detected_wifi_ssid') != clean) {
+          await prefs.setString('ui_detected_wifi_ssid', clean);
+        }
         if (isOnKnownPrivateWifi) {
           _pendingWifiConfirmationSsid = null;
           _autoReleaseManager.cancelCountdown();
@@ -414,6 +447,9 @@ class SensorFusionEngine extends ChangeNotifier {
       } else {
         currentConnectedWifiSsid = null;
         _pendingWifiConfirmationSsid = null;
+        if (prefs.containsKey('ui_detected_wifi_ssid')) {
+          await prefs.remove('ui_detected_wifi_ssid');
+        }
       }
     } catch (_) {}
   }
@@ -474,7 +510,6 @@ class SensorFusionEngine extends ChangeNotifier {
     parkedLon = currentUserLon;
     distanceFromCarMeters = 0.0;
     currentState = VehicleState.parked;
-    _notified100m = false;
     _manualReleaseConfirmed = false;
 
     final prefs = await SharedPreferences.getInstance();
@@ -491,7 +526,6 @@ class SensorFusionEngine extends ChangeNotifier {
     parkedLon = null;
     distanceFromCarMeters = null;
     currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
-    _notified100m = false;
     _manualReleaseConfirmed = false;
 
     final prefs = await SharedPreferences.getInstance();
@@ -509,7 +543,6 @@ class SensorFusionEngine extends ChangeNotifier {
   Future<void> simulateApproach100m() async {
     if (!isCarParked) await simulateParkHere();
     distanceFromCarMeters = 45.0;
-    _notified100m = true;
     if (!isOnKnownPrivateWifi && _pendingWifiConfirmationSsid == null) {
       _autoReleaseManager.startCountdownIfBetaTester();
     }
