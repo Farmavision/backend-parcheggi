@@ -102,6 +102,12 @@ class MainActivity : FlutterActivity() {
         (args["geofenceRadiusM"] as? Number)?.let {
             ed.putInt("geofence_radius_m", it.toInt().coerceIn(20, 2000))
         }
+        (args["nPassi"] as? Number)?.let {
+            ed.putInt("n_passi", it.toInt().coerceIn(5, 500))
+        }
+        (args["t0PassiSec"] as? Number)?.let {
+            ed.putInt("t0_passi_sec", it.toInt().coerceIn(5, 300))
+        }
         if (args.containsKey("parkedLat") && args.containsKey("parkedLon")) {
             val lat = (args["parkedLat"] as? Number)?.toDouble()
             val lon = (args["parkedLon"] as? Number)?.toDouble()

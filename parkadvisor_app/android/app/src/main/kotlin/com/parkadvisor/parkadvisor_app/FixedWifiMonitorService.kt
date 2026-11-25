@@ -104,7 +104,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 "homeWifiSsid" to (p.getString("home_wifi_ssid", "") ?: ""),
                 "workWifiSsid" to (p.getString("work_wifi_ssid", "") ?: ""),
                 "connectedWifiSsid" to (p.getString("ui_wifi_ssid", "") ?: ""),
-                "onFixedWifi" to false
+                "onFixedWifi" to false,
+                "anchoredSteps" to 0,
+                "nPassi" to p.getInt("n_passi", 50).coerceIn(5, 500),
+                "t0PassiSec" to p.getInt("t0_passi_sec", 30).coerceIn(5, 300)
             )
         }
     }
@@ -152,6 +155,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var sessionSteps = 0
     private var recentWindowSteps = 0
     private var boutStepsSinceStationary = 0
+    private var anchoredStepCount = 0
     private var isWalking = false
 
     private var gravX = 0f
@@ -177,6 +181,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private var gpsWindowTickRunnable: Runnable? = null
     private var stepStoppedRunnable: Runnable? = null
+    private var anchoredStepResetRunnable: Runnable? = null
     private var geofenceWatchdogRunnable: Runnable? = null
     private var homeRearmRunnable: Runnable? = null
 
@@ -286,6 +291,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         stopNoStepGpsWindow()
         updateDynamicAccelerometerRegistration(shouldListen = false)
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
+        anchoredStepResetRunnable?.let { handler.removeCallbacks(it) }
         geofenceWatchdogRunnable?.let { handler.removeCallbacks(it) }
         homeRearmRunnable?.let { handler.removeCallbacks(it) }
         try {
@@ -339,7 +345,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             "homeWifiSsid" to (prefs.getString("home_wifi_ssid", "") ?: ""),
             "workWifiSsid" to (prefs.getString("work_wifi_ssid", "") ?: ""),
             "connectedWifiSsid" to (currentConnectedWifiSsid ?: ""),
-            "onFixedWifi" to isOnFixedWifi()
+            "onFixedWifi" to isOnFixedWifi(),
+            "anchoredSteps" to anchoredStepCount,
+            "nPassi" to getNPassi(),
+            "t0PassiSec" to getT0PassiSec()
         )
     }
 
@@ -395,6 +404,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         (args["geofenceRadiusM"] as? Number)?.let {
             ed.putInt("geofence_radius_m", it.toInt().coerceIn(20, 2000))
         }
+        (args["nPassi"] as? Number)?.let {
+            ed.putInt("n_passi", it.toInt().coerceIn(5, 500))
+        }
+        (args["t0PassiSec"] as? Number)?.let {
+            ed.putInt("t0_passi_sec", it.toInt().coerceIn(5, 300))
+        }
 
         if (args.containsKey("parkedLat") && args.containsKey("parkedLon")) {
             val lat = (args["parkedLat"] as? Number)?.toDouble()
@@ -413,6 +428,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                         isWalking = false
                         boutStepsSinceStationary = 0
                         recentWindowSteps = 0
+                        resetAnchoredStepsCounter()
                         if (!isOnFixedWifi() && userActivityState == STATE_MOVING) {
                             userActivityState = anchoredStationaryState ?: STATE_STILL
                         }
@@ -464,6 +480,19 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun getTGpsNoStepSec(): Int = prefs.getInt("tgps_senzapasso_sec", 30).coerceIn(10, 180)
     private fun getGeofenceRadiusMeters(): Float = prefs.getInt("geofence_radius_m", 100).coerceIn(20, 2000).toFloat()
+    private fun getNPassi(): Int = prefs.getInt("n_passi", 50).coerceIn(5, 500)
+    private fun getT0PassiSec(): Int = prefs.getInt("t0_passi_sec", 30).coerceIn(5, 300)
+
+    private fun isAnchoredWithoutFixedWifi(): Boolean {
+        return !isOnFixedWifi() && anchoredStationaryState != null &&
+            (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK)
+    }
+
+    private fun resetAnchoredStepsCounter() {
+        anchoredStepResetRunnable?.let { handler.removeCallbacks(it) }
+        anchoredStepResetRunnable = null
+        anchoredStepCount = 0
+    }
 
     private fun hasActiveParking(): Boolean {
         return prefs.contains("parked_lat") && prefs.contains("parked_lon")
@@ -594,18 +623,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    private fun onHardwareStepsDetected(stepDelta: Int) {
-        val now = System.currentTimeMillis()
-        sessionSteps += stepDelta
-        boutStepsSinceStationary += stepDelta
-
-        if (now - lastStepTimestampMs > 5_000L) {
-            recentWindowSteps = stepDelta
-        } else {
-            recentWindowSteps += stepDelta
-        }
-        lastStepTimestampMs = now
-
+    private fun scheduleWalkStopTimeout() {
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
         stepStoppedRunnable = Runnable {
             val wasWalkingBeforeStop = isWalking
@@ -618,16 +636,64 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             }
         }
         handler.postDelayed(stepStoppedRunnable!!, 6_000L)
+    }
+
+    private fun onHardwareStepsDetected(stepDelta: Int) {
+        val now = System.currentTimeMillis()
+        sessionSteps += stepDelta
 
         if (isOnFixedWifi()) {
+            resetAnchoredStepsCounter()
+            lastStepTimestampMs = now
             persistAndBroadcastState(forceNotification = false)
             return
         }
 
         if (isCarBtConnected) {
+            resetAnchoredStepsCounter()
+            lastStepTimestampMs = now
             persistAndBroadcastState(forceNotification = false)
             return
         }
+
+        // Soglia Npassi + reset T0passi (su eventi passo) solo se ancorato a Casa/Lavoro senza Wi-Fi
+        if (isAnchoredWithoutFixedWifi()) {
+            lastStepTimestampMs = now
+            anchoredStepCount += stepDelta
+            boutStepsSinceStationary += stepDelta
+
+            anchoredStepResetRunnable?.let { handler.removeCallbacks(it) }
+            val threshold = getNPassi()
+            if (anchoredStepCount >= threshold) {
+                anchoredStepResetRunnable = null
+                anchoredStepCount = 0
+                anchoredStationaryState = null
+                recentWindowSteps = threshold
+                isWalking = true
+                scheduleWalkStopTimeout()
+                evaluateNoFixedWifiAlgorithm()
+            } else {
+                anchoredStepResetRunnable = Runnable {
+                    anchoredStepResetRunnable = null
+                    anchoredStepCount = 0
+                    boutStepsSinceStationary = 0
+                    recentWindowSteps = 0
+                    persistAndBroadcastState(forceNotification = false)
+                }
+                handler.postDelayed(anchoredStepResetRunnable!!, getT0PassiSec() * 1000L)
+                persistAndBroadcastState(forceNotification = false)
+            }
+            return
+        }
+
+        boutStepsSinceStationary += stepDelta
+        if (now - lastStepTimestampMs > 5_000L) {
+            recentWindowSteps = stepDelta
+        } else {
+            recentWindowSteps += stepDelta
+        }
+        lastStepTimestampMs = now
+        scheduleWalkStopTimeout()
 
         if (userActivityState == STATE_IN_CAR) {
             if (recentWindowSteps >= 6) {
@@ -650,6 +716,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun handleAccelerometerSample(ax: Float, ay: Float, az: Float) {
         if (isOnFixedWifi() || isWalking || gpsHighAccuracyActive || userActivityState == STATE_IN_CAR || !gpsRestingAfterAnalysis) {
+            return
+        }
+        if (isAnchoredWithoutFixedWifi() && (System.currentTimeMillis() - lastStepTimestampMs) < 3_000L) {
             return
         }
         if (!gravInitialized) {
@@ -778,6 +847,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = false
             carPromptShownInCurrentBout = false
+            resetAnchoredStepsCounter()
             boutStepsSinceStationary = 0
             recentWindowSteps = 0
             currentSpeedKmh = 0f
@@ -825,6 +895,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (isOnFixedWifi()) return
 
         if (isCarBtConnected) {
+            resetAnchoredStepsCounter()
             anchoredStationaryState = null
             stopNoStepGpsWindow()
             updateDynamicAccelerometerRegistration(shouldListen = false)
@@ -967,6 +1038,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             return
         }
 
+        resetAnchoredStepsCounter()
         anchoredStationaryState = null
 
         if (vIst <= 10.0f) {
@@ -1197,6 +1269,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         val key = if (isHome) "home_wifi_ssid" else "work_wifi_ssid"
         val otherKey = if (isHome) "work_wifi_ssid" else "home_wifi_ssid"
         val targetState = if (isHome) STATE_AT_HOME else STATE_AT_WORK
+        resetAnchoredStepsCounter()
         activeWifiIsFixed = true
         anchoredStationaryState = targetState
         lastCallbackWifiSsid = clean

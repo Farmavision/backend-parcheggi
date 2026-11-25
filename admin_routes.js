@@ -16,6 +16,8 @@ const PARAM_DEFAULTS = {
   arrival_verification_meters: 25,
   self_booking_block_enabled: 0,
   geofence_enabled: 0,
+  n_passi: 50,
+  t0_passi_sec: 30,
 };
 
 function haversineKm(lat1, lon1, lat2, lon2) {
@@ -215,7 +217,7 @@ button.sec{background:#1565c0}button.del{background:#c62828;padding:6px 10px}.zo
 <button onclick="saveAll()" style="width:100%;font-size:16px">Salva Tutte le Impostazioni</button></div>
 <script>
 let PIN='', CFG={params:{},zones:[]};
-const LABELS={initial_credits:'Crediti iniziali',search_fee:'Costo prenotazione (crediti)',release_reward:'Premio rilascio (crediti)',cancellation_penalty:'Penale annullamento',release_delta_minutes:'Preavviso uscita (min)',reservation_hold_minutes:'Max attesa prenotazione (min)',free_spot_ttl_minutes:'Durata stallo libero (min)',polling_interval_seconds:'Polling stato (sec)',search_radius_meters:'Raggio ricerca (m)',arrival_verification_meters:'Tolleranza GPS arrivo (m)',self_booking_block_enabled:'Blocco auto-prenotazione (1=Sì, 0=No)'};
+const LABELS={initial_credits:'Crediti iniziali',search_fee:'Costo prenotazione (crediti)',release_reward:'Premio rilascio (crediti)',cancellation_penalty:'Penale annullamento',release_delta_minutes:'Preavviso uscita (min)',reservation_hold_minutes:'Max attesa prenotazione (min)',free_spot_ttl_minutes:'Durata stallo libero (min)',polling_interval_seconds:'Polling stato (sec)',search_radius_meters:'Raggio ricerca (m)',arrival_verification_meters:'Tolleranza GPS arrivo (m)',self_booking_block_enabled:'Blocco auto-prenotazione (1=Sì, 0=No)',n_passi:'Npassi — Soglia passi uscita Casa/Lavoro senza Wi-Fi',t0_passi_sec:'T0passi — Reset contatore passi Casa/Lavoro (sec)'};
 async function unlock(){PIN=document.getElementById('pinInput').value;const r=await fetch('/api/admin/verify-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:PIN})});if(!r.ok)return alert('PIN errato');document.getElementById('loginCard').style.display='none';document.getElementById('panel').style.display='block';load();}
 async function load(){const r=await fetch('/api/admin/config');CFG=await r.json();document.getElementById('geofence_enabled').checked=Number(CFG.params.geofence_enabled)===1;const g=document.getElementById('paramsGrid');g.innerHTML='';for(const[k,lbl]of Object.entries(LABELS)){g.innerHTML+='<div><label>'+lbl+'</label><input type="number" id="p_'+k+'" value="'+(CFG.params[k]??0)+'"></div>';}renderZones();}
 function renderZones(){const el=document.getElementById('zonesList');el.innerHTML='';CFG.zones.forEach((z,i)=>{el.innerHTML+='<div class="zone"><div><input type="checkbox" '+(z.active?'checked':'')+' onchange="CFG.zones['+i+'].active=this.checked"> <b>'+z.name+'</b> ('+z.lat+', '+z.lon+' · '+z.radius_km+' km)</div><button class="del" onclick="CFG.zones.splice('+i+',1);renderZones()">Elimina</button></div>';});}

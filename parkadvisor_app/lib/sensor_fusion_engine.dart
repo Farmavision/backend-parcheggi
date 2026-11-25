@@ -51,6 +51,9 @@ class SensorFusionEngine extends ChangeNotifier {
   bool isCarBtConnected = false;
 
   int tGpsNoStepSec = 30;
+  int nPassi = 50;
+  int t0PassiSec = 30;
+  int anchoredPendingSteps = 0;
   bool isHighAccuracyGpsActive = false;
   int gpsWindowRemainingSec = 0;
   int _noStepGpsCycleCount = 0;
@@ -109,7 +112,11 @@ class SensorFusionEngine extends ChangeNotifier {
     final segments = <String>[gpsPowerStateLabel];
     final activelyOnFixedWifi = _nativeOnFixedWifi || isOnKnownPrivateWifi;
     if (!activelyOnFixedWifi) {
-      segments.add('Vel: ${currentSpeedKmh.toStringAsFixed(1)} km/h | Passi: $sessionSteps');
+      final isAnchoredPlace = userActivityState == UserActivityState.atHome || userActivityState == UserActivityState.atWork;
+      final stepText = isAnchoredPlace
+          ? 'Passi: $anchoredPendingSteps/$nPassi'
+          : 'Passi: $sessionSteps';
+      segments.add('Vel: ${currentSpeedKmh.toStringAsFixed(1)} km/h | $stepText');
     }
     if (isCarParked) {
       final dist = distanceFromCarMeters != null ? ' (${distanceFromCarMeters!.round()}m)' : '';
@@ -214,6 +221,9 @@ class SensorFusionEngine extends ChangeNotifier {
     _noStepGpsCycleCount = (snap['gpsCycle'] as num?)?.toInt() ?? 0;
     currentSpeedKmh = (snap['speedKmh'] as num?)?.toDouble() ?? 0.0;
     sessionSteps = (snap['sessionSteps'] as num?)?.toInt() ?? 0;
+    anchoredPendingSteps = (snap['anchoredSteps'] as num?)?.toInt() ?? 0;
+    if (snap['nPassi'] != null) nPassi = (snap['nPassi'] as num).toInt();
+    if (snap['t0PassiSec'] != null) t0PassiSec = (snap['t0PassiSec'] as num).toInt();
     if (snap['carBtConnected'] != null) {
       isCarBtConnected = snap['carBtConnected'] == true;
     }
@@ -270,6 +280,8 @@ class SensorFusionEngine extends ChangeNotifier {
         'uiDetectedWifiSsid': currentConnectedWifiSsid ?? '',
         'carBtMac': targetCarBluetoothMac ?? '',
         'tGpsNoStepSec': tGpsNoStepSec,
+        'nPassi': nPassi,
+        't0PassiSec': t0PassiSec,
         'geofenceRadiusM': geofenceRadiusMeters.round(),
         'parkedLat': parkedLat,
         'parkedLon': parkedLon,
@@ -324,6 +336,8 @@ class SensorFusionEngine extends ChangeNotifier {
       final savedWork = prefs.getString('work_wifi_ssid');
       if (savedWork != null && savedWork.isNotEmpty) workWifiSsid = savedWork;
       tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
+      nPassi = (prefs.getInt('n_passi') ?? 50).clamp(5, 500);
+      t0PassiSec = (prefs.getInt('t0_passi_sec') ?? 30).clamp(5, 300);
       geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
       _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
       _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
@@ -372,6 +386,8 @@ class SensorFusionEngine extends ChangeNotifier {
     final workWifi = prefs.getString('work_wifi_ssid');
     if (workWifi != null && workWifi.isNotEmpty) workWifiSsid = workWifi;
     tGpsNoStepSec = (prefs.getInt('tgps_senzapasso_sec') ?? 30).clamp(10, 180);
+    nPassi = (prefs.getInt('n_passi') ?? 50).clamp(5, 500);
+    t0PassiSec = (prefs.getInt('t0_passi_sec') ?? 30).clamp(5, 300);
     geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
     await _pushConfigToNative();
     await syncFromNativeBackgroundService();
