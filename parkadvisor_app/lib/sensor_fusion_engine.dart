@@ -53,6 +53,7 @@ class SensorFusionEngine extends ChangeNotifier {
   int tGpsNoStepSec = 30;
   int nPassi = 50;
   int t0PassiSec = 30;
+  int deltaGpsMeters = 150;
   int anchoredPendingSteps = 0;
   bool isHighAccuracyGpsActive = false;
   int gpsWindowRemainingSec = 0;
@@ -102,6 +103,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
   String get gpsPowerStateLabel {
     if (isHighAccuracyGpsActive) {
+      if (gpsWindowRemainingSec <= 0) return 'GPS alta precisione (radar ${geofenceRadiusMeters.round()}+${deltaGpsMeters}m)';
       final cycleText = _noStepGpsCycleCount > 0 ? 'conferma' : 'analisi';
       return 'GPS alta precisione ($cycleText ${gpsWindowRemainingSec}s)';
     }
@@ -225,6 +227,7 @@ class SensorFusionEngine extends ChangeNotifier {
     if (snap['nPassi'] != null) nPassi = (snap['nPassi'] as num).toInt();
     if (snap['t0PassiSec'] != null) t0PassiSec = (snap['t0PassiSec'] as num).toInt();
     if (snap['geofenceRadiusM'] != null) geofenceRadiusMeters = (snap['geofenceRadiusM'] as num).toDouble();
+    if (snap['deltaGpsM'] != null) deltaGpsMeters = (snap['deltaGpsM'] as num).toInt();
     final nativeDist = (snap['distanceFromCarM'] as num?)?.toDouble();
     if (nativeDist != null) distanceFromCarMeters = nativeDist;
     else if (snap['hasParked'] == false) distanceFromCarMeters = null;
@@ -290,6 +293,7 @@ class SensorFusionEngine extends ChangeNotifier {
         'nPassi': nPassi,
         't0PassiSec': t0PassiSec,
         'geofenceRadiusM': geofenceRadiusMeters.round(),
+        'deltaGpsM': deltaGpsMeters,
         'parkedLat': parkedLat,
         'parkedLon': parkedLon,
         if (isSimulation) 'isSimulation': true,
@@ -347,6 +351,8 @@ class SensorFusionEngine extends ChangeNotifier {
       nPassi = (prefs.getInt('n_passi') ?? 50).clamp(5, 500);
       t0PassiSec = (prefs.getInt('t0_passi_sec') ?? 30).clamp(5, 300);
       geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
+    deltaGpsMeters = (prefs.getInt('delta_gps_m') ?? 150).clamp(50, 500);
+      deltaGpsMeters = (prefs.getInt('delta_gps_m') ?? 150).clamp(50, 500);
       _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
       _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
       if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
