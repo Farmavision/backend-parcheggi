@@ -541,7 +541,7 @@ class _FindMyCarScreenState extends State<FindMyCarScreen> {
     super.initState();
     final pLat = widget.sensorEngine.parkedLat;
     final pLon = widget.sensorEngine.parkedLon;
-    if (pLat != null && pLon != null) _carPos = LatLng(pLat, pLon);
+    _carPos = (pLat != null && pLon != null) ? LatLng(pLat, pLon) : null;
     final uLat = widget.sensorEngine.currentUserLat;
     final uLon = widget.sensorEngine.currentUserLon;
     if (uLat != null && uLon != null) _userPos = LatLng(uLat, uLon);
@@ -571,7 +571,8 @@ class _FindMyCarScreenState extends State<FindMyCarScreen> {
         final res = await http.get(Uri.parse('${widget.backendBaseUrl}/api/parking/my-spot?userId=${widget.userId}')).timeout(const Duration(seconds: 8));
         if (res.statusCode == 200 && mounted) {
           final spot = json.decode(res.body)['spot'];
-          if (spot != null && spot['latitude'] != null && spot['longitude'] != null) {
+          final st = (spot?['status'] ?? '').toString().toUpperCase();
+          if (spot != null && (st == 'OCCUPIED' || st == 'LEAVING_SOON') && spot['latitude'] != null && spot['longitude'] != null) {
             _carPos = LatLng((spot['latitude'] as num).toDouble(), (spot['longitude'] as num).toDouble());
           }
         }

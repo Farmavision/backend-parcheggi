@@ -96,7 +96,7 @@ app.get('/api/parking/my-spot', async (req, res) => {
     const { userId } = req.query;
     if (!userId) return res.status(400).json({ error: 'userId richiesto' });
     if (!useSupabase) return res.json({ spot: null });
-    const { data } = await supabase.from('parking_spots').select('*').eq('user_id', userId).maybeSingle();
+    const { data } = await supabase.from('parking_spots').select('*').eq('user_id', userId).in('status', ['OCCUPIED', 'LEAVING_SOON']).order('updated_at', { ascending: false }).limit(1).maybeSingle();
     res.json({ spot: data || null });
   } catch (err) {
     res.status(500).json({ error: 'Errore controllo stallo utente' });

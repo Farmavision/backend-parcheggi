@@ -503,6 +503,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         } else {
             evaluateConnectedWifiState()
         }
+        if (args.containsKey("hasParked")) {
+            persistAndBroadcastState(forceNotification = true)
+        }
         return buildSnapshotMap()
     }
 
