@@ -103,7 +103,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 "parkedLon" to if (hasParked) p.getString("parked_lon", null)?.toDoubleOrNull() else null,
                 "homeWifiSsid" to (p.getString("home_wifi_ssid", "") ?: ""),
                 "workWifiSsid" to (p.getString("work_wifi_ssid", "") ?: ""),
-                "connectedWifiSsid" to (p.getString("ui_wifi_ssid", "") ?: "")
+                "connectedWifiSsid" to (p.getString("ui_wifi_ssid", "") ?: ""),
+                "onFixedWifi" to false
             )
         }
     }
@@ -133,6 +134,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private var userActivityState: String = STATE_STILL
+    private var anchoredStationaryState: String? = null
+    private var activeWifiIsFixed: Boolean = false
     private var lastNotifiedTitleState: String = ""
     private var lastNotifiedGpsMode: Boolean? = null
     private var currentConnectedWifiSsid: String? = null
@@ -204,6 +207,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             if (intent?.action == WifiManager.WIFI_STATE_CHANGED_ACTION) {
                 val wifiState = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, WifiManager.WIFI_STATE_UNKNOWN)
                 if (wifiState == WifiManager.WIFI_STATE_DISABLED || wifiState == WifiManager.WIFI_STATE_DISABLING) {
+                    activeWifiIsFixed = false
                     lastCallbackWifiSsid = null
                     currentConnectedWifiSsid = null
                     pendingUnknownWifiSsid = null
@@ -243,6 +247,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         instance = this
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         migrateLegacyPrefsIfNeeded()
+        userActivityState = prefs.getString("user_state", STATE_STILL) ?: STATE_STILL
+        anchoredStationaryState = prefs.getString("anchored_place_state", null)
+        if (anchoredStationaryState == null && (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK)) {
+            anchoredStationaryState = userActivityState
+        }
 
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         geofencingClient = LocationServices.getGeofencingClient(this)
@@ -329,7 +338,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             "parkedLon" to coords?.second,
             "homeWifiSsid" to (prefs.getString("home_wifi_ssid", "") ?: ""),
             "workWifiSsid" to (prefs.getString("work_wifi_ssid", "") ?: ""),
-            "connectedWifiSsid" to (currentConnectedWifiSsid ?: "")
+            "connectedWifiSsid" to (currentConnectedWifiSsid ?: ""),
+            "onFixedWifi" to isOnFixedWifi()
         )
     }
 
@@ -342,14 +352,28 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     fun onFlutterConfigSynced(args: Map<String, Any?>): HashMap<String, Any?> {
         val ed = prefs.edit()
         (args["homeWifiSsid"] as? String)?.trim()?.let {
-            if (it.isNotEmpty()) ed.putString("home_wifi_ssid", it.replace("\"", ""))
+            val clean = it.replace("\"", "")
+            if (clean.isNotEmpty()) {
+                ed.putString("home_wifi_ssid", clean)
+                if (prefs.getString("work_wifi_ssid", "").equals(clean, ignoreCase = true) &&
+                    (args["workWifiSsid"] as? String)?.trim()?.replace("\"", "")?.equals(clean, ignoreCase = true) != true) {
+                    ed.remove("work_wifi_ssid")
+                }
+            }
         }
-        if (args["clearHomeWifi"] == true) ed.remove("home_wifi_ssid")
+        if (args["clearHomeWifi"] == true) {
+            ed.remove("home_wifi_ssid")
+            if (anchoredStationaryState == STATE_AT_HOME) anchoredStationaryState = null
+        }
 
         (args["workWifiSsid"] as? String)?.trim()?.let {
-            if (it.isNotEmpty()) ed.putString("work_wifi_ssid", it.replace("\"", ""))
+            val clean = it.replace("\"", "")
+            if (clean.isNotEmpty()) ed.putString("work_wifi_ssid", clean)
         }
-        if (args["clearWorkWifi"] == true) ed.remove("work_wifi_ssid")
+        if (args["clearWorkWifi"] == true) {
+            ed.remove("work_wifi_ssid")
+            if (anchoredStationaryState == STATE_AT_WORK) anchoredStationaryState = null
+        }
 
         if (args.containsKey("uiDetectedWifiSsid")) {
             val uiSsid = (args["uiDetectedWifiSsid"] as? String)?.replace("\"", "")?.trim()
@@ -390,7 +414,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                         boutStepsSinceStationary = 0
                         recentWindowSteps = 0
                         if (!isOnFixedWifi() && userActivityState == STATE_MOVING) {
-                            userActivityState = STATE_STILL
+                            userActivityState = anchoredStationaryState ?: STATE_STILL
                         }
                     }
                 }
@@ -423,11 +447,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         syncNativeGeofenceWithActiveParking()
 
         if (forced == STATE_IN_CAR) {
+            anchoredStationaryState = null
             gpsRestingAfterAnalysis = true
             stopNoStepGpsWindow()
             updateDynamicAccelerometerRegistration(shouldListen = false)
             userActivityState = STATE_IN_CAR
             persistAndBroadcastState(forceNotification = true)
+        } else if (forced == STATE_AT_HOME || forced == STATE_AT_WORK) {
+            anchoredStationaryState = forced
+            evaluateConnectedWifiState()
         } else {
             evaluateConnectedWifiState()
         }
@@ -580,10 +608,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
         stepStoppedRunnable = Runnable {
+            val wasWalkingBeforeStop = isWalking
             isWalking = false
             recentWindowSteps = 0
             boutStepsSinceStationary = 0
-            if (!isOnFixedWifi() && userActivityState != STATE_IN_CAR) {
+            if (wasWalkingBeforeStop && !isOnFixedWifi() && userActivityState != STATE_IN_CAR) {
                 gpsRestingAfterAnalysis = false
                 evaluateNoFixedWifiAlgorithm()
             }
@@ -717,13 +746,18 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun isOnFixedWifi(): Boolean {
+        if (!isWifiTransportConnected()) {
+            activeWifiIsFixed = false
+            currentConnectedWifiSsid = null
+            return false
+        }
         val s = detectActiveWifiSsid()
         currentConnectedWifiSsid = s
-        if (isHomeWifi(s) || isWorkWifi(s)) return true
-        if (s == null && isWifiTransportConnected() && (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK)) {
-            return true
+        if (!s.isNullOrEmpty()) {
+            activeWifiIsFixed = isHomeWifi(s) || isWorkWifi(s)
+            return activeWifiIsFixed
         }
-        return false
+        return activeWifiIsFixed
     }
 
     private fun isIgnoredWifiSsid(ssid: String): Boolean {
@@ -737,7 +771,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         currentConnectedWifiSsid = ssid
 
         if (isHomeWifi(ssid) || isWorkWifi(ssid)) {
-            val targetState = if (isWorkWifi(ssid)) STATE_AT_WORK else STATE_AT_HOME
+            val targetState = if (isHomeWifi(ssid)) STATE_AT_HOME else STATE_AT_WORK
+            activeWifiIsFixed = true
+            anchoredStationaryState = targetState
             pendingUnknownWifiSsid = null
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = false
@@ -756,17 +792,18 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                         promptShownForCurrentSession = false
                     }
                 }
-                handler.postDelayed(homeRearmRunnable!!, 90_000L)
+                handler.postDelayed(homeRearmRunnable!!, 30_000L)
             }
 
             transitionUserState(targetState)
             return
         }
 
-        if (ssid == null && wifiConnected && (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK)) {
+        if (ssid == null && wifiConnected && activeWifiIsFixed) {
             persistAndBroadcastState(forceNotification = false)
             return
         }
+        activeWifiIsFixed = false
 
         homeRearmRunnable?.let {
             handler.removeCallbacks(it)
@@ -788,6 +825,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (isOnFixedWifi()) return
 
         if (isCarBtConnected) {
+            anchoredStationaryState = null
             stopNoStepGpsWindow()
             updateDynamicAccelerometerRegistration(shouldListen = false)
             transitionUserState(STATE_IN_CAR)
@@ -795,6 +833,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
 
         if (isWalking) {
+            anchoredStationaryState = null
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = false
             stopNoStepGpsWindow()
@@ -810,8 +849,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             return
         }
 
-        if (userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK) {
-            transitionUserState(STATE_STILL)
+        val stationaryTarget = anchoredStationaryState ?: STATE_STILL
+        if (userActivityState != stationaryTarget) {
+            transitionUserState(stationaryTarget)
         }
 
         if (!gpsHighAccuracyActive && !gpsRestingAfterAnalysis) {
@@ -903,7 +943,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             val netMeters = distArr[0]
             val netAvgKmh = (netMeters / elapsedSec) * 3.6f
             val dopplerAvgKmh = gpsWindowSamples.map { it.speedKmh }.average().toFloat()
-            vMedia = if (netMeters > 8f) max(netAvgKmh, dopplerAvgKmh) else dopplerAvgKmh
+            val minReliableDisp = max(25f, first.accuracy + last.accuracy)
+            vMedia = if (netMeters > minReliableDisp) max(netAvgKmh, dopplerAvgKmh) else dopplerAvgKmh
 
             val tail = gpsWindowSamples.takeLast(2)
             vIst = tail.map { it.speedKmh }.average().toFloat()
@@ -915,15 +956,18 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         currentSpeedKmh = vIst
 
         if (vMedia <= 1.0f) {
+            val stationaryTarget = anchoredStationaryState ?: STATE_STILL
             stopNoStepGpsWindow()
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = true
             carPromptShownInCurrentBout = false
             boutStepsSinceStationary = 0
             updateDynamicAccelerometerRegistration(shouldListen = true)
-            transitionUserState(STATE_STILL)
+            transitionUserState(stationaryTarget)
             return
         }
+
+        anchoredStationaryState = null
 
         if (vIst <= 10.0f) {
             transitionUserState(STATE_MOVING)
@@ -1002,6 +1046,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun onCarBluetoothConnected() {
         if (isOnFixedWifi()) return
+        anchoredStationaryState = null
         gpsRestingAfterAnalysis = true
         stopNoStepGpsWindow()
         updateDynamicAccelerometerRegistration(shouldListen = false)
@@ -1057,6 +1102,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun handleUserConfirmInCarFromNotif() {
         cancelInCarPromptNotification()
+        anchoredStationaryState = null
         prefs.edit().putBoolean("prompt_in_car", false).apply()
         gpsRestingAfterAnalysis = true
         stopNoStepGpsWindow()
@@ -1097,10 +1143,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun persistAndBroadcastState(forceNotification: Boolean) {
         try {
-            prefs.edit()
+            val ed = prefs.edit()
                 .putString("user_state", userActivityState)
                 .putInt("session_steps", sessionSteps)
-                .apply()
+            if (anchoredStationaryState != null) {
+                ed.putString("anchored_place_state", anchoredStationaryState)
+            } else {
+                ed.remove("anchored_place_state")
+            }
+            ed.apply()
 
             if (forceNotification || lastNotifiedTitleState != userActivityState || lastNotifiedGpsMode != gpsHighAccuracyActive) {
                 lastNotifiedTitleState = userActivityState
@@ -1127,7 +1178,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun updateForegroundStatusNotification() {
         try {
             val openPi = PendingIntent.getActivity(this, 10, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            val gpsText = if (gpsHighAccuracyActive) "GPS alta precisione attivo" else "GPS in risparmio"
+            val wifiNote = if ((userActivityState == STATE_AT_HOME || userActivityState == STATE_AT_WORK) && !isOnFixedWifi()) " • Wi-Fi assente" else ""
+            val gpsText = (if (gpsHighAccuracyActive) "GPS alta precisione attivo" else "GPS in risparmio") + wifiNote
             val notif = NotificationCompat.Builder(this, CHANNEL_FG)
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                 .setContentTitle("Stato utente: ${userStateItalianLabel()}")
@@ -1143,7 +1195,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun handleSaveWifiAction(ssid: String?, isHome: Boolean) {
         val clean = ssid?.replace("\"", "")?.trim()?.takeIf { it.isNotEmpty() } ?: return
         val key = if (isHome) "home_wifi_ssid" else "work_wifi_ssid"
+        val otherKey = if (isHome) "work_wifi_ssid" else "home_wifi_ssid"
         val targetState = if (isHome) STATE_AT_HOME else STATE_AT_WORK
+        activeWifiIsFixed = true
+        anchoredStationaryState = targetState
         lastCallbackWifiSsid = clean
         currentConnectedWifiSsid = clean
         pendingUnknownWifiSsid = null
@@ -1154,11 +1209,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         stopNoStepGpsWindow()
         updateDynamicAccelerometerRegistration(shouldListen = false)
         cancelReleasePromptNotification()
-        prefs.edit()
+        val ed = prefs.edit()
             .putString(key, clean)
             .putString("ui_wifi_ssid", clean)
             .putString("user_state", targetState)
-            .apply()
+            .putString("anchored_place_state", targetState)
+        if (prefs.getString(otherKey, "").equals(clean, ignoreCase = true)) {
+            ed.remove(otherKey)
+        }
+        ed.apply()
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(WIFI_PROMPT_NOTIF_ID)
         } catch (_: Exception) {}
@@ -1259,6 +1318,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
 
         val handleLost: () -> Unit = {
+            activeWifiIsFixed = false
             lastCallbackWifiSsid = null
             handler.post {
                 currentConnectedWifiSsid = null

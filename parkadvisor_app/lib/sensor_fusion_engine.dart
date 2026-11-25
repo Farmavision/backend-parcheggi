@@ -56,6 +56,7 @@ class SensorFusionEngine extends ChangeNotifier {
   int _noStepGpsCycleCount = 0;
   bool _inCarPromptDeliveredInUi = false;
   bool _releasePromptDeliveredInUi = false;
+  bool _nativeOnFixedWifi = false;
   bool _isAppInForeground = true;
 
   final Future<void> Function(double lat, double lon, String method) onCarParked;
@@ -106,7 +107,8 @@ class SensorFusionEngine extends ChangeNotifier {
 
   String get statusMessage {
     final segments = <String>[gpsPowerStateLabel];
-    if (userActivityState != UserActivityState.atHome && userActivityState != UserActivityState.atWork) {
+    final activelyOnFixedWifi = _nativeOnFixedWifi || isOnKnownPrivateWifi;
+    if (!activelyOnFixedWifi) {
       segments.add('Vel: ${currentSpeedKmh.toStringAsFixed(1)} km/h | Passi: $sessionSteps');
     }
     if (isCarParked) {
@@ -196,9 +198,14 @@ class SensorFusionEngine extends ChangeNotifier {
       SharedPreferences.getInstance().then((p) => p.setString('work_wifi_ssid', nativeWork));
     }
 
+    if (snap.containsKey('onFixedWifi')) {
+      _nativeOnFixedWifi = snap['onFixedWifi'] == true;
+    }
     final nativeConnectedWifi = (snap['connectedWifiSsid'] as String?)?.trim() ?? '';
     if (nativeConnectedWifi.isNotEmpty) {
       currentConnectedWifiSsid = nativeConnectedWifi;
+    } else if (snap.containsKey('onFixedWifi') && !_nativeOnFixedWifi) {
+      currentConnectedWifiSsid = null;
     }
 
     final nativeState = snap['userActivityState'] as String?;
@@ -211,10 +218,10 @@ class SensorFusionEngine extends ChangeNotifier {
       isCarBtConnected = snap['carBtConnected'] == true;
     }
 
-    if (isOnKnownPrivateWifi) {
+    if (_nativeOnFixedWifi && isOnKnownPrivateWifi) {
       final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-      final isWork = workWifiSsid != null && workWifiSsid!.isNotEmpty && clean.toLowerCase() == workWifiSsid!.toLowerCase();
-      userActivityState = isWork ? UserActivityState.atWork : UserActivityState.atHome;
+      final isHome = homeWifiSsid != null && homeWifiSsid!.isNotEmpty && clean.toLowerCase() == homeWifiSsid!.toLowerCase();
+      userActivityState = isHome ? UserActivityState.atHome : UserActivityState.atWork;
       isHighAccuracyGpsActive = false;
       gpsWindowRemainingSec = 0;
     } else if (nativeState != null) {
@@ -448,28 +455,48 @@ class SensorFusionEngine extends ChangeNotifier {
   Future<void> saveWifiAsHome(String ssid) async {
     final clean = ssid.replaceAll('"', '').trim();
     homeWifiSsid = clean;
+    if (workWifiSsid != null && workWifiSsid!.toLowerCase() == clean.toLowerCase()) {
+      workWifiSsid = null;
+    }
     currentConnectedWifiSsid = clean;
+    _nativeOnFixedWifi = true;
     userActivityState = UserActivityState.atHome;
     isHighAccuracyGpsActive = false;
     gpsWindowRemainingSec = 0;
     _pendingWifiConfirmationSsid = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('home_wifi_ssid', clean);
-    await _pushConfigToNative(forceUserState: 'atHome');
+    if (workWifiSsid == null) await prefs.remove('work_wifi_ssid');
+    await _bgServiceChannel.invokeMethod('syncConfigToNative', {
+      'homeWifiSsid': clean,
+      if (workWifiSsid == null) 'clearWorkWifi': true,
+      'forceUserState': 'atHome',
+    });
+    await syncFromNativeBackgroundService();
     notifyListeners();
   }
 
   Future<void> saveWifiAsWork(String ssid) async {
     final clean = ssid.replaceAll('"', '').trim();
     workWifiSsid = clean;
+    if (homeWifiSsid != null && homeWifiSsid!.toLowerCase() == clean.toLowerCase()) {
+      homeWifiSsid = null;
+    }
     currentConnectedWifiSsid = clean;
+    _nativeOnFixedWifi = true;
     userActivityState = UserActivityState.atWork;
     isHighAccuracyGpsActive = false;
     gpsWindowRemainingSec = 0;
     _pendingWifiConfirmationSsid = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('work_wifi_ssid', clean);
-    await _pushConfigToNative(forceUserState: 'atWork');
+    if (homeWifiSsid == null) await prefs.remove('home_wifi_ssid');
+    await _bgServiceChannel.invokeMethod('syncConfigToNative', {
+      'workWifiSsid': clean,
+      if (homeWifiSsid == null) 'clearHomeWifi': true,
+      'forceUserState': 'atWork',
+    });
+    await syncFromNativeBackgroundService();
     notifyListeners();
   }
 
