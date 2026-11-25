@@ -177,6 +177,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var passedThroughStall = false
     private var lastGeofenceCoords: Pair<Double, Double>? = null
     private var lastGeofenceRadiusMeters: Float = -1f
+    private var lastDistanceFromCarMeters: Float? = null
+    private var lastKnownUserLocation: Location? = null
+    private var approachMonitorMode: Int = 0
+    private var lastMovingStateMs: Long = 0L
+    private var lastRemoteSpotSyncMs: Long = 0L
     private var activeRingtone: android.media.Ringtone? = null
 
     private var gpsWindowTickRunnable: Runnable? = null
@@ -189,6 +194,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         override fun onLocationResult(result: LocationResult) {
             val loc = result.lastLocation ?: return
             handleFusedLocation(loc)
+        }
+    }
+
+    private val approachLocationCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            val loc = result.lastLocation ?: return
+            handleApproachLocation(loc)
         }
     }
 
@@ -289,6 +301,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     override fun onDestroy() {
         if (instance === this) instance = null
         stopNoStepGpsWindow()
+        stopGeofenceApproachMonitor()
         updateDynamicAccelerometerRegistration(shouldListen = false)
         stepStoppedRunnable?.let { handler.removeCallbacks(it) }
         anchoredStepResetRunnable?.let { handler.removeCallbacks(it) }
@@ -331,7 +344,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         val coords = getParkedLatLon()
         return hashMapOf(
             "userActivityState" to userActivityState,
-            "gpsActive" to gpsHighAccuracyActive,
+            "gpsActive" to (gpsHighAccuracyActive || approachMonitorMode == 2),
             "gpsRemainingSec" to gpsWindowRemainingSec,
             "gpsCycle" to noStepGpsCycleCount,
             "speedKmh" to currentSpeedKmh.toDouble(),
@@ -342,6 +355,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             "hasParked" to (coords != null),
             "parkedLat" to coords?.first,
             "parkedLon" to coords?.second,
+            "distanceFromCarM" to lastDistanceFromCarMeters?.toDouble(),
+            "geofenceRadiusM" to getGeofenceRadiusMeters().toInt(),
+            "userLat" to lastKnownUserLocation?.latitude,
+            "userLon" to lastKnownUserLocation?.longitude,
             "homeWifiSsid" to (prefs.getString("home_wifi_ssid", "") ?: ""),
             "workWifiSsid" to (prefs.getString("work_wifi_ssid", "") ?: ""),
             "connectedWifiSsid" to (currentConnectedWifiSsid ?: ""),
@@ -417,9 +434,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             if (lat != null && lon != null) {
                 val hadBefore = hasActiveParking()
                 val isSim = args["isSimulation"] == true
+                val prevCoords = getParkedLatLon()
+                val coordsChanged = prevCoords == null ||
+                    kotlin.math.abs(prevCoords.first - lat) > 0.00015 ||
+                    kotlin.math.abs(prevCoords.second - lon) > 0.00015
                 ed.putString("parked_lat", lat.toString())
                 ed.putString("parked_lon", lon.toString())
-                if (!hadBefore || isSim) {
+                ed.putString("parked_source", if (isSim) "sim" else "local")
+                if (!hadBefore || isSim || coordsChanged) {
+                    lastMovingStateMs = 0L
                     promptShownForCurrentSession = false
                     passedThroughStall = false
                     armedForDeparturePrompt = true
@@ -437,9 +460,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             } else {
                 ed.remove("parked_lat")
                 ed.remove("parked_lon")
+                ed.remove("parked_source")
                 ed.putBoolean("prompt_release", false)
+                lastDistanceFromCarMeters = null
                 promptShownForCurrentSession = false
                 passedThroughStall = false
+                stopGeofenceApproachMonitor()
                 cancelPromptNotification()
             }
         }
@@ -455,11 +481,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             ed.putBoolean("prompt_release", false)
             cancelPromptNotification()
         }
+        val forceRemoteSync = args["syncRemoteSpot"] == true
 
         val forced = (args["forceUserState"] as? String)?.trim()
         ed.apply()
 
         registerStepSensors()
+        if (forceRemoteSync) syncRemoteActiveParkingIfNeeded(force = true)
         syncNativeGeofenceWithActiveParking()
 
         if (forced == STATE_IN_CAR) {
@@ -942,17 +970,17 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             armedForDeparturePrompt = true
         }
 
-        val inMotion = (newState == STATE_MOVING || newState == STATE_IN_CAR)
-        if (inMotion && armedForDeparturePrompt && !isOnFixedWifi() && hasActiveParking() && !promptShownForCurrentSession) {
-            val enoughMovement = (newState == STATE_IN_CAR) || !hasStepHardware || (boutStepsSinceStationary >= 3) || !isWalking
-            if (enoughMovement) {
-                armedForDeparturePrompt = false
-                if (newState == STATE_IN_CAR && isCarBtConnected) {
-                    completeAutomaticVehicleDeparture()
-                } else {
-                    triggerReleaseConfirmationPrompt()
-                }
-            }
+        if (newState == STATE_MOVING) {
+            lastMovingStateMs = System.currentTimeMillis()
+        }
+
+        if (newState == STATE_IN_CAR && isCarBtConnected && hasActiveParking()) {
+            stopGeofenceApproachMonitor()
+            completeAutomaticVehicleDeparture()
+        } else if (newState == STATE_MOVING && !isOnFixedWifi() && hasActiveParking() && !promptShownForCurrentSession) {
+            updateGeofenceApproachMonitor(triggerImmediateCheck = true)
+        } else {
+            stopGeofenceApproachMonitor()
         }
 
         persistAndBroadcastState(forceNotification = changed)
@@ -1092,28 +1120,98 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun handleFusedLocation(loc: Location) {
+        lastKnownUserLocation = loc
         val instKmh = if (loc.hasSpeed()) max(0f, loc.speed * 3.6f) else 0f
         currentSpeedKmh = instKmh
-
         if (gpsHighAccuracyActive) {
             if (loc.accuracy <= 35f || gpsWindowSamples.isEmpty()) {
-                gpsWindowSamples.add(
-                    NativeGpsSample(System.currentTimeMillis(), loc.latitude, loc.longitude, instKmh, loc.accuracy)
-                )
+                gpsWindowSamples.add(NativeGpsSample(System.currentTimeMillis(), loc.latitude, loc.longitude, instKmh, loc.accuracy))
             }
             persistAndBroadcastState(forceNotification = false)
         }
+        evaluateDistanceToParkedCar(loc)
+    }
 
-        val coords = getParkedLatLon()
-        if (coords != null) {
-            val results = FloatArray(1)
-            Location.distanceBetween(loc.latitude, loc.longitude, coords.first, coords.second, results)
-            val distMeters = results[0]
-            if (distMeters <= 30f) passedThroughStall = true
-            if (passedThroughStall && isCarBtConnected && distMeters > 15f) {
-                completeAutomaticVehicleDeparture()
-            }
+    private fun handleApproachLocation(loc: Location) {
+        lastKnownUserLocation = loc
+        evaluateDistanceToParkedCar(loc)
+        persistAndBroadcastState(forceNotification = false)
+    }
+
+    private fun evaluateDistanceToParkedCar(loc: Location) {
+        val coords = getParkedLatLon() ?: run {
+            lastDistanceFromCarMeters = null; stopGeofenceApproachMonitor(); return
         }
+        val res = FloatArray(1)
+        Location.distanceBetween(loc.latitude, loc.longitude, coords.first, coords.second, res)
+        val dist = res[0]
+        lastDistanceFromCarMeters = dist
+        if (dist <= 30f) passedThroughStall = true
+        if (passedThroughStall && isCarBtConnected && dist > 15f) {
+            completeAutomaticVehicleDeparture(); return
+        }
+        val r = getGeofenceRadiusMeters()
+        val recentMove = (userActivityState == STATE_MOVING) ||
+            (userActivityState == STATE_STILL && (System.currentTimeMillis() - lastMovingStateMs) < 25_000L)
+        if (!isOnFixedWifi() && !promptShownForCurrentSession && recentMove && dist <= r) {
+            stopGeofenceApproachMonitor()
+            triggerReleaseConfirmationPrompt()
+            return
+        }
+        if (userActivityState == STATE_MOVING && !isOnFixedWifi() && !promptShownForCurrentSession) {
+            val desired = if (dist <= r + 350f) 2 else 1
+            if (desired != approachMonitorMode) applyApproachLocationRequest(desired)
+        }
+    }
+
+    private fun updateGeofenceApproachMonitor(triggerImmediateCheck: Boolean = false) {
+        if (!hasActiveParking() || isOnFixedWifi() || promptShownForCurrentSession || userActivityState != STATE_MOVING) {
+            stopGeofenceApproachMonitor(); return
+        }
+        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fine && !coarse) return
+        if (triggerImmediateCheck) {
+            val c = lastKnownUserLocation
+            if (c != null && (System.currentTimeMillis() - c.time) < 15_000L) {
+                evaluateDistanceToParkedCar(c)
+                if (promptShownForCurrentSession) return
+            }
+            try {
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                    .addOnSuccessListener { loc ->
+                        if (loc != null) {
+                            lastKnownUserLocation = loc; evaluateDistanceToParkedCar(loc)
+                        } else if (prefs.getString("parked_source", "") == "sim" && !promptShownForCurrentSession && userActivityState == STATE_MOVING) {
+                            stopGeofenceApproachMonitor(); triggerReleaseConfirmationPrompt()
+                        }
+                    }
+            } catch (_: Exception) {}
+        }
+        val r = getGeofenceRadiusMeters()
+        val desired = if (lastDistanceFromCarMeters == null || lastDistanceFromCarMeters!! <= r + 350f) 2 else 1
+        if (approachMonitorMode != desired) applyApproachLocationRequest(desired)
+    }
+
+    private fun applyApproachLocationRequest(mode: Int) {
+        try { fusedLocationClient.removeLocationUpdates(approachLocationCallback) } catch (_: Exception) {}
+        approachMonitorMode = mode
+        val req = if (mode == 2) {
+            LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2_000L).setMinUpdateIntervalMillis(1_000L).build()
+        } else {
+            LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 8_000L).setMinUpdateIntervalMillis(4_000L).build()
+        }
+        try { fusedLocationClient.requestLocationUpdates(req, approachLocationCallback, Looper.getMainLooper()) } catch (_: Exception) { approachMonitorMode = 0 }
+    }
+
+    private fun stopGeofenceApproachMonitor() {
+        if (approachMonitorMode == 0) return
+        approachMonitorMode = 0
+        try { fusedLocationClient.removeLocationUpdates(approachLocationCallback) } catch (_: Exception) {}
+    }
+
+    fun onExternalGeofenceIntent(intent: Intent) {
+        handler.post { handleGeofenceEnterEvent(intent) }
     }
 
     private fun onCarBluetoothConnected() {
@@ -1142,9 +1240,17 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun handleGeofenceEnterEvent(intent: Intent) {
         val event = GeofencingEvent.fromIntent(intent)
         if (event != null && event.hasError()) return
-        if (!hasActiveParking() || isOnFixedWifi()) return
-
-        if (userActivityState == STATE_MOVING && !promptShownForCurrentSession) {
+        if (!hasActiveParking() || isOnFixedWifi() || promptShownForCurrentSession) return
+        event?.triggeringLocation?.let { loc ->
+            lastKnownUserLocation = loc
+            getParkedLatLon()?.let { c ->
+                val res = FloatArray(1)
+                Location.distanceBetween(loc.latitude, loc.longitude, c.first, c.second, res)
+                lastDistanceFromCarMeters = res[0]
+            }
+        }
+        if (userActivityState == STATE_MOVING || userActivityState == STATE_STILL) {
+            stopGeofenceApproachMonitor()
             triggerReleaseConfirmationPrompt()
         }
     }
@@ -1436,56 +1542,79 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         geofenceWatchdogRunnable = object : Runnable {
             override fun run() {
                 registerStepSensors()
+                syncRemoteActiveParkingIfNeeded(force = false)
                 syncNativeGeofenceWithActiveParking()
                 evaluateConnectedWifiState()
+                updateGeofenceApproachMonitor(triggerImmediateCheck = false)
                 handler.postDelayed(this, 30_000L)
             }
         }
         handler.post(geofenceWatchdogRunnable!!)
     }
 
+    private fun syncRemoteActiveParkingIfNeeded(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastRemoteSpotSyncMs < 25_000L) return
+        lastRemoteSpotSyncMs = now
+        val userId = prefs.getString("user_id", "USER-001") ?: "USER-001"
+        Thread {
+            try {
+                val conn = (URL("https://parknow-api.onrender.com/api/parking/my-spot?userId=$userId").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"; connectTimeout = 8000; readTimeout = 8000
+                }
+                if (conn.responseCode == 200) {
+                    val spot = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optJSONObject("spot")
+                    val status = spot?.optString("status", "") ?: ""
+                    val lat = when { spot == null -> Double.NaN; !spot.isNull("lat") -> spot.optDouble("lat", Double.NaN); else -> spot.optDouble("latitude", Double.NaN) }
+                    val lon = when { spot == null -> Double.NaN; !spot.isNull("lon") -> spot.optDouble("lon", Double.NaN); else -> spot.optDouble("longitude", Double.NaN) }
+                    handler.post {
+                        if (spot != null && status == "OCCUPIED" && !lat.isNaN() && !lon.isNaN()) {
+                            val prev = getParkedLatLon()
+                            val ch = prev == null || kotlin.math.abs(prev.first - lat) > 0.00015 || kotlin.math.abs(prev.second - lon) > 0.00015
+                            if (ch) {
+                                prefs.edit().putString("parked_lat", lat.toString()).putString("parked_lon", lon.toString())
+                                    .putString("parked_source", "remote").putBoolean("prompt_release", false).apply()
+                                promptShownForCurrentSession = false; passedThroughStall = false; armedForDeparturePrompt = true
+                                syncNativeGeofenceWithActiveParking()
+                                updateGeofenceApproachMonitor(triggerImmediateCheck = true)
+                                persistAndBroadcastState(forceNotification = false)
+                            }
+                        } else if ((spot == null || status == "FREE") && prefs.getString("parked_source", "") == "remote") {
+                            resetSessionFlagsAndClearParking(); lastDistanceFromCarMeters = null
+                            stopGeofenceApproachMonitor(); syncNativeGeofenceWithActiveParking()
+                            persistAndBroadcastState(forceNotification = false)
+                        }
+                    }
+                }
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
+    }
+
     private fun syncNativeGeofenceWithActiveParking() {
         val coords = getParkedLatLon()
         if (coords == null) {
-            promptShownForCurrentSession = false
-            lastGeofenceCoords = null
-            lastGeofenceRadiusMeters = -1f
+            promptShownForCurrentSession = false; lastGeofenceCoords = null; lastGeofenceRadiusMeters = -1f
             try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
             return
         }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            return
-        }
-
-        val radiusMeters = getGeofenceRadiusMeters()
-        if (lastGeofenceCoords == coords && lastGeofenceRadiusMeters == radiusMeters) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
+        val r = getGeofenceRadiusMeters()
+        if (lastGeofenceCoords == coords && lastGeofenceRadiusMeters == r) return
         try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
-        lastGeofenceCoords = coords
-        lastGeofenceRadiusMeters = radiusMeters
-
-        val geofence = Geofence.Builder()
-            .setRequestId(GEOFENCE_REQ_ID)
-            .setCircularRegion(coords.first, coords.second, radiusMeters)
-            .setExpirationDuration(Geofence.NEVER_EXPIRE)
-            .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER)
-            .build()
-
-        val geoReq = GeofencingRequest.Builder()
-            .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
-            .addGeofence(geofence)
-            .build()
-
-        val pi = PendingIntent.getBroadcast(
-            this,
-            5101,
-            Intent(ACTION_GEOFENCE_TRANSITION).setPackage(packageName),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-        )
-
+        val geo = Geofence.Builder().setRequestId(GEOFENCE_REQ_ID).setCircularRegion(coords.first, coords.second, r)
+            .setExpirationDuration(Geofence.NEVER_EXPIRE).setNotificationResponsiveness(1_000).setLoiteringDelay(3_000)
+            .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER or Geofence.GEOFENCE_TRANSITION_DWELL).build()
+        val req = GeofencingRequest.Builder()
+            .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER or GeofencingRequest.INITIAL_TRIGGER_DWELL)
+            .addGeofence(geo).build()
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
+        val pi = PendingIntent.getBroadcast(this, 7701, Intent(this, GeofenceBroadcastReceiver::class.java), flags)
         try {
-            geofencingClient.addGeofences(geoReq, pi)
-        } catch (_: Exception) {}
+            geofencingClient.addGeofences(req, pi)
+                .addOnSuccessListener { lastGeofenceCoords = coords; lastGeofenceRadiusMeters = r }
+                .addOnFailureListener { lastGeofenceCoords = null; lastGeofenceRadiusMeters = -1f }
+        } catch (_: Exception) { lastGeofenceCoords = null }
     }
 
     private fun triggerServerRelease(minutes: Int) {

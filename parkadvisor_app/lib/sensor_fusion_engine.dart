@@ -224,6 +224,13 @@ class SensorFusionEngine extends ChangeNotifier {
     anchoredPendingSteps = (snap['anchoredSteps'] as num?)?.toInt() ?? 0;
     if (snap['nPassi'] != null) nPassi = (snap['nPassi'] as num).toInt();
     if (snap['t0PassiSec'] != null) t0PassiSec = (snap['t0PassiSec'] as num).toInt();
+    if (snap['geofenceRadiusM'] != null) geofenceRadiusMeters = (snap['geofenceRadiusM'] as num).toDouble();
+    final nativeDist = (snap['distanceFromCarM'] as num?)?.toDouble();
+    if (nativeDist != null) distanceFromCarMeters = nativeDist;
+    else if (snap['hasParked'] == false) distanceFromCarMeters = null;
+    final uLat = (snap['userLat'] as num?)?.toDouble();
+    final uLon = (snap['userLon'] as num?)?.toDouble();
+    if (uLat != null && uLon != null) { currentUserLat = uLat; currentUserLon = uLon; }
     if (snap['carBtConnected'] != null) {
       isCarBtConnected = snap['carBtConnected'] == true;
     }
@@ -286,6 +293,7 @@ class SensorFusionEngine extends ChangeNotifier {
         'parkedLat': parkedLat,
         'parkedLon': parkedLon,
         if (isSimulation) 'isSimulation': true,
+        if (!isSimulation) 'syncRemoteSpot': true,
         if (forceUserState != null) 'forceUserState': forceUserState,
       });
       if (rawRes is Map) {

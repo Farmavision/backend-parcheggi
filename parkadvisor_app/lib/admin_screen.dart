@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -118,6 +119,14 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       await prefs.setInt('n_passi', nPassiVal);
       await prefs.setInt('t0_passi_sec', t0PassiVal);
       await prefs.setInt('geofence_radius_m', geoRadVal);
+      try {
+        await const MethodChannel('parknow/bg_service').invokeMethod('syncConfigToNative', {
+          'tGpsNoStepSec': (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180),
+          'nPassi': nPassiVal,
+          't0PassiSec': t0PassiVal,
+          'geofenceRadiusM': geoRadVal,
+        });
+      } catch (_) {}
 
       final r = await _apiCall('POST', '/api/admin/settings', body: {
         'reward_release': int.tryParse(_rewardCtrl.text) ?? 10,
@@ -353,7 +362,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           controller: _geofenceRadiusMCtrl,
           keyboardType: TextInputType.number,
           decoration: const InputDecoration(
-            labelText: 'Raggio Geofence auto (metri)',
+            labelText: 'Rgeofence — Raggio Geofence auto (metri)',
             helperText: 'Default: 100m (min 20m). Distanza attivazione rilevamento intorno allo stallo.',
             border: OutlineInputBorder(),
           ),
