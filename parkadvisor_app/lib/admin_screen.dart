@@ -29,6 +29,7 @@ class _AdminScreenState extends State<AdminScreen> {
   final _nPassiCtrl = TextEditingController(text: '50');
   final _t0PassiSecCtrl = TextEditingController(text: '30');
   final _geofenceRadiusMCtrl = TextEditingController(text: '100');
+  final _deltaGpsMCtrl = TextEditingController(text: '150');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
 
@@ -95,7 +96,8 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       SharedPreferences.getInstance().then((spLoad) { _xtRitNotSecCtrl.text = (data['xt_rit_not_sec'] ?? spLoad.getInt('xt_rit_not_sec') ?? 15).toString(); _xtGpsAttivoSecCtrl.text = (data['xt_gps_attivo_sec'] ?? spLoad.getInt('xt_gps_attivo_sec') ?? 10).toString(); _xtGpsMaxAttivoMinCtrl.text = (data['xt_gps_max_attivo_min'] ?? spLoad.getInt('xt_gps_max_attivo_min') ?? 5).toString(); _xtGpsDisattivoSecCtrl.text = (data['xt_gps_disattivo_sec'] ?? spLoad.getInt('xt_gps_disattivo_sec') ?? 15).toString(); _tGpsSenzaPassoCtrl.text = (data['tgps_senzapasso_sec'] ?? spLoad.getInt('tgps_senzapasso_sec') ?? 30).toString();
           _nPassiCtrl.text = (data['n_passi'] ?? spLoad.getInt('n_passi') ?? 50).toString();
           _t0PassiSecCtrl.text = (data['t0_passi_sec'] ?? spLoad.getInt('t0_passi_sec') ?? 30).toString();
-          _geofenceRadiusMCtrl.text = (data['geofence_radius_m'] ?? spLoad.getInt('geofence_radius_m') ?? 100).toString(); });
+          _geofenceRadiusMCtrl.text = (data['geofence_radius_m'] ?? spLoad.getInt('geofence_radius_m') ?? 100).toString();
+          _deltaGpsMCtrl.text = (data['delta_gps_m'] ?? spLoad.getInt('delta_gps_m') ?? 150).toString(); });
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
             final val = int.tryParse(_autoReleaseDelayCtrl.text);
@@ -115,16 +117,19 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       final nPassiVal = (int.tryParse(_nPassiCtrl.text) ?? 50).clamp(5, 500);
       final t0PassiVal = (int.tryParse(_t0PassiSecCtrl.text) ?? 30).clamp(5, 300);
       final geoRadVal = (int.tryParse(_geofenceRadiusMCtrl.text) ?? 100).clamp(20, 2000);
+      final deltaGpsVal = (int.tryParse(_deltaGpsMCtrl.text) ?? 150).clamp(50, 500);
       await prefs.setInt('tgps_senzapasso_sec', (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180));
       await prefs.setInt('n_passi', nPassiVal);
       await prefs.setInt('t0_passi_sec', t0PassiVal);
       await prefs.setInt('geofence_radius_m', geoRadVal);
+      await prefs.setInt('delta_gps_m', deltaGpsVal);
       try {
         await const MethodChannel('parknow/bg_service').invokeMethod('syncConfigToNative', {
           'tGpsNoStepSec': (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180),
           'nPassi': nPassiVal,
           't0PassiSec': t0PassiVal,
           'geofenceRadiusM': geoRadVal,
+          'deltaGpsM': deltaGpsVal,
         });
       } catch (_) {}
 
@@ -142,6 +147,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       'n_passi': nPassiVal,
       't0_passi_sec': t0PassiVal,
       'geofence_radius_m': geoRadVal,
+      'delta_gps_m': deltaGpsVal,
       'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
       });
@@ -201,6 +207,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
     _nPassiCtrl.dispose();
     _t0PassiSecCtrl.dispose();
     _geofenceRadiusMCtrl.dispose();
+    _deltaGpsMCtrl.dispose();
     _deltaCtrl.dispose();
     _autoReleaseDelayCtrl.dispose();
     super.dispose();
@@ -364,6 +371,16 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           decoration: const InputDecoration(
             labelText: 'Rgeofence — Raggio Geofence auto (metri)',
             helperText: 'Default: 100m (min 20m). Distanza attivazione rilevamento intorno allo stallo.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _deltaGpsMCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'DeltaGps — Margine GPS alta precisione (metri)',
+            helperText: 'Default: 150m (50-500m). Accende il GPS rapido entro Rgeofence + DeltaGps.',
             border: OutlineInputBorder(),
           ),
         ),
