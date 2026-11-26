@@ -41,6 +41,38 @@ async function getSystemSettings() {
   return defaults;
 }
 
+async function logCreditLedger(externalUserId, delta, balanceAfter, reasonCode, opts = {}) {
+  if (!useSupabase || !externalUserId) return;
+  try {
+    await supabase.from('user_credit_ledger').insert({
+      user_id: externalUserId,
+      delta: Math.trunc(Number(delta) || 0),
+      balance_after: Math.trunc(Number(balanceAfter) || 0),
+      reason_code: String(reasonCode || 'SYSTEM'),
+      note: opts.note || null,
+      spot_id: opts.spotId || null,
+      actor: opts.actor || 'SYSTEM',
+    });
+  } catch (_) {}
+}
+
+async function logAuditEvent(externalUserId, eventType, opts = {}) {
+  if (!useSupabase || !externalUserId) return;
+  try {
+    await supabase.from('user_audit_logs').insert({
+      user_id: externalUserId,
+      event_type: String(eventType || 'EVENT'),
+      trigger_source: opts.triggerSource || null,
+      distance_m: opts.distanceM != null ? Number(opts.distanceM) : null,
+      accuracy_m: opts.accuracyM != null ? Number(opts.accuracyM) : null,
+      lat: opts.lat != null ? Number(opts.lat) : null,
+      lon: opts.lon != null ? Number(opts.lon) : null,
+      spot_id: opts.spotId || null,
+      meta: opts.meta || {},
+    });
+  } catch (_) {}
+}
+
 async function ensureAndAdjustUserCredits(externalUserId, deltaAmount, transactionType, spotId = null) {
   if (!useSupabase || !externalUserId) return null;
   let { data: user } = await supabase.from('users').select('*').eq('external_user_id', externalUserId).maybeSingle();
@@ -145,6 +177,7 @@ app.post('/api/parking/park', async (req, res) => {
       });
       if (error) throw error;
     }
+    await logAuditEvent(userId, 'PARKED', { triggerSource: detectionMethod, lat: latitude, lon: longitude, spotId });
     res.status(201).json({ success: true, spotId, status: 'OCCUPIED' });
   } catch (err) {
     res.status(500).json({ error: 'Errore registrazione parcheggio' });
@@ -167,6 +200,7 @@ app.post('/api/parking/confirm-release', async (req, res) => {
       if (error) throw error;
       if (!data || data.length === 0) return res.status(404).json({ error: 'Nessuna auto parcheggiata' });
     }
+    await logAuditEvent(userId, 'PROMPT_ACCEPTED', { triggerSource: 'USER_CONFIRM', meta: { availableInMinutes, deltaMinutes } });
     res.json({ success: true, status: 'LEAVING_SOON', deltaMinutes, verificationDeadline: deadline });
   } catch (err) {
     res.status(500).json({ error: 'Errore conferma rilascio' });
@@ -204,6 +238,7 @@ app.post('/api/parking/release', async (req, res) => {
       spotId = data[0].id;
     }
     const newBalance = await ensureAndAdjustUserCredits(userId, reward, 'RELEASE_REWARD', spotId);
+    await logAuditEvent(userId, 'SPOT_RELEASED', { triggerSource: req.body?.triggerSource || 'APP_RELEASE', spotId, meta: { reward, newBalance } });
     res.json({ success: true, status: 'FREE', creditsAwarded: reward, newBalance });
   } catch (err) {
     res.status(500).json({ error: 'Errore rilascio stallo' });
@@ -230,7 +265,7 @@ app.get('/api/user/profile', async (req, res) => {
 
 app.post('/api/user/profile', async (req, res) => {
   try {
-    const { userId, phoneNumber, carBrand, carModel, carColor, carPlate, autoShareEnabled = true, isBetaTester = false, searchRadiusM = 500, homeWifiSsid, carBluetoothMac } = req.body;
+    const { userId, email, phoneNumber, carBrand, carModel, carColor, carPlate, autoShareEnabled = true, isBetaTester = false, searchRadiusM = 500, homeWifiSsid, carBluetoothMac } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId richiesto' });
     const cleanPlate = (carPlate || '').trim().toUpperCase();
     const visiblePart = cleanPlate.length >= 2 ? cleanPlate.slice(-2) : cleanPlate;
@@ -238,17 +273,24 @@ app.post('/api/user/profile', async (req, res) => {
     if (!useSupabase) return res.json({ success: true });
     
     // Assicuriamoci che la colonna is_beta_tester esista o venga aggiornata
-    const { data, error } = await supabase.from('users').upsert({
+    const basePayload = {
       external_user_id: userId,
       phone_number: phoneNumber && phoneNumber.trim() !== '' ? phoneNumber.trim() : null,
       car_brand: carBrand || null, car_model: carModel || null, car_color: carColor || null,
       car_plate_encrypted: encryptedPart, car_plate_visible: visiblePart || null,
       auto_share_enabled: Boolean(autoShareEnabled),
-      is_beta_tester: Boolean(isBetaTester), // <-- Salviamo il nuovo flag Beta Tester!
+      is_beta_tester: Boolean(isBetaTester),
       search_radius_m: [100, 300, 500, 1000].includes(Number(searchRadiusM)) ? Number(searchRadiusM) : 500,
       home_wifi_ssid: homeWifiSsid || null, car_bluetooth_mac: carBluetoothMac || null,
       updated_at: new Date().toISOString()
-    }, { onConflict: 'external_user_id' }).select().single();
+    };
+    const fullPayload = email !== undefined ? { ...basePayload, email: String(email).trim() || null } : basePayload;
+    let { data, error } = await supabase.from('users').upsert(fullPayload, { onConflict: 'external_user_id' }).select().single();
+    if (error && email !== undefined) {
+      const retry = await supabase.from('users').upsert(basePayload, { onConflict: 'external_user_id' }).select().single();
+      data = retry.data;
+      error = retry.error;
+    }
     if (error) throw error;
     res.json({ success: true, profile: data });
   } catch (err) {
@@ -301,5 +343,7 @@ app.post("/api/beta/feedback", async (req, res) => {
 app.get("/api/beta/feedback", (req, res) => {
   return res.json({ feedbacks: betaFeedbacks });
 });
+
+require('./admin_backoffice')(app, { useSupabase, supabase, getSystemSettings, processExpiredReleaseVerifications, logAuditEvent, logCreditLedger, betaFeedbacks });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Server ParkNow! attivo sulla porta ${PORT}`));

@@ -5,7 +5,8 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 class AdminScreen extends StatefulWidget {
-  const AdminScreen({super.key});
+  final String? initialPin;
+  const AdminScreen({super.key, this.initialPin});
   @override
   State<AdminScreen> createState() => _AdminScreenState();
 }
@@ -16,6 +17,17 @@ class _AdminScreenState extends State<AdminScreen> {
   bool _unlocked = false;
   bool _loading = false;
   String _adminPin = '';
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialPin != null && widget.initialPin!.isNotEmpty) {
+      _adminPin = widget.initialPin!;
+      _unlocked = true;
+      _loadConfig();
+    }
+  }
+
 
   final List<Map<String, dynamic>> _zones = [];
   final _rewardCtrl = TextEditingController(text: '10');

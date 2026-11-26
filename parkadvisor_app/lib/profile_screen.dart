@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'admin_screen.dart';
+import 'admin_hub_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -20,6 +21,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   int _creditsBalance = 50;
   bool _isSaving = false;
 
+  final _emailController = TextEditingController();
   final _phoneController = TextEditingController();
   final _brandController = TextEditingController();
   final _modelController = TextEditingController();
@@ -50,6 +52,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final savedRadius = prefs.getInt('search_radius_m') ?? 500;
       _searchRadius = _allowedRadii.contains(savedRadius) ? savedRadius : 500;
       _creditsBalance = prefs.getInt('credits_balance') ?? 50;
+      _emailController.text = prefs.getString('user_email') ?? '';
       _phoneController.text = prefs.getString('user_phone') ?? '';
       _brandController.text = prefs.getString('car_brand') ?? '';
       _modelController.text = prefs.getString('car_model') ?? '';
@@ -64,6 +67,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (res.statusCode == 200 && mounted) {
         final data = json.decode(res.body);
         final remoteCredits = (data['credits_balance'] as num?)?.toInt();
+        final remoteEmail = data['email'] as String?;
         final remotePhone = data['phone_number'] as String?;
         final remoteBrand = data['car_brand'] as String?;
         final remoteModel = data['car_model'] as String?;
@@ -80,6 +84,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         }
 
         if (remoteCredits != null) await prefs.setInt('credits_balance', remoteCredits);
+        if (remoteEmail != null) await prefs.setString('user_email', remoteEmail);
         if (remotePhone != null) await prefs.setString('user_phone', remotePhone);
         if (remoteBrand != null) await prefs.setString('car_brand', remoteBrand);
         if (remoteModel != null) await prefs.setString('car_model', remoteModel);
@@ -94,6 +99,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
         setState(() {
           if (remoteCredits != null) _creditsBalance = remoteCredits;
+          if (remoteEmail != null) _emailController.text = remoteEmail;
           if (remotePhone != null) _phoneController.text = remotePhone;
           if (remoteBrand != null) _brandController.text = remoteBrand;
           if (remoteModel != null) _modelController.text = remoteModel;
@@ -279,6 +285,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     await prefs.setBool('auto_share_enabled', _autoShare);
     await prefs.setBool('is_beta_tester', _isBetaTester);
     await prefs.setInt('search_radius_m', _searchRadius);
+    await prefs.setString('user_email', _emailController.text.trim());
     await prefs.setString('user_phone', _phoneController.text.trim());
     await prefs.setString('car_brand', _brandController.text.trim());
     await prefs.setString('car_model', _modelController.text.trim());
@@ -295,6 +302,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         headers: {'Content-Type': 'application/json'},
         body: json.encode({
           'userId': _userId,
+          'email': _emailController.text.trim(),
           'phoneNumber': _phoneController.text.trim(),
           'carBrand': _brandController.text.trim(),
           'carModel': _modelController.text.trim(),
@@ -336,6 +344,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   @override
   void dispose() {
+    _emailController.dispose();
     _phoneController.dispose();
     _brandController.dispose();
     _modelController.dispose();
@@ -360,7 +369,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(builder: (_) => const AdminScreen()),
+                MaterialPageRoute(builder: (_) => const AdminHubScreen()),
               );
             },
           ),
@@ -458,6 +467,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 children: [
                   const Text('Dati Veicolo & Contatto', style: TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 12),
+                  TextField(controller: _emailController, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Email', border: OutlineInputBorder(), isDense: true)),
+                  const SizedBox(height: 10),
                   TextField(controller: _phoneController, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Telefono', border: OutlineInputBorder(), isDense: true)),
                   const SizedBox(height: 10),
                   TextField(controller: _brandController, decoration: const InputDecoration(labelText: 'Marca Auto (es. Fiat)', border: OutlineInputBorder(), isDense: true)),
