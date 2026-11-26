@@ -51,6 +51,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
   bool _isLoading = false;
   bool _isReserving = false;
   Timer? _pollingTimer;
+  StreamSubscription<Position>? _searchPosSub;
 
   @override
   void initState() {
@@ -78,6 +79,12 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
       setState(() => _center = LatLng(pos.latitude, pos.longitude));
       _mapController.move(_center, 17.0);
     } catch (_) {}
+    _searchPosSub ??= Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 5),
+    ).listen((pos) {
+      if (!mounted) return;
+      setState(() => _center = LatLng(pos.latitude, pos.longitude));
+    });
     await _fetchSpots();
   }
 
@@ -170,6 +177,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
 
   @override
   void dispose() {
+    _searchPosSub?.cancel();
     _pollingTimer?.cancel();
     widget.sensorEngine.removeListener(_onEngineUpdate);
     super.dispose();
@@ -535,6 +543,7 @@ class _FindMyCarScreenState extends State<FindMyCarScreen> {
   LatLng? _carPos;
   LatLng? _userPos;
   bool _loadingRemote = false;
+  StreamSubscription<Position>? _findCarPosSub;
 
   @override
   void initState() {
@@ -565,6 +574,12 @@ class _FindMyCarScreenState extends State<FindMyCarScreen> {
       final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
       if (mounted) setState(() => _userPos = LatLng(pos.latitude, pos.longitude));
     } catch (_) {}
+    _findCarPosSub ??= Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 5),
+    ).listen((pos) {
+      if (!mounted) return;
+      setState(() => _userPos = LatLng(pos.latitude, pos.longitude));
+    });
     if (_carPos == null) {
       setState(() => _loadingRemote = true);
       try {
@@ -588,6 +603,7 @@ class _FindMyCarScreenState extends State<FindMyCarScreen> {
 
   @override
   void dispose() {
+    _findCarPosSub?.cancel();
     widget.sensorEngine.removeListener(_onEngineUpdate);
     super.dispose();
   }

@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -29,6 +30,271 @@ class _ProfileScreenState extends State<ProfileScreen> {
   final _plateController = TextEditingController();
   final _wifiController = TextEditingController();
   final _btController = TextEditingController();
+  static const MethodChannel _bgServiceChannel = MethodChannel('parknow/bg_service');
+  List<String> _homeWifis = [];
+  List<String> _workWifis = [];
+  List<String> _ignoredWifis = [];
+  List<String> _carBtMacs = [];
+  List<String> _ignoredBtMacs = [];
+  Map<String, String> _btNames = {};
+
+  List<String> _parseCsv(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return [];
+    return raw.split(',').map((e) => e.replaceAll('"', '').trim()).where((e) => e.isNotEmpty).toList();
+  }
+
+  Future<void> _persistAndSyncNetworks() async {
+    final prefs = await SharedPreferences.getInstance();
+    final homeCsv = _homeWifis.join(',');
+    final workCsv = _workWifis.join(',');
+    final btCsv = _carBtMacs.map((m) => m.toUpperCase()).join(',');
+    _wifiController.text = homeCsv;
+    _btController.text = btCsv;
+
+    if (homeCsv.isEmpty) { await prefs.remove('home_wifi_ssid'); } else { await prefs.setString('home_wifi_ssid', homeCsv); }
+    if (workCsv.isEmpty) { await prefs.remove('work_wifi_ssid'); } else { await prefs.setString('work_wifi_ssid', workCsv); }
+    await prefs.setStringList('ignored_wifis', _ignoredWifis);
+    if (btCsv.isEmpty) { await prefs.remove('car_bt_mac'); } else { await prefs.setString('car_bt_mac', btCsv); }
+    await prefs.setStringList('ignored_bt_macs', _ignoredBtMacs);
+    await prefs.setString('car_bt_names_json', json.encode(_btNames));
+
+    try {
+      await _bgServiceChannel.invokeMethod('syncConfigToNative', {
+        'homeWifiSsid': homeCsv,
+        if (homeCsv.isEmpty) 'clearHomeWifi': true,
+        'workWifiSsid': workCsv,
+        if (workCsv.isEmpty) 'clearWorkWifi': true,
+        'ignoredWifis': _ignoredWifis,
+        'carBtMac': btCsv,
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _addWifiDialog() async {
+    final ctrl = TextEditingController();
+    String kind = 'home';
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: const Text('Aggiungi rete Wi-Fi'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: ctrl,
+                decoration: const InputDecoration(labelText: 'Nome rete (SSID)', border: OutlineInputBorder(), isDense: true),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                value: kind,
+                decoration: const InputDecoration(labelText: 'Tipo', border: OutlineInputBorder(), isDense: true),
+                items: const [
+                  DropdownMenuItem(value: 'home', child: Text('Casa')),
+                  DropdownMenuItem(value: 'work', child: Text('Lavoro')),
+                  DropdownMenuItem(value: 'ignored', child: Text('Ignorata (non chiedere più)')),
+                ],
+                onChanged: (v) { if (v != null) setDlg(() => kind = v); },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annulla')),
+            ElevatedButton(
+              onPressed: () async {
+                final ssid = ctrl.text.replaceAll('"', '').trim();
+                if (ssid.isEmpty) return;
+                setState(() {
+                  _homeWifis.removeWhere((e) => e.toLowerCase() == ssid.toLowerCase());
+                  _workWifis.removeWhere((e) => e.toLowerCase() == ssid.toLowerCase());
+                  _ignoredWifis.removeWhere((e) => e.toLowerCase() == ssid.toLowerCase());
+                  if (kind == 'home') _homeWifis.add(ssid);
+                  else if (kind == 'work') _workWifis.add(ssid);
+                  else _ignoredWifis.add(ssid);
+                });
+                await _persistAndSyncNetworks();
+                if (ctx.mounted) Navigator.pop(ctx);
+              },
+              child: const Text('Salva'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _addBluetoothDialog() async {
+    final macCtrl = TextEditingController();
+    final nameCtrl = TextEditingController();
+    String kind = 'car';
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: const Text('Aggiungi dispositivo Bluetooth'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: nameCtrl,
+                decoration: const InputDecoration(labelText: 'Nome (es. Audi MMI)', border: OutlineInputBorder(), isDense: true),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: macCtrl,
+                textCapitalization: TextCapitalization.characters,
+                decoration: const InputDecoration(labelText: 'Indirizzo MAC (AA:BB:CC:DD:EE:FF)', border: OutlineInputBorder(), isDense: true),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                value: kind,
+                decoration: const InputDecoration(labelText: 'Tipo', border: OutlineInputBorder(), isDense: true),
+                items: const [
+                  DropdownMenuItem(value: 'car', child: Text('Auto')),
+                  DropdownMenuItem(value: 'ignored', child: Text('Ignorato (non chiedere più)')),
+                ],
+                onChanged: (v) { if (v != null) setDlg(() => kind = v); },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annulla')),
+            ElevatedButton(
+              onPressed: () async {
+                final mac = macCtrl.text.trim().toUpperCase();
+                final name = nameCtrl.text.trim();
+                if (mac.isEmpty) return;
+                setState(() {
+                  _carBtMacs.removeWhere((e) => e.toUpperCase() == mac);
+                  _ignoredBtMacs.removeWhere((e) => e.toUpperCase() == mac);
+                  if (kind == 'car') _carBtMacs.add(mac);
+                  else _ignoredBtMacs.add(mac);
+                  if (name.isNotEmpty) _btNames[mac] = name;
+                });
+                await _persistAndSyncNetworks();
+                if (ctx.mounted) Navigator.pop(ctx);
+              },
+              child: const Text('Salva'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _netBadge(String text, Color color) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+    decoration: BoxDecoration(color: color.withOpacity(0.12), borderRadius: BorderRadius.circular(8)),
+    child: Text(text, style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: color)),
+  );
+
+  Widget _buildMyWifiCard() {
+    final items = <Map<String, String>>[
+      ..._homeWifis.map((s) => {'ssid': s, 'type': 'home'}),
+      ..._workWifis.map((s) => {'ssid': s, 'type': 'work'}),
+      ..._ignoredWifis.map((s) => {'ssid': s, 'type': 'ignored'}),
+    ];
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.wifi, color: Colors.blue),
+                const SizedBox(width: 8),
+                const Expanded(child: Text('Le mie reti Wi-Fi', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15))),
+                TextButton.icon(onPressed: _addWifiDialog, icon: const Icon(Icons.add, size: 18), label: const Text('Aggiungi')),
+              ],
+            ),
+            const Text('Le reti in elenco vengono riconosciute in automatico e non saranno più richieste alla connessione.', style: TextStyle(fontSize: 12, color: Colors.black54)),
+            const SizedBox(height: 8),
+            if (items.isEmpty)
+              const Text('Nessuna rete Wi-Fi salvata.', style: TextStyle(color: Colors.grey, fontSize: 13))
+            else
+              ...items.map((it) {
+                final ssid = it['ssid']!;
+                final type = it['type']!;
+                final color = type == 'home' ? Colors.blue.shade700 : (type == 'work' ? Colors.teal.shade700 : Colors.grey.shade700);
+                final label = type == 'home' ? 'Casa' : (type == 'work' ? 'Lavoro' : 'Ignorata');
+                return ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(ssid, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  leading: _netBadge(label, color),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+                    onPressed: () async {
+                      setState(() {
+                        _homeWifis.removeWhere((e) => e.toLowerCase() == ssid.toLowerCase());
+                        _workWifis.removeWhere((e) => e.toLowerCase() == ssid.toLowerCase());
+                        _ignoredWifis.removeWhere((e) => e.toLowerCase() == ssid.toLowerCase());
+                      });
+                      await _persistAndSyncNetworks();
+                    },
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMyBluetoothCard() {
+    final items = <Map<String, String>>[
+      ..._carBtMacs.map((m) => {'mac': m.toUpperCase(), 'type': 'car'}),
+      ..._ignoredBtMacs.map((m) => {'mac': m.toUpperCase(), 'type': 'ignored'}),
+    ];
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.bluetooth, color: Colors.indigo),
+                const SizedBox(width: 8),
+                const Expanded(child: Text('I miei dispositivi Bluetooth', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15))),
+                TextButton.icon(onPressed: _addBluetoothDialog, icon: const Icon(Icons.add, size: 18), label: const Text('Aggiungi')),
+              ],
+            ),
+            const Text('I dispositivi in elenco non verranno più richiesti quando si connettono al telefono.', style: TextStyle(fontSize: 12, color: Colors.black54)),
+            const SizedBox(height: 8),
+            if (items.isEmpty)
+              const Text('Nessun dispositivo Bluetooth salvato.', style: TextStyle(color: Colors.grey, fontSize: 13))
+            else
+              ...items.map((it) {
+                final mac = it['mac']!;
+                final type = it['type']!;
+                final name = _btNames[mac] ?? '';
+                final color = type == 'car' ? Colors.indigo.shade700 : Colors.grey.shade700;
+                final label = type == 'car' ? 'Auto' : 'Ignorato';
+                return ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: _netBadge(label, color),
+                  title: Text(name.isNotEmpty ? name : mac, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  subtitle: name.isNotEmpty ? Text(mac, style: const TextStyle(fontSize: 11)) : null,
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+                    onPressed: () async {
+                      setState(() {
+                        _carBtMacs.removeWhere((e) => e.toUpperCase() == mac);
+                        _ignoredBtMacs.removeWhere((e) => e.toUpperCase() == mac);
+                      });
+                      await _persistAndSyncNetworks();
+                    },
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
   final List<int> _allowedRadii = [100, 300, 500, 1000];
 
   String get _maskedPlatePreview {
@@ -60,6 +326,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _plateController.text = prefs.getString('car_plate') ?? '';
       _wifiController.text = prefs.getString('home_wifi_ssid') ?? '';
       _btController.text = prefs.getString('car_bt_mac') ?? '';
+      _homeWifis = _parseCsv(prefs.getString('home_wifi_ssid'));
+      _workWifis = _parseCsv(prefs.getString('work_wifi_ssid'));
+      _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
+      _carBtMacs = _parseCsv(prefs.getString('car_bt_mac')).map((m) => m.toUpperCase()).toList();
+      _ignoredBtMacs = (prefs.getStringList('ignored_bt_macs') ?? []).map((m) => m.toUpperCase()).toList();
+      try {
+        final rawNames = prefs.getString('car_bt_names_json');
+        if (rawNames != null && rawNames.isNotEmpty) {
+          _btNames = Map<String, String>.from(json.decode(rawNames));
+        }
+        final legacyName = prefs.getString('car_bt_name');
+        if (legacyName != null && legacyName.isNotEmpty && _carBtMacs.isNotEmpty) {
+          _btNames.putIfAbsent(_carBtMacs.first, () => legacyName);
+        }
+      } catch (_) {}
     });
 
     try {
@@ -110,6 +391,17 @@ class _ProfileScreenState extends State<ProfileScreen> {
           if (remoteRadius != null && _allowedRadii.contains(remoteRadius)) _searchRadius = remoteRadius;
           if (remoteWifi != null) _wifiController.text = remoteWifi;
           if (remoteBt != null) _btController.text = remoteBt;
+          if (remoteWifi != null && remoteWifi.isNotEmpty) {
+            for (final s in _parseCsv(remoteWifi)) {
+              if (!_homeWifis.any((e) => e.toLowerCase() == s.toLowerCase())) _homeWifis.add(s);
+            }
+          }
+          if (remoteBt != null && remoteBt.isNotEmpty) {
+            for (final m in _parseCsv(remoteBt)) {
+              final u = m.toUpperCase();
+              if (!_carBtMacs.any((e) => e.toUpperCase() == u)) _carBtMacs.add(u);
+            }
+          }
         });
       }
     } catch (_) {}
@@ -488,21 +780,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ),
           ),
           const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(14),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Sensori & Automazione', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 12),
-                  TextField(controller: _wifiController, decoration: const InputDecoration(labelText: 'Wi-Fi Fisse Casa/Lavoro (separate da virgola)', border: OutlineInputBorder(), isDense: true)),
-                  const SizedBox(height: 10),
-                  TextField(controller: _btController, decoration: const InputDecoration(labelText: 'MAC Bluetooth Auto', border: OutlineInputBorder(), isDense: true)),
-                ],
-              ),
-            ),
-          ),
+          _buildMyWifiCard(),
+          const SizedBox(height: 12),
+          _buildMyBluetoothCard(),
           const SizedBox(height: 20),
           SizedBox(
             width: double.infinity,

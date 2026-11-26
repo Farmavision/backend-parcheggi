@@ -147,6 +147,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var lastPromptedWifiSsid: String? = null
     private var promptShownForCurrentSession = false
     private var armedForDeparturePrompt = true
+    private var graceRearmRunnable: Runnable? = null
 
     private var hasStepHardware = false
     private var lastStepCounterHardwareVal: Int? = null
@@ -312,6 +313,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             unregisterReceiver(internalReceiver)
             unregisterReceiver(systemReceiver)
             networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+            cancelGracePeriodRearm()
             geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID))
         } catch (_: Exception) {}
         super.onDestroy()
@@ -365,7 +367,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             "onFixedWifi" to isOnFixedWifi(),
             "anchoredSteps" to anchoredStepCount,
             "nPassi" to getNPassi(),
-            "t0PassiSec" to getT0PassiSec()
+            "t0PassiSec" to getT0PassiSec(),
+            "deltaGpsM" to getDeltaGpsMeters().toInt(),
+            "tGraziaMin" to getTGraziaMin()
         )
     }
 
@@ -395,6 +399,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         (args["workWifiSsid"] as? String)?.trim()?.let {
             val clean = it.replace("\"", "")
             if (clean.isNotEmpty()) ed.putString("work_wifi_ssid", clean)
+        }
+        (args["deltaGpsM"] as? Number)?.toInt()?.let { ed.putInt("delta_gps_m", it.coerceIn(50, 500)) }
+        (args["tGraziaMin"] as? Number)?.toInt()?.let { ed.putInt("t_grazia_min", it.coerceIn(1, 60)) }
+        if (args.containsKey("ignoredWifis")) {
+            val rawList = args["ignoredWifis"] as? List<*>
+            val cleanSet = rawList?.mapNotNull { (it as? String)?.replace("\"", "")?.trim()?.takeIf { s -> s.isNotEmpty() } }?.toSet() ?: emptySet()
+            ed.putStringSet("ignored_wifis", cleanSet)
         }
         if (args["clearWorkWifi"] == true) {
             ed.remove("work_wifi_ssid")
@@ -443,10 +454,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 ed.putString("parked_source", if (isSim) "sim" else "local")
                 if (!hadBefore || isSim || coordsChanged) {
                     lastMovingStateMs = 0L
-                    promptShownForCurrentSession = false
                     passedThroughStall = false
                     armedForDeparturePrompt = true
                     ed.putBoolean("prompt_release", false)
+                    scheduleGracePeriodRearm()
                     if (isSim) {
                         isWalking = false
                         boutStepsSinceStationary = 0
@@ -513,6 +524,36 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun getGeofenceRadiusMeters(): Float = prefs.getInt("geofence_radius_m", 100).coerceIn(20, 2000).toFloat()
     private fun getNPassi(): Int = prefs.getInt("n_passi", 50).coerceIn(5, 500)
     private fun getT0PassiSec(): Int = prefs.getInt("t0_passi_sec", 30).coerceIn(5, 300)
+    private fun getDeltaGpsMeters(): Float = prefs.getInt("delta_gps_m", 150).coerceIn(50, 500).toFloat()
+    private fun getTGraziaMin(): Int = prefs.getInt("t_grazia_min", 5).coerceIn(1, 60)
+
+    private fun splitCsv(raw: String?): MutableList<String> {
+        if (raw.isNullOrBlank()) return mutableListOf()
+        return raw.split(",").map { it.replace("\"", "").trim() }.filter { it.isNotEmpty() }.toMutableList()
+    }
+
+    private fun cancelGracePeriodRearm() {
+        graceRearmRunnable?.let { handler.removeCallbacks(it) }
+        graceRearmRunnable = null
+    }
+
+    private fun scheduleGracePeriodRearm() {
+        cancelGracePeriodRearm()
+        promptShownForCurrentSession = true
+        val delayMs = getTGraziaMin() * 60_000L
+        graceRearmRunnable = Runnable {
+            graceRearmRunnable = null
+            if (hasActiveParking()) {
+                promptShownForCurrentSession = false
+                armedForDeparturePrompt = true
+                prefs.edit().putBoolean("prompt_release", false).apply()
+                if (userActivityState == STATE_MOVING && !isOnFixedWifi()) {
+                    updateGeofenceApproachMonitor(triggerImmediateCheck = true)
+                }
+            }
+        }
+        handler.postDelayed(graceRearmRunnable!!, delayMs)
+    }
 
     private fun isAnchoredWithoutFixedWifi(): Boolean {
         return !isOnFixedWifi() && anchoredStationaryState != null &&
@@ -834,15 +875,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun isHomeWifi(ssid: String?): Boolean {
-        if (ssid.isNullOrBlank()) return false
-        val home = prefs.getString("home_wifi_ssid", "")?.replace("\"", "")?.trim() ?: ""
-        return home.isNotEmpty() && home.equals(ssid, ignoreCase = true)
+        val clean = ssid?.replace("\"", "")?.trim() ?: return false
+        if (clean.isEmpty()) return false
+        return splitCsv(prefs.getString("home_wifi_ssid", "")).any { it.equals(clean, ignoreCase = true) }
     }
 
     private fun isWorkWifi(ssid: String?): Boolean {
-        if (ssid.isNullOrBlank()) return false
-        val work = prefs.getString("work_wifi_ssid", "")?.replace("\"", "")?.trim() ?: ""
-        return work.isNotEmpty() && work.equals(ssid, ignoreCase = true)
+        val clean = ssid?.replace("\"", "")?.trim() ?: return false
+        if (clean.isEmpty()) return false
+        return splitCsv(prefs.getString("work_wifi_ssid", "")).any { it.equals(clean, ignoreCase = true) }
     }
 
     private fun isOnFixedWifi(): Boolean {
@@ -980,7 +1021,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (newState == STATE_IN_CAR && isCarBtConnected && hasActiveParking()) {
             stopGeofenceApproachMonitor()
             completeAutomaticVehicleDeparture()
-        } else if (newState == STATE_MOVING && !isOnFixedWifi() && hasActiveParking() && !promptShownForCurrentSession) {
+        } else if (newState == STATE_MOVING && !isOnFixedWifi() && hasActiveParking()) {
             updateGeofenceApproachMonitor(triggerImmediateCheck = true)
         } else {
             stopGeofenceApproachMonitor()
@@ -1161,14 +1202,29 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             triggerReleaseConfirmationPrompt()
             return
         }
-        if (userActivityState == STATE_MOVING && !isOnFixedWifi() && !promptShownForCurrentSession) {
-            val desired = if (dist <= r + 350f) 2 else 1
+        val accComp = kotlin.math.min(loc.accuracy, 100f)
+        val dEff = max(0f, dist - accComp)
+        if (!isOnFixedWifi() && promptShownForCurrentSession && dist >= r + 50f && dEff >= r + 20f) {
+            cancelGracePeriodRearm()
+            promptShownForCurrentSession = false
+            armedForDeparturePrompt = true
+            prefs.edit().putBoolean("prompt_release", false).apply()
+        }
+        if (userActivityState == STATE_MOVING && !isOnFixedWifi()) {
+            val delta = getDeltaGpsMeters()
+            val desired = if (promptShownForCurrentSession) {
+                1
+            } else if (approachMonitorMode == 2) {
+                if (dEff > r + delta + 30f) 1 else 2
+            } else {
+                if (dEff <= r + delta) 2 else 1
+            }
             if (desired != approachMonitorMode) applyApproachLocationRequest(desired)
         }
     }
 
     private fun updateGeofenceApproachMonitor(triggerImmediateCheck: Boolean = false) {
-        if (!hasActiveParking() || isOnFixedWifi() || promptShownForCurrentSession || userActivityState != STATE_MOVING) {
+        if (!hasActiveParking() || isOnFixedWifi() || userActivityState != STATE_MOVING) {
             stopGeofenceApproachMonitor(); return
         }
         val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
@@ -1192,7 +1248,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             } catch (_: Exception) {}
         }
         val r = getGeofenceRadiusMeters()
-        val desired = if (lastDistanceFromCarMeters == null || lastDistanceFromCarMeters!! <= r + 350f) 2 else 1
+        val delta = getDeltaGpsMeters()
+        val desired = if (promptShownForCurrentSession) 1 else if (lastDistanceFromCarMeters == null || lastDistanceFromCarMeters!! <= r + delta) 2 else 1
         if (approachMonitorMode != desired) applyApproachLocationRequest(desired)
     }
 
@@ -1256,6 +1313,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (tr == Geofence.GEOFENCE_TRANSITION_EXIT) {
             val d = lastDistanceFromCarMeters
             if (promptShownForCurrentSession && (d == null || d >= getGeofenceRadiusMeters() + 50f)) {
+                cancelGracePeriodRearm()
                 promptShownForCurrentSession = false
                 armedForDeparturePrompt = true
                 prefs.edit().putBoolean("prompt_release", false).apply()
@@ -1288,6 +1346,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
         passedThroughStall = false
+        scheduleGracePeriodRearm()
+        if (userActivityState == STATE_MOVING && !isOnFixedWifi() && hasActiveParking()) {
+            applyApproachLocationRequest(1)
+        }
         persistAndBroadcastState(forceNotification = false)
     }
 
@@ -1327,6 +1389,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             .putBoolean("prompt_in_car", false)
             .putBoolean("prompt_release", false)
             .apply()
+        cancelGracePeriodRearm()
         promptShownForCurrentSession = false
         passedThroughStall = false
         try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
@@ -1401,15 +1464,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         stopNoStepGpsWindow()
         updateDynamicAccelerometerRegistration(shouldListen = false)
         cancelReleasePromptNotification()
-        val ed = prefs.edit()
-            .putString(key, clean)
-            .putString("ui_wifi_ssid", clean)
-            .putString("user_state", targetState)
-            .putString("anchored_place_state", targetState)
-        if (prefs.getString(otherKey, "").equals(clean, ignoreCase = true)) {
-            ed.remove(otherKey)
-        }
-        ed.apply()
+        val targetList = splitCsv(prefs.getString(key, ""))
+        if (targetList.none { it.equals(clean, ignoreCase = true) }) targetList.add(clean)
+        val otherList = splitCsv(prefs.getString(otherKey, "")).filter { !it.equals(clean, ignoreCase = true) }
+        val ignSet = (prefs.getStringSet("ignored_wifis", emptySet()) ?: emptySet()).filter { !it.equals(clean, ignoreCase = true) }.toSet()
+        prefs.edit()
+            .putString(key, targetList.joinToString(","))
+            .putString(otherKey, otherList.joinToString(","))
+            .putStringSet("ignored_wifis", ignSet)
+            .apply()
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(WIFI_PROMPT_NOTIF_ID)
         } catch (_: Exception) {}

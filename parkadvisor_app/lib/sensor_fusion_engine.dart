@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -54,6 +55,7 @@ class SensorFusionEngine extends ChangeNotifier {
   int nPassi = 50;
   int t0PassiSec = 30;
   int deltaGpsMeters = 150;
+  int tGraziaMin = 5;
   int anchoredPendingSteps = 0;
   bool isHighAccuracyGpsActive = false;
   int gpsWindowRemainingSec = 0;
@@ -152,11 +154,35 @@ class SensorFusionEngine extends ChangeNotifier {
     );
   }
 
+  List<String> _splitCsv(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return [];
+    return raw.split(',').map((e) => e.replaceAll('"', '').trim()).where((e) => e.isNotEmpty).toList();
+  }
+
+  bool _csvContains(String? raw, String item) {
+    final target = item.replaceAll('"', '').trim().toLowerCase();
+    if (target.isEmpty) return false;
+    return _splitCsv(raw).any((e) => e.toLowerCase() == target);
+  }
+
+  String _csvAdd(String? raw, String item) {
+    final clean = item.replaceAll('"', '').trim();
+    final list = _splitCsv(raw);
+    if (clean.isNotEmpty && !list.any((e) => e.toLowerCase() == clean.toLowerCase())) {
+      list.add(clean);
+    }
+    return list.join(',');
+  }
+
+  String _csvRemove(String? raw, String item) {
+    final target = item.replaceAll('"', '').trim().toLowerCase();
+    return _splitCsv(raw).where((e) => e.toLowerCase() != target).join(',');
+  }
+
   bool get isOnKnownPrivateWifi {
     if (currentConnectedWifiSsid == null || currentConnectedWifiSsid!.isEmpty) return false;
     final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-    return (homeWifiSsid != null && homeWifiSsid!.isNotEmpty && clean.toLowerCase() == homeWifiSsid!.toLowerCase()) ||
-        (workWifiSsid != null && workWifiSsid!.isNotEmpty && clean.toLowerCase() == workWifiSsid!.toLowerCase());
+    return _csvContains(homeWifiSsid, clean) || _csvContains(workWifiSsid, clean);
   }
 
   UserActivityState _parseNativeState(String? code) {
@@ -228,6 +254,7 @@ class SensorFusionEngine extends ChangeNotifier {
     if (snap['t0PassiSec'] != null) t0PassiSec = (snap['t0PassiSec'] as num).toInt();
     if (snap['geofenceRadiusM'] != null) geofenceRadiusMeters = (snap['geofenceRadiusM'] as num).toDouble();
     if (snap['deltaGpsM'] != null) deltaGpsMeters = (snap['deltaGpsM'] as num).toInt();
+    if (snap['tGraziaMin'] != null) tGraziaMin = (snap['tGraziaMin'] as num).toInt();
     final nativeDist = (snap['distanceFromCarM'] as num?)?.toDouble();
     if (nativeDist != null) distanceFromCarMeters = nativeDist;
     else if (snap['hasParked'] == false) distanceFromCarMeters = null;
@@ -240,7 +267,7 @@ class SensorFusionEngine extends ChangeNotifier {
 
     if (_nativeOnFixedWifi && isOnKnownPrivateWifi) {
       final clean = currentConnectedWifiSsid!.replaceAll('"', '').trim();
-      final isHome = homeWifiSsid != null && homeWifiSsid!.isNotEmpty && clean.toLowerCase() == homeWifiSsid!.toLowerCase();
+      final isHome = _csvContains(homeWifiSsid, clean);
       userActivityState = isHome ? UserActivityState.atHome : UserActivityState.atWork;
       isHighAccuracyGpsActive = false;
       gpsWindowRemainingSec = 0;
@@ -294,6 +321,8 @@ class SensorFusionEngine extends ChangeNotifier {
         't0PassiSec': t0PassiSec,
         'geofenceRadiusM': geofenceRadiusMeters.round(),
         'deltaGpsM': deltaGpsMeters,
+        'tGraziaMin': tGraziaMin,
+        'ignoredWifis': _ignoredWifis,
         'parkedLat': parkedLat,
         'parkedLon': parkedLon,
         if (isSimulation) 'isSimulation': true,
@@ -351,8 +380,8 @@ class SensorFusionEngine extends ChangeNotifier {
       nPassi = (prefs.getInt('n_passi') ?? 50).clamp(5, 500);
       t0PassiSec = (prefs.getInt('t0_passi_sec') ?? 30).clamp(5, 300);
       geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
-    deltaGpsMeters = (prefs.getInt('delta_gps_m') ?? 150).clamp(50, 500);
       deltaGpsMeters = (prefs.getInt('delta_gps_m') ?? 150).clamp(50, 500);
+      tGraziaMin = (prefs.getInt('t_grazia_min') ?? 5).clamp(1, 60);
       _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
       _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
       if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
@@ -456,14 +485,23 @@ class SensorFusionEngine extends ChangeNotifier {
   }
 
   Future<void> setCarBluetoothDevice(String mac, String name) async {
-    targetCarBluetoothMac = mac.toUpperCase();
+    final upper = mac.trim().toUpperCase();
+    targetCarBluetoothMac = _csvAdd(targetCarBluetoothMac, upper);
     targetCarBluetoothName = name;
+    _ignoredBtMacs.removeWhere((m) => m.toUpperCase() == upper);
     isCarBtConnected = true;
     userActivityState = UserActivityState.inCar;
     isHighAccuracyGpsActive = false;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('car_bt_mac', targetCarBluetoothMac!);
     await prefs.setString('car_bt_name', name);
+    await prefs.setStringList('ignored_bt_macs', _ignoredBtMacs);
+    try {
+      final rawMap = prefs.getString('car_bt_names_json');
+      final Map<String, dynamic> names = rawMap != null ? Map<String, dynamic>.from(json.decode(rawMap)) : {};
+      if (name.trim().isNotEmpty) names[upper] = name.trim();
+      await prefs.setString('car_bt_names_json', json.encode(names));
+    } catch (_) {}
     await _pushConfigToNative(forceUserState: 'inCar');
     if (isCarParked) {
       await _triggerCarReleased();
@@ -484,10 +522,10 @@ class SensorFusionEngine extends ChangeNotifier {
 
   Future<void> saveWifiAsHome(String ssid) async {
     final clean = ssid.replaceAll('"', '').trim();
-    homeWifiSsid = clean;
-    if (workWifiSsid != null && workWifiSsid!.toLowerCase() == clean.toLowerCase()) {
-      workWifiSsid = null;
-    }
+    homeWifiSsid = _csvAdd(homeWifiSsid, clean);
+    final updatedWork = _csvRemove(workWifiSsid, clean);
+    workWifiSsid = updatedWork.isEmpty ? null : updatedWork;
+    _ignoredWifis.removeWhere((w) => w.toLowerCase() == clean.toLowerCase());
     currentConnectedWifiSsid = clean;
     _nativeOnFixedWifi = true;
     userActivityState = UserActivityState.atHome;
@@ -495,10 +533,13 @@ class SensorFusionEngine extends ChangeNotifier {
     gpsWindowRemainingSec = 0;
     _pendingWifiConfirmationSsid = null;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('home_wifi_ssid', clean);
-    if (workWifiSsid == null) await prefs.remove('work_wifi_ssid');
+    await prefs.setString('home_wifi_ssid', homeWifiSsid!);
+    if (workWifiSsid == null) { await prefs.remove('work_wifi_ssid'); } else { await prefs.setString('work_wifi_ssid', workWifiSsid!); }
+    await prefs.setStringList('ignored_wifis', _ignoredWifis);
     await _bgServiceChannel.invokeMethod('syncConfigToNative', {
-      'homeWifiSsid': clean,
+      'homeWifiSsid': homeWifiSsid ?? '',
+      'workWifiSsid': workWifiSsid ?? '',
+      'ignoredWifis': _ignoredWifis,
       if (workWifiSsid == null) 'clearWorkWifi': true,
       'forceUserState': 'atHome',
     });
@@ -508,10 +549,10 @@ class SensorFusionEngine extends ChangeNotifier {
 
   Future<void> saveWifiAsWork(String ssid) async {
     final clean = ssid.replaceAll('"', '').trim();
-    workWifiSsid = clean;
-    if (homeWifiSsid != null && homeWifiSsid!.toLowerCase() == clean.toLowerCase()) {
-      homeWifiSsid = null;
-    }
+    workWifiSsid = _csvAdd(workWifiSsid, clean);
+    final updatedHome = _csvRemove(homeWifiSsid, clean);
+    homeWifiSsid = updatedHome.isEmpty ? null : updatedHome;
+    _ignoredWifis.removeWhere((w) => w.toLowerCase() == clean.toLowerCase());
     currentConnectedWifiSsid = clean;
     _nativeOnFixedWifi = true;
     userActivityState = UserActivityState.atWork;
@@ -519,10 +560,13 @@ class SensorFusionEngine extends ChangeNotifier {
     gpsWindowRemainingSec = 0;
     _pendingWifiConfirmationSsid = null;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('work_wifi_ssid', clean);
-    if (homeWifiSsid == null) await prefs.remove('home_wifi_ssid');
+    await prefs.setString('work_wifi_ssid', workWifiSsid!);
+    if (homeWifiSsid == null) { await prefs.remove('home_wifi_ssid'); } else { await prefs.setString('home_wifi_ssid', homeWifiSsid!); }
+    await prefs.setStringList('ignored_wifis', _ignoredWifis);
     await _bgServiceChannel.invokeMethod('syncConfigToNative', {
-      'workWifiSsid': clean,
+      'workWifiSsid': workWifiSsid ?? '',
+      'homeWifiSsid': homeWifiSsid ?? '',
+      'ignoredWifis': _ignoredWifis,
       if (homeWifiSsid == null) 'clearHomeWifi': true,
       'forceUserState': 'atWork',
     });
@@ -532,11 +576,15 @@ class SensorFusionEngine extends ChangeNotifier {
 
   Future<void> ignoreWifi(String ssid) async {
     final clean = ssid.replaceAll('"', '').trim();
-    if (!_ignoredWifis.contains(clean)) {
+    if (clean.isEmpty) return;
+    if (!_ignoredWifis.any((w) => w.toLowerCase() == clean.toLowerCase())) {
       _ignoredWifis.add(clean);
       final prefs = await SharedPreferences.getInstance();
       await prefs.setStringList('ignored_wifis', _ignoredWifis);
       _pendingWifiConfirmationSsid = null;
+      try {
+        await _bgServiceChannel.invokeMethod('syncConfigToNative', {'ignoredWifis': _ignoredWifis});
+      } catch (_) {}
     }
   }
 
