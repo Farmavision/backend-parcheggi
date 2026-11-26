@@ -145,7 +145,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     @Volatile private var lastCallbackWifiSsid: String? = null
     @Volatile private var pendingUnknownWifiSsid: String? = null
     private var lastPromptedWifiSsid: String? = null
+    // [DUAL_TRIGGER_HOME_EXIT_V1]
     private var promptShownForCurrentSession = false
+    private var homeExitPromptShownForSession = false
+    private var lastHomeExitPromptMs = 0L
+    private var awaitingGeofenceExitBeforeTrigger2 = false
+    private var wasOutsideGeofenceAfterHomeExit = false
+    private var canSpatialRearmOnExit = false
     private var armedForDeparturePrompt = true
     private var graceRearmRunnable: Runnable? = null
 
@@ -456,8 +462,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                     lastMovingStateMs = 0L
                     passedThroughStall = false
                     armedForDeparturePrompt = true
+                    resetHomeExitSessionFlags()
                     ed.putBoolean("prompt_release", false)
-                    scheduleGracePeriodRearm()
+                    scheduleGracePeriodRearm(initiallyInsideGeofence = true)
                     if (isSim) {
                         isWalking = false
                         boutStepsSinceStationary = 0
@@ -474,7 +481,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 ed.remove("parked_source")
                 ed.putBoolean("prompt_release", false)
                 lastDistanceFromCarMeters = null
+                cancelGracePeriodRearm()
                 promptShownForCurrentSession = false
+                canSpatialRearmOnExit = false
+                resetHomeExitSessionFlags()
                 passedThroughStall = false
                 stopGeofenceApproachMonitor()
                 cancelPromptNotification()
@@ -491,6 +501,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (args["dismissReleaseNotif"] == true) {
             ed.putBoolean("prompt_release", false)
             cancelPromptNotification()
+            if (hasActiveParking()) {
+                awaitingGeofenceExitBeforeTrigger2 = false
+                val inside = lastDistanceFromCarMeters != null && lastDistanceFromCarMeters!! <= getGeofenceRadiusMeters()
+                scheduleGracePeriodRearm(initiallyInsideGeofence = inside)
+            }
         }
         val forceRemoteSync = args["syncRemoteSpot"] == true
 
@@ -537,14 +552,47 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         graceRearmRunnable = null
     }
 
-    private fun scheduleGracePeriodRearm() {
+    private fun resetHomeExitSessionFlags() {
+        homeExitPromptShownForSession = false
+        lastHomeExitPromptMs = 0L
+        awaitingGeofenceExitBeforeTrigger2 = false
+        wasOutsideGeofenceAfterHomeExit = false
+    }
+
+    private fun triggerHomeExitReleasePrompt() {
+        if (isOnFixedWifi() || !hasActiveParking()) return
+        homeExitPromptShownForSession = true
+        lastHomeExitPromptMs = System.currentTimeMillis()
+        val d = lastDistanceFromCarMeters
+        val locFresh = lastKnownUserLocation != null && (lastHomeExitPromptMs - lastKnownUserLocation!!.time) < 20_000L
+        if (locFresh && d != null) {
+            if (d <= getGeofenceRadiusMeters()) {
+                awaitingGeofenceExitBeforeTrigger2 = true
+                wasOutsideGeofenceAfterHomeExit = false
+            } else {
+                awaitingGeofenceExitBeforeTrigger2 = false
+                wasOutsideGeofenceAfterHomeExit = true
+            }
+        } else {
+            awaitingGeofenceExitBeforeTrigger2 = false
+            wasOutsideGeofenceAfterHomeExit = false
+        }
+        prefs.edit().putBoolean("prompt_release", true).apply()
+        cancelPromptNotification()
+        showReleasePromptNotification()
+        persistAndBroadcastState(forceNotification = true)
+    }
+
+    private fun scheduleGracePeriodRearm(initiallyInsideGeofence: Boolean = true) {
         cancelGracePeriodRearm()
         promptShownForCurrentSession = true
+        canSpatialRearmOnExit = initiallyInsideGeofence
         val delayMs = getTGraziaMin() * 60_000L
         graceRearmRunnable = Runnable {
             graceRearmRunnable = null
             if (hasActiveParking()) {
                 promptShownForCurrentSession = false
+                awaitingGeofenceExitBeforeTrigger2 = false
                 armedForDeparturePrompt = true
                 prefs.edit().putBoolean("prompt_release", false).apply()
                 if (userActivityState == STATE_MOVING && !isOnFixedWifi()) {
@@ -737,13 +785,23 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             anchoredStepResetRunnable?.let { handler.removeCallbacks(it) }
             val threshold = getNPassi()
             if (anchoredStepCount >= threshold) {
+                val shouldTriggerHomeExit = hasActiveParking() && !homeExitPromptShownForSession
                 anchoredStepResetRunnable = null
                 anchoredStepCount = 0
                 anchoredStationaryState = null
                 recentWindowSteps = threshold
                 isWalking = true
+                if (shouldTriggerHomeExit) {
+                    cancelGracePeriodRearm()
+                    promptShownForCurrentSession = false
+                    homeExitPromptShownForSession = true
+                    lastHomeExitPromptMs = now
+                }
                 scheduleWalkStopTimeout()
                 evaluateNoFixedWifiAlgorithm()
+                if (shouldTriggerHomeExit) {
+                    triggerHomeExitReleasePrompt()
+                }
             } else {
                 anchoredStepResetRunnable = Runnable {
                     anchoredStepResetRunnable = null
@@ -925,13 +983,18 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             currentSpeedKmh = 0f
             stopNoStepGpsWindow()
             updateDynamicAccelerometerRegistration(shouldListen = false)
+            prefs.edit().putBoolean("prompt_release", false).apply()
             cancelReleasePromptNotification()
 
-            if (promptShownForCurrentSession && homeRearmRunnable == null) {
+            if ((promptShownForCurrentSession || homeExitPromptShownForSession || graceRearmRunnable != null) && homeRearmRunnable == null) {
                 homeRearmRunnable = Runnable {
                     homeRearmRunnable = null
                     if (isOnFixedWifi()) {
+                        cancelGracePeriodRearm()
                         promptShownForCurrentSession = false
+                        canSpatialRearmOnExit = false
+                        resetHomeExitSessionFlags()
+                        prefs.edit().putBoolean("prompt_release", false).apply()
                     }
                 }
                 handler.postDelayed(homeRearmRunnable!!, 30_000L)
@@ -1195,24 +1258,45 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             completeAutomaticVehicleDeparture(); return
         }
         val r = getGeofenceRadiusMeters()
+        val nowMs = System.currentTimeMillis()
+        val inHomeExitAntiOverlap = homeExitPromptShownForSession && (nowMs - lastHomeExitPromptMs) < 15_000L
+
+        if (dist <= r) {
+            canSpatialRearmOnExit = true
+            if (inHomeExitAntiOverlap && !wasOutsideGeofenceAfterHomeExit) {
+                awaitingGeofenceExitBeforeTrigger2 = true
+            }
+        } else {
+            if (homeExitPromptShownForSession && !wasOutsideGeofenceAfterHomeExit) {
+                wasOutsideGeofenceAfterHomeExit = true
+            }
+            if (awaitingGeofenceExitBeforeTrigger2 && dist >= r + 20f) {
+                awaitingGeofenceExitBeforeTrigger2 = false
+            }
+        }
+
         val recentMove = (userActivityState == STATE_MOVING) ||
-            (userActivityState == STATE_STILL && (System.currentTimeMillis() - lastMovingStateMs) < 25_000L)
-        if (!isOnFixedWifi() && !promptShownForCurrentSession && recentMove && dist <= r) {
+            (userActivityState == STATE_STILL && (nowMs - lastMovingStateMs) < 25_000L)
+        val canFireGeofenceTrigger = !promptShownForCurrentSession &&
+            !inHomeExitAntiOverlap &&
+            !awaitingGeofenceExitBeforeTrigger2
+        if (!isOnFixedWifi() && canFireGeofenceTrigger && recentMove && dist <= r) {
             stopGeofenceApproachMonitor()
             triggerReleaseConfirmationPrompt()
             return
         }
         val accComp = kotlin.math.min(loc.accuracy, 100f)
         val dEff = max(0f, dist - accComp)
-        if (!isOnFixedWifi() && promptShownForCurrentSession && dist >= r + 50f && dEff >= r + 20f) {
+        if (!isOnFixedWifi() && promptShownForCurrentSession && canSpatialRearmOnExit && dist >= r + 50f && dEff >= r + 20f) {
             cancelGracePeriodRearm()
             promptShownForCurrentSession = false
+            awaitingGeofenceExitBeforeTrigger2 = false
             armedForDeparturePrompt = true
             prefs.edit().putBoolean("prompt_release", false).apply()
         }
         if (userActivityState == STATE_MOVING && !isOnFixedWifi()) {
             val delta = getDeltaGpsMeters()
-            val desired = if (promptShownForCurrentSession) {
+            val desired = if (promptShownForCurrentSession || awaitingGeofenceExitBeforeTrigger2) {
                 1
             } else if (approachMonitorMode == 2) {
                 if (dEff > r + delta + 30f) 1 else 2
@@ -1241,7 +1325,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                     .addOnSuccessListener { loc ->
                         if (loc != null) {
                             lastKnownUserLocation = loc; evaluateDistanceToParkedCar(loc)
-                        } else if (prefs.getString("parked_source", "") == "sim" && !promptShownForCurrentSession && userActivityState == STATE_MOVING) {
+                        } else if (prefs.getString("parked_source", "") == "sim" &&
+                            !promptShownForCurrentSession &&
+                            !awaitingGeofenceExitBeforeTrigger2 &&
+                            !(homeExitPromptShownForSession && (System.currentTimeMillis() - lastHomeExitPromptMs) < 15_000L) &&
+                            userActivityState == STATE_MOVING) {
                             stopGeofenceApproachMonitor(); triggerReleaseConfirmationPrompt()
                         }
                     }
@@ -1312,7 +1400,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
         if (tr == Geofence.GEOFENCE_TRANSITION_EXIT) {
             val d = lastDistanceFromCarMeters
-            if (promptShownForCurrentSession && (d == null || d >= getGeofenceRadiusMeters() + 50f)) {
+            if (awaitingGeofenceExitBeforeTrigger2 && (d == null || d >= getGeofenceRadiusMeters() + 20f)) {
+                awaitingGeofenceExitBeforeTrigger2 = false
+            }
+            if (homeExitPromptShownForSession && !wasOutsideGeofenceAfterHomeExit) {
+                wasOutsideGeofenceAfterHomeExit = true
+            }
+            if (promptShownForCurrentSession && canSpatialRearmOnExit && (d == null || d >= getGeofenceRadiusMeters() + 50f)) {
                 cancelGracePeriodRearm()
                 promptShownForCurrentSession = false
                 armedForDeparturePrompt = true
@@ -1320,7 +1414,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             }
             return
         }
-        if (!promptShownForCurrentSession && (userActivityState == STATE_MOVING || userActivityState == STATE_STILL)) {
+        val nowMs = System.currentTimeMillis()
+        val inHomeExitAntiOverlap = homeExitPromptShownForSession && (nowMs - lastHomeExitPromptMs) < 15_000L
+        canSpatialRearmOnExit = true
+        if (inHomeExitAntiOverlap && !wasOutsideGeofenceAfterHomeExit) {
+            awaitingGeofenceExitBeforeTrigger2 = true
+            return
+        }
+        if (!promptShownForCurrentSession && !inHomeExitAntiOverlap && !awaitingGeofenceExitBeforeTrigger2 &&
+            (userActivityState == STATE_MOVING || userActivityState == STATE_STILL)) {
             triggerReleaseConfirmationPrompt()
             if (userActivityState == STATE_MOVING) applyApproachLocationRequest(1) else stopGeofenceApproachMonitor()
         }
@@ -1328,8 +1430,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun triggerReleaseConfirmationPrompt() {
         if (isOnFixedWifi()) return
+        val wasAlreadyPending = prefs.getBoolean("prompt_release", false)
         promptShownForCurrentSession = true
+        canSpatialRearmOnExit = true
+        if (wasAlreadyPending) {
+            prefs.edit().putBoolean("prompt_release", false).apply()
+            persistAndBroadcastState(forceNotification = false)
+        }
         prefs.edit().putBoolean("prompt_release", true).apply()
+        cancelPromptNotification()
         showReleasePromptNotification()
         persistAndBroadcastState(forceNotification = true)
     }
@@ -1346,7 +1455,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
         passedThroughStall = false
-        scheduleGracePeriodRearm()
+        awaitingGeofenceExitBeforeTrigger2 = false
+        val currentlyInside = lastDistanceFromCarMeters != null &&
+            lastDistanceFromCarMeters!! <= getGeofenceRadiusMeters()
+        scheduleGracePeriodRearm(initiallyInsideGeofence = currentlyInside)
         if (userActivityState == STATE_MOVING && !isOnFixedWifi() && hasActiveParking()) {
             applyApproachLocationRequest(1)
         }
@@ -1386,11 +1498,14 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         prefs.edit()
             .remove("parked_lat")
             .remove("parked_lon")
+            .remove("parked_source")
             .putBoolean("prompt_in_car", false)
             .putBoolean("prompt_release", false)
             .apply()
         cancelGracePeriodRearm()
         promptShownForCurrentSession = false
+        canSpatialRearmOnExit = false
+        resetHomeExitSessionFlags()
         passedThroughStall = false
         try { geofencingClient.removeGeofences(listOf(GEOFENCE_REQ_ID)) } catch (_: Exception) {}
     }
@@ -1653,8 +1768,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                                 if (ch) {
                                     prefs.edit().putString("parked_lat", lat.toString()).putString("parked_lon", lon.toString())
                                         .putString("parked_source", "remote").putBoolean("prompt_release", false).apply()
-                                    promptShownForCurrentSession = false; passedThroughStall = false; armedForDeparturePrompt = true
+                                    passedThroughStall = false; armedForDeparturePrompt = true
+                                    resetHomeExitSessionFlags()
+                                    scheduleGracePeriodRearm(initiallyInsideGeofence = true)
                                     syncNativeGeofenceWithActiveParking()
+                                    if (isOnFixedWifi()) evaluateConnectedWifiState()
                                     updateGeofenceApproachMonitor(triggerImmediateCheck = true)
                                     persistAndBroadcastState(forceNotification = false)
                                 }
