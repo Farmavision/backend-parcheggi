@@ -207,7 +207,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var lastMovingStateMs: Long = 0L
     // [RELEASE_CONFLICT_FIX_V1]
     private var lastRemoteSpotSyncMs: Long = 0L
+    // [LEAVING_ETA_LIVE_V1]
     private var lastLocalReleaseMs: Long = 0L
+    private var isLeavingSoonActive: Boolean = false
+    private var lastSentEtaMinutes: Int = -1
     private var activeRingtone: android.media.Ringtone? = null
 
     private var gpsWindowTickRunnable: Runnable? = null
@@ -526,6 +529,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 ed.remove("parked_source")
                 ed.putBoolean("prompt_release", false)
                 lastLocalReleaseMs = System.currentTimeMillis()
+                isLeavingSoonActive = false
+                lastSentEtaMinutes = -1
                 lastDistanceFromCarMeters = null
                 cancelGracePeriodRearm()
                 promptShownForCurrentSession = false
@@ -543,6 +548,17 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
         if (args["clearPromptRelease"] == true) {
             ed.putBoolean("prompt_release", false)
+        }
+        if (args["confirmLeavingSoon"] == true) {
+            ed.putBoolean("prompt_release", false)
+            cancelPromptNotification()
+            cancelGracePeriodRearm()
+            isLeavingSoonActive = true
+            promptShownForCurrentSession = true
+            homeExitPromptShownForSession = true
+            awaitingGeofenceExitBeforeTrigger2 = false
+            lastSentEtaMinutes = (args["etaMinutes"] as? Number)?.toInt() ?: computeEtaMinutes(lastDistanceFromCarMeters)
+            updateGeofenceApproachMonitor(triggerImmediateCheck = true)
         }
         if (args["dismissReleaseNotif"] == true) {
             ed.putBoolean("prompt_release", false)
@@ -1552,7 +1568,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
         if (userActivityState == STATE_MOVING && !isOnFixedWifi()) {
             val delta = getDeltaGpsMeters()
-            val desired = if (promptShownForCurrentSession || awaitingGeofenceExitBeforeTrigger2) {
+            val allowHighAccForEta = isLeavingSoonActive || (!promptShownForCurrentSession && !awaitingGeofenceExitBeforeTrigger2)
+            val desired = if (!allowHighAccForEta) {
                 1
             } else if (approachMonitorMode == 2) {
                 if (dEff > r + delta + 30f) 1 else 2
@@ -1560,6 +1577,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 if (dEff <= r + delta) 2 else 1
             }
             if (desired != approachMonitorMode) applyApproachLocationRequest(desired)
+            if (isLeavingSoonActive && approachMonitorMode == 2) {
+                val updatedEta = computeEtaMinutes(dist)
+                if (updatedEta != lastSentEtaMinutes) {
+                    lastSentEtaMinutes = updatedEta
+                    updateServerLeavingEta(updatedEta)
+                }
+            }
         }
     }
 
@@ -1593,7 +1617,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
         val r = getGeofenceRadiusMeters()
         val delta = getDeltaGpsMeters()
-        val desired = if (promptShownForCurrentSession) 1 else if (lastDistanceFromCarMeters == null || lastDistanceFromCarMeters!! <= r + delta) 2 else 1
+        val allowHighAcc = isLeavingSoonActive || !promptShownForCurrentSession
+        val desired = if (!allowHighAcc) 1 else if (lastDistanceFromCarMeters == null || lastDistanceFromCarMeters!! <= r + delta) 2 else 1
         if (approachMonitorMode != desired) applyApproachLocationRequest(desired)
     }
 
@@ -1721,11 +1746,14 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
         cancelGracePeriodRearm()
+        isLeavingSoonActive = true
         promptShownForCurrentSession = true
         homeExitPromptShownForSession = true
         awaitingGeofenceExitBeforeTrigger2 = false
-        stopGeofenceApproachMonitor()
-        triggerServerRelease(2)
+        val initEta = computeEtaMinutes(lastDistanceFromCarMeters)
+        lastSentEtaMinutes = initEta
+        triggerServerRelease(initEta)
+        updateGeofenceApproachMonitor(triggerImmediateCheck = true)
         persistAndBroadcastState(forceNotification = true)
     }
 
@@ -1777,6 +1805,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun resetSessionFlagsAndClearParking() {
         lastLocalReleaseMs = System.currentTimeMillis()
+        isLeavingSoonActive = false
+        lastSentEtaMinutes = -1
         prefs.edit()
             .remove("parked_lat")
             .remove("parked_lon")
@@ -2107,6 +2137,33 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         } catch (_: Exception) {
             "USER-001"
         }
+    }
+
+    private fun computeEtaMinutes(distMeters: Float?): Int {
+        val d = distMeters ?: 0f
+        return (if (d <= 3f) 0 else kotlin.math.ceil((d / 75.0)).toInt()) + 1
+    }
+
+    private fun updateServerLeavingEta(minutes: Int) {
+        val uid = resolveActiveUserId()
+        Thread {
+            try {
+                val url = URL("https://parknow-api.onrender.com/api/parking/leaving")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.doOutput = true
+                val body = JSONObject().apply {
+                    put("userId", uid)
+                    put("availableInMinutes", minutes)
+                }.toString()
+                conn.outputStream.use { it.write(body.toByteArray()) }
+                conn.responseCode
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
     }
 
     private fun triggerServerRelease(minutes: Int) {

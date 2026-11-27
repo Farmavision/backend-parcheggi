@@ -138,26 +138,35 @@ app.get('/api/parking/my-spot', async (req, res) => {
 app.get('/api/parking/nearby', async (req, res) => {
   try {
     await processExpiredReleaseVerifications();
+    const settings = await getSystemSettings();
+    const tStalloLiberoSec = Math.max(10, Math.min(600, Number(settings.t_stallo_libero_sec || 60)));
+    const tStalloForseLiberoSec = Math.max(10, Math.min(900, Number(settings.t_stallo_forselibero_sec || 120)));
+    const totalFreeWindowMs = (tStalloLiberoSec + tStalloForseLiberoSec) * 1000;
     const { lat, lon, radius = 500 } = req.query;
     let rows = [];
     if (useSupabase) {
-      const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-      await supabase.from('parking_spots').delete().eq('status', 'FREE').lt('updated_at', fifteenMinAgo);
+      const expireIso = new Date(Date.now() - totalFreeWindowMs).toISOString();
+      await supabase.from('parking_spots').delete().eq('status', 'FREE').lt('updated_at', expireIso);
       const { data, error } = await supabase.from('parking_spots').select('*').in('status', ['LEAVING_SOON', 'FREE']);
       if (error) throw error;
       rows = data || [];
     } else {
       rows = db.prepare("SELECT * FROM parking_spots WHERE status IN ('LEAVING_SOON', 'FREE')").all();
     }
-    const formatted = rows.map(r => ({
+    const nowMs = Date.now();
+    const activeRows = rows.filter(r => {
+      if (r.status !== 'FREE' || !r.updated_at) return true;
+      return (nowMs - new Date(r.updated_at).getTime()) < totalFreeWindowMs;
+    });
+    const formatted = activeRows.map(r => ({
       id: r.id, userId: r.user_id, latitude: r.latitude, longitude: r.longitude,
-      status: r.status, availableInMinutes: r.status === 'LEAVING_SOON' && r.updated_at ? Math.max(1, (r.available_in_minutes || 1) - Math.floor((Date.now() - new Date(r.updated_at).getTime()) / 60000)) : r.available_in_minutes, updatedAt: r.updated_at,
+      status: r.status, availableInMinutes: r.status === 'LEAVING_SOON' && r.updated_at ? Math.max(1, (r.available_in_minutes || 1) - Math.floor((nowMs - new Date(r.updated_at).getTime()) / 60000)) : r.available_in_minutes, updatedAt: r.updated_at,
       distanceMeters: (lat && lon) ? Math.round(getDistanceMeters(parseFloat(lat), parseFloat(lon), r.latitude, r.longitude)) : null
     }));
     const result = (lat && lon)
       ? formatted.filter(s => s.distanceMeters <= parseFloat(radius)).sort((a, b) => a.distanceMeters - b.distanceMeters)
       : formatted;
-    res.json({ count: result.length, appliedRadius: Number(radius), spots: result });
+    res.json({ count: result.length, appliedRadius: Number(radius), tStalloLiberoSec, tStalloForseLiberoSec, spots: result });
   } catch (err) {
     res.status(500).json({ error: 'Errore interno del database' });
   }

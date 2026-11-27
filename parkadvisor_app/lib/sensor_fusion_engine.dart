@@ -493,8 +493,11 @@ class SensorFusionEngine extends ChangeNotifier {
   Future<void> confirmManualRelease([int? customMinutes]) async {
     _manualReleaseConfirmed = true;
     currentState = VehicleState.leavingSoon;
-    _bgServiceChannel.invokeMethod('syncConfigToNative', {'dismissReleaseNotif': true});
     final eta = customMinutes ?? estimatedMinutesToRelease;
+    _bgServiceChannel.invokeMethod('syncConfigToNative', {
+      'confirmLeavingSoon': true,
+      'etaMinutes': eta,
+    });
     if (onManualReleaseConfirmed != null) await onManualReleaseConfirmed!(eta);
     notifyListeners();
   }

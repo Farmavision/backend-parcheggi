@@ -44,6 +44,8 @@ class _AdminScreenState extends State<AdminScreen> {
   final _deltaGpsMCtrl = TextEditingController(text: '150');
   final _tGraziaMinCtrl = TextEditingController(text: '5');
   final _tCountdownSecCtrl = TextEditingController(text: '30');
+  final _tStalloLiberoSecCtrl = TextEditingController(text: '60');
+  final _tStalloForseLiberoSecCtrl = TextEditingController(text: '120');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
 
@@ -113,7 +115,9 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           _geofenceRadiusMCtrl.text = (data['geofence_radius_m'] ?? spLoad.getInt('geofence_radius_m') ?? 100).toString();
           _deltaGpsMCtrl.text = (data['delta_gps_m'] ?? spLoad.getInt('delta_gps_m') ?? 150).toString();
           _tGraziaMinCtrl.text = (data['t_grazia_min'] ?? spLoad.getInt('t_grazia_min') ?? 5).toString();
-          _tCountdownSecCtrl.text = (data['t_countdown_sec'] ?? spLoad.getInt('t_countdown_sec') ?? 30).toString(); });
+          _tCountdownSecCtrl.text = (data['t_countdown_sec'] ?? spLoad.getInt('t_countdown_sec') ?? 30).toString();
+          _tStalloLiberoSecCtrl.text = (data['t_stallo_libero_sec'] ?? spLoad.getInt('t_stallo_libero_sec') ?? 60).toString();
+          _tStalloForseLiberoSecCtrl.text = (data['t_stallo_forselibero_sec'] ?? spLoad.getInt('t_stallo_forselibero_sec') ?? 120).toString(); });
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
             final val = int.tryParse(_autoReleaseDelayCtrl.text);
@@ -136,6 +140,8 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       final deltaGpsVal = (int.tryParse(_deltaGpsMCtrl.text) ?? 150).clamp(50, 500);
       final tGraziaVal = (int.tryParse(_tGraziaMinCtrl.text) ?? 5).clamp(1, 60);
       final tCountdownVal = (int.tryParse(_tCountdownSecCtrl.text) ?? 30).clamp(5, 120);
+      final tStalloLiberoVal = (int.tryParse(_tStalloLiberoSecCtrl.text) ?? 60).clamp(10, 600);
+      final tStalloForseLiberoVal = (int.tryParse(_tStalloForseLiberoSecCtrl.text) ?? 120).clamp(10, 900);
       await prefs.setInt('tgps_senzapasso_sec', (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180));
       await prefs.setInt('n_passi', nPassiVal);
       await prefs.setInt('t0_passi_sec', t0PassiVal);
@@ -143,6 +149,8 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       await prefs.setInt('delta_gps_m', deltaGpsVal);
       await prefs.setInt('t_grazia_min', tGraziaVal);
       await prefs.setInt('t_countdown_sec', tCountdownVal);
+      await prefs.setInt('t_stallo_libero_sec', tStalloLiberoVal);
+      await prefs.setInt('t_stallo_forselibero_sec', tStalloForseLiberoVal);
       try {
         await const MethodChannel('parknow/bg_service').invokeMethod('syncConfigToNative', {
           'tGpsNoStepSec': (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180),
@@ -172,6 +180,8 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       'delta_gps_m': deltaGpsVal,
       't_grazia_min': tGraziaVal,
       't_countdown_sec': tCountdownVal,
+      't_stallo_libero_sec': tStalloLiberoVal,
+      't_stallo_forselibero_sec': tStalloForseLiberoVal,
       'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
       });
@@ -234,6 +244,8 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
     _deltaGpsMCtrl.dispose();
     _tGraziaMinCtrl.dispose();
     _tCountdownSecCtrl.dispose();
+    _tStalloLiberoSecCtrl.dispose();
+    _tStalloForseLiberoSecCtrl.dispose();
     _deltaCtrl.dispose();
     _autoReleaseDelayCtrl.dispose();
     super.dispose();
@@ -427,6 +439,26 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           decoration: const InputDecoration(
             labelText: 'Tcountdown — Conto alla rovescia ripartenza In Auto (secondi)',
             helperText: 'Default: 30s (5-120s). Durata avviso a schermo intero (solo tasto Nega) prima della conferma automatica.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _tStalloLiberoSecCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Tstallo_libero — Durata segnaposto P verde lampeggiante (secondi)',
+            helperText: 'Default: 60s (10-600s). Tempo in cui lo stallo appena liberato lampeggia in verde sulla mappa.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _tStalloForseLiberoSecCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Tstallo_forselibero — Durata icona rossa ? (secondi)',
+            helperText: 'Default: 120s (10-900s). Tempo successivo in cui lo stallo appare rosso con ? prima di sparire.',
             border: OutlineInputBorder(),
           ),
         ),

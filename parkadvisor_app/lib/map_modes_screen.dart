@@ -9,7 +9,7 @@ import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'sensor_fusion_engine.dart';
 
-Widget buildMapSpotBadge(Color color, {int? mins, bool showP = false}) {
+Widget buildMapSpotBadge(Color color, {int? mins, bool showP = false, String? customSymbol}) {
   return Container(
     decoration: BoxDecoration(
       color: color,
@@ -26,10 +26,46 @@ Widget buildMapSpotBadge(Color color, {int? mins, bool showP = false}) {
               const Text('min', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 9, height: 1.0)),
             ],
           )
-        : showP
-            ? const Text('P', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 20, height: 1.0))
-            : const Icon(Icons.directions_car, color: Colors.white, size: 22),
+        : customSymbol != null
+            ? Text(customSymbol, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 22, height: 1.0))
+            : showP
+                ? const Text('P', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 20, height: 1.0))
+                : const Icon(Icons.directions_car, color: Colors.white, size: 22),
   );
+}
+
+class _BlinkingSpotBadge extends StatefulWidget {
+  final Color color;
+  final bool showP;
+  const _BlinkingSpotBadge({required this.color, this.showP = true});
+  @override
+  State<_BlinkingSpotBadge> createState() => _BlinkingSpotBadgeState();
+}
+
+class _BlinkingSpotBadgeState extends State<_BlinkingSpotBadge> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 650))..repeat(reverse: true);
+    _opacity = Tween<double>(begin: 0.35, end: 1.0).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut));
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _opacity,
+      child: buildMapSpotBadge(widget.color, showP: widget.showP),
+    );
+  }
 }
 
 class SearchParkingScreen extends StatefulWidget {
@@ -51,6 +87,9 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
   bool _isLoading = false;
   bool _isReserving = false;
   Timer? _pollingTimer;
+  Timer? _visualTickTimer;
+  int _tStalloLiberoSec = 60;
+  int _tStalloForseLiberoSec = 120;
   StreamSubscription<Position>? _searchPosSub;
 
   @override
@@ -61,7 +100,17 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
     if (uLat != null && uLon != null) _center = LatLng(uLat, uLon);
     widget.sensorEngine.addListener(_onEngineUpdate);
     _refreshLocationAndSpots();
+    SharedPreferences.getInstance().then((p) {
+      if (!mounted) return;
+      setState(() {
+        _tStalloLiberoSec = (p.getInt('t_stallo_libero_sec') ?? 60).clamp(10, 600);
+        _tStalloForseLiberoSec = (p.getInt('t_stallo_forselibero_sec') ?? 120).clamp(10, 900);
+      });
+    });
     _pollingTimer = Timer.periodic(const Duration(seconds: 15), (_) => _fetchSpots(silent: true));
+    _visualTickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && _spots.isNotEmpty) setState(() {});
+    });
   }
 
   void _onEngineUpdate() {
@@ -97,6 +146,12 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
       final res = await http.get(url, headers: {'Accept': 'application/json'}).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200 && mounted) {
         final body = json.decode(res.body);
+        if (body is Map && body['tStalloLiberoSec'] != null) {
+          _tStalloLiberoSec = (body['tStalloLiberoSec'] as num).toInt().clamp(10, 600);
+        }
+        if (body is Map && body['tStalloForseLiberoSec'] != null) {
+          _tStalloForseLiberoSec = (body['tStalloForseLiberoSec'] as num).toInt().clamp(10, 900);
+        }
         final spots = body['spots'] as List<dynamic>? ?? [];
         setState(() {
           _spots = spots;
@@ -179,6 +234,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
   void dispose() {
     _searchPosSub?.cancel();
     _pollingTimer?.cancel();
+    _visualTickTimer?.cancel();
     widget.sensorEngine.removeListener(_onEngineUpdate);
     super.dispose();
   }
@@ -197,13 +253,34 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
       if (pLat != null && pLon != null && Geolocator.distanceBetween(sLat, sLon, pLat, pLon) < -1.0) continue;
       final bool isLeaving = spot['status'] == 'LEAVING_SOON';
       final int? etaMin = isLeaving ? ((spot['availableInMinutes'] as num?)?.toInt() ?? 1) : null;
+      Widget spotBadge;
+      if (isLeaving) {
+        spotBadge = buildMapSpotBadge(Colors.orange.shade600, mins: etaMin);
+      } else {
+        int elapsedSec = 0;
+        final rawUpdated = spot['updatedAt']?.toString();
+        if (rawUpdated != null && rawUpdated.isNotEmpty) {
+          final parsed = DateTime.tryParse(rawUpdated);
+          if (parsed != null) {
+            elapsedSec = DateTime.now().difference(parsed.toLocal()).inSeconds;
+            if (elapsedSec < 0) elapsedSec = 0;
+          }
+        }
+        if (elapsedSec >= _tStalloLiberoSec + _tStalloForseLiberoSec) {
+          continue;
+        } else if (elapsedSec < _tStalloLiberoSec) {
+          spotBadge = _BlinkingSpotBadge(color: Colors.green.shade600, showP: true);
+        } else {
+          spotBadge = buildMapSpotBadge(Colors.red.shade600, customSymbol: '?');
+        }
+      }
       markers.add(Marker(
         point: LatLng(sLat, sLon),
         width: 46,
         height: 46,
         child: GestureDetector(
           onTap: () => _showConfirmDialog(spot['id'].toString()),
-          child: buildMapSpotBadge(Colors.green.shade600, mins: etaMin, showP: !isLeaving),
+          child: spotBadge,
         ),
       ));
     }
