@@ -775,13 +775,14 @@ class SensorFusionEngine extends ChangeNotifier {
     distanceFromCarMeters = null;
     currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
     _manualReleaseConfirmed = false;
+    notifyListeners();
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('parked_lat');
     await prefs.remove('parked_lon');
 
-    await onCarReleased();
     await _pushConfigToNative(forceUserState: forceUserState, skipRemoteSync: true);
+    await onCarReleased();
     notifyListeners();
   }
 
