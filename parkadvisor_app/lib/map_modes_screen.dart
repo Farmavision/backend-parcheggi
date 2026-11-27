@@ -37,7 +37,7 @@ Widget buildMapSpotBadge(Color color, {int? mins, bool showP = false, String? cu
 class _BlinkingSpotBadge extends StatefulWidget {
   final Color color;
   final bool showP;
-  const _BlinkingSpotBadge({required this.color, this.showP = true});
+  const _BlinkingSpotBadge({super.key, required this.color, this.showP = true});
   @override
   State<_BlinkingSpotBadge> createState() => _BlinkingSpotBadgeState();
 }
@@ -90,6 +90,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
   Timer? _visualTickTimer;
   int _tStalloLiberoSec = 60;
   int _tStalloForseLiberoSec = 120;
+  DateTime _spotsFetchedAt = DateTime.now();
   StreamSubscription<Position>? _searchPosSub;
 
   @override
@@ -154,6 +155,7 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
         }
         final spots = body['spots'] as List<dynamic>? ?? [];
         setState(() {
+          _spotsFetchedAt = DateTime.now();
           _spots = spots;
           _feeSearch = (body['feeSearch'] as num?)?.toInt() ?? 5;
           _statusText = spots.isEmpty ? 'Nessuno stallo entro ${widget.searchRadiusM}m' : '${spots.length == 1 ? "1 stallo" : "${spots.length} stalli"} entro ${widget.searchRadiusM}m';
@@ -258,18 +260,26 @@ class _SearchParkingScreenState extends State<SearchParkingScreen> {
         spotBadge = buildMapSpotBadge(Colors.orange.shade600, mins: etaMin);
       } else {
         int elapsedSec = 0;
-        final rawUpdated = spot['updatedAt']?.toString();
-        if (rawUpdated != null && rawUpdated.isNotEmpty) {
-          final parsed = DateTime.tryParse(rawUpdated);
-          if (parsed != null) {
-            elapsedSec = DateTime.now().difference(parsed.toLocal()).inSeconds;
-            if (elapsedSec < 0) elapsedSec = 0;
+        final localDeltaSec = DateTime.now().difference(_spotsFetchedAt).inSeconds;
+        if (spot['elapsedFreeSec'] != null) {
+          elapsedSec = (spot['elapsedFreeSec'] as num).toInt() + (localDeltaSec > 0 ? localDeltaSec : 0);
+        } else {
+          final rawUpdated = spot['updatedAt']?.toString().trim();
+          if (rawUpdated != null && rawUpdated.isNotEmpty) {
+            final norm = (rawUpdated.endsWith('Z') || RegExp(r'[+-]\d{2}:?\d{2}$').hasMatch(rawUpdated))
+                ? rawUpdated
+                : '${rawUpdated.replaceFirst(' ', 'T')}Z';
+            final parsed = DateTime.tryParse(norm) ?? DateTime.tryParse(rawUpdated);
+            if (parsed != null) {
+              elapsedSec = DateTime.now().toUtc().difference(parsed.toUtc()).inSeconds;
+              if (elapsedSec < 0) elapsedSec = 0;
+            }
           }
         }
         if (elapsedSec >= _tStalloLiberoSec + _tStalloForseLiberoSec) {
           continue;
         } else if (elapsedSec < _tStalloLiberoSec) {
-          spotBadge = _BlinkingSpotBadge(color: Colors.green.shade600, showP: true);
+          spotBadge = _BlinkingSpotBadge(key: ValueKey('blink_${spot['id']}'), color: Colors.green.shade600, showP: true);
         } else {
           spotBadge = buildMapSpotBadge(Colors.red.shade600, customSymbol: '?');
         }

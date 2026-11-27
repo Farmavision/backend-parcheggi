@@ -153,14 +153,24 @@ app.get('/api/parking/nearby', async (req, res) => {
     } else {
       rows = db.prepare("SELECT * FROM parking_spots WHERE status IN ('LEAVING_SOON', 'FREE')").all();
     }
+    const parseUtcMs = (ts) => {
+      if (!ts) return Date.now();
+      const s = String(ts).trim();
+      const norm = (s.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(s)) ? s : (s.replace(' ', 'T') + 'Z');
+      const ms = new Date(norm).getTime();
+      return Number.isNaN(ms) ? new Date(s).getTime() : ms;
+    };
     const nowMs = Date.now();
     const activeRows = rows.filter(r => {
       if (r.status !== 'FREE' || !r.updated_at) return true;
-      return (nowMs - new Date(r.updated_at).getTime()) < totalFreeWindowMs;
+      return Math.max(0, nowMs - parseUtcMs(r.updated_at)) < totalFreeWindowMs;
     });
     const formatted = activeRows.map(r => ({
       id: r.id, userId: r.user_id, latitude: r.latitude, longitude: r.longitude,
-      status: r.status, availableInMinutes: r.status === 'LEAVING_SOON' && r.updated_at ? Math.max(1, (r.available_in_minutes || 1) - Math.floor((nowMs - new Date(r.updated_at).getTime()) / 60000)) : r.available_in_minutes, updatedAt: r.updated_at,
+      status: r.status,
+      availableInMinutes: r.status === 'LEAVING_SOON' && r.updated_at ? Math.max(1, (r.available_in_minutes || 1) - Math.floor(Math.max(0, nowMs - parseUtcMs(r.updated_at)) / 60000)) : r.available_in_minutes,
+      elapsedFreeSec: r.status === 'FREE' && r.updated_at ? Math.max(0, Math.floor((nowMs - parseUtcMs(r.updated_at)) / 1000)) : 0,
+      updatedAt: r.updated_at,
       distanceMeters: (lat && lon) ? Math.round(getDistanceMeters(parseFloat(lat), parseFloat(lon), r.latitude, r.longitude)) : null
     }));
     const result = (lat && lon)
@@ -222,7 +232,7 @@ app.post('/api/parking/leaving', async (req, res) => {
     if (useSupabase && userId) {
       await supabase.from('parking_spots').update({
         status: 'LEAVING_SOON', available_in_minutes: availableInMinutes, updated_at: new Date().toISOString()
-      }).eq('user_id', userId).in('status', ['OCCUPIED', 'LEAVING_SOON']);
+      }).eq('user_id', userId).eq('status', 'LEAVING_SOON');
     }
     res.json({ success: true, status: 'LEAVING_SOON', availableInMinutes });
   } catch (err) {

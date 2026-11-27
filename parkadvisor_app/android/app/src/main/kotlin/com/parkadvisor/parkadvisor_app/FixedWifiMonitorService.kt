@@ -211,7 +211,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var lastLocalReleaseMs: Long = 0L
     private var isLeavingSoonActive: Boolean = false
     private var lastSentEtaMinutes: Int = -1
+    // [AUDIT_FIXES_V1]
     private var activeRingtone: android.media.Ringtone? = null
+    private var ringtoneStopRunnable: Runnable? = null
 
     private var gpsWindowTickRunnable: Runnable? = null
     private var stepStoppedRunnable: Runnable? = null
@@ -351,6 +353,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         geofenceWatchdogRunnable?.let { handler.removeCallbacks(it) }
         homeRearmRunnable?.let { handler.removeCallbacks(it) }
         stopDepartureCountdown(clearNotif = false)
+        stopAlarmRingtone()
         powerUnplugDebounceRunnable?.let { handler.removeCallbacks(it) }
         try {
             sensorManager?.unregisterListener(this)
@@ -509,6 +512,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 if (!hadBefore || isSim || coordsChanged) {
                     lastMovingStateMs = 0L
                     passedThroughStall = false
+                    inCarDepartureConfirmedForSession = false
+                    isLeavingSoonActive = false
+                    lastSentEtaMinutes = -1
                     armedForDeparturePrompt = true
                     resetHomeExitSessionFlags()
                     ed.putBoolean("prompt_release", false)
@@ -1060,6 +1066,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
         if (userActivityState == STATE_IN_CAR) {
             if (recentWindowSteps >= 6) {
+                stopDepartureCountdown(clearNotif = true)
+                inCarDepartureConfirmedForSession = false
                 isWalking = true
                 gpsRestingAfterAnalysis = false
                 evaluateNoFixedWifiAlgorithm()
@@ -1225,11 +1233,13 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             prefs.edit().putBoolean("prompt_release", false).apply()
             cancelReleasePromptNotification()
 
-            if ((promptShownForCurrentSession || homeExitPromptShownForSession || graceRearmRunnable != null) && homeRearmRunnable == null) {
+            if ((promptShownForCurrentSession || homeExitPromptShownForSession || isLeavingSoonActive || graceRearmRunnable != null) && homeRearmRunnable == null) {
                 homeRearmRunnable = Runnable {
                     homeRearmRunnable = null
                     if (isOnFixedWifi()) {
                         cancelGracePeriodRearm()
+                        isLeavingSoonActive = false
+                        lastSentEtaMinutes = -1
                         promptShownForCurrentSession = false
                         canSpatialRearmOnExit = false
                         resetHomeExitSessionFlags()
@@ -1526,7 +1536,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         val dist = res[0]
         lastDistanceFromCarMeters = dist
         if (dist <= 30f) passedThroughStall = true
-        if (passedThroughStall && isCarBtConnected && dist > 15f) {
+        if (passedThroughStall && isCarBtConnected && !btDeniedUntilDisconnect &&
+            departureCountdownRemainingSec <= 0 && inCarDepartureConfirmedForSession && dist > 15f) {
             completeAutomaticVehicleDeparture(); return
         }
         val r = getGeofenceRadiusMeters()
@@ -1760,6 +1771,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun handleUserDenyRelease() {
         prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
+        isLeavingSoonActive = false
+        lastSentEtaMinutes = -1
         passedThroughStall = false
         awaitingGeofenceExitBeforeTrigger2 = false
         val currentlyInside = lastDistanceFromCarMeters != null &&
@@ -1805,6 +1818,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun resetSessionFlagsAndClearParking() {
         lastLocalReleaseMs = System.currentTimeMillis()
+        inCarDepartureConfirmedForSession = false
         isLeavingSoonActive = false
         lastSentEtaMinutes = -1
         prefs.edit()
@@ -1889,6 +1903,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         carPromptShownInCurrentBout = false
         boutStepsSinceStationary = 0
         stopNoStepGpsWindow()
+        stopDepartureCountdown(clearNotif = true)
+        inCarDepartureConfirmedForSession = false
+        if (isDeviceCharging) {
+            chargingIgnoredUntilUnplug = true
+            chargingSessionHandled = true
+        }
         updateDynamicAccelerometerRegistration(shouldListen = false)
         cancelReleasePromptNotification()
         val targetList = splitCsv(prefs.getString(key, ""))
@@ -2059,7 +2079,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         val now = System.currentTimeMillis()
         if (!force && now - lastRemoteSpotSyncMs < 25_000L) return
         lastRemoteSpotSyncMs = now
-        val userId = prefs.getString("user_id", "USER-001") ?: "USER-001"
+        val userId = resolveActiveUserId()
         Thread {
             try {
                 val conn = (URL("https://parknow-api.onrender.com/api/parking/my-spot?userId=$userId").openConnection() as HttpURLConnection).apply {
@@ -2341,11 +2361,15 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) rt?.isLooping = true
             rt?.play()
             activeRingtone = rt
-            handler.postDelayed({ stopAlarmRingtone() }, 12_000L)
+            ringtoneStopRunnable?.let { handler.removeCallbacks(it) }
+            ringtoneStopRunnable = Runnable { stopAlarmRingtone() }
+            handler.postDelayed(ringtoneStopRunnable!!, 12_000L)
         } catch (_: Exception) {}
     }
 
     private fun stopAlarmRingtone() {
+        ringtoneStopRunnable?.let { handler.removeCallbacks(it) }
+        ringtoneStopRunnable = null
         try { activeRingtone?.stop(); activeRingtone = null } catch (_: Exception) {}
     }
 

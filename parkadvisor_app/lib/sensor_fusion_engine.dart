@@ -703,21 +703,24 @@ class SensorFusionEngine extends ChangeNotifier {
     });
   }
 
+  // [BLE_COUNTDOWN_FIX_V1]
   void _startBleBluetoothMonitor() {
     _btCheckTimer?.cancel();
     _btCheckTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
       try {
         final connected = FlutterBluePlus.connectedDevices;
-        if (targetCarBluetoothMac != null) {
-          final found = connected.any((d) => d.remoteId.str.toUpperCase() == targetCarBluetoothMac);
-          if (found) {
+        if (targetCarBluetoothMac != null && targetCarBluetoothMac!.isNotEmpty) {
+          final found = connected.any((d) => _csvContains(targetCarBluetoothMac, d.remoteId.str));
+          if (found && !isCarBtConnected) {
             isCarBtConnected = true;
-            userActivityState = UserActivityState.inCar;
-            if (isCarParked) {
-              await _triggerCarReleased();
-            } else {
-              notifyListeners();
+            final rawRes = await _bgServiceChannel.invokeMethod('syncConfigToNative', {
+              'carBtMac': targetCarBluetoothMac ?? '',
+              'triggerCarBtConnected': true,
+            });
+            if (rawRes is Map) {
+              _applyNativeSnapshotMap(Map<String, dynamic>.from(rawRes));
             }
+            notifyListeners();
           }
         }
       } catch (_) {}
