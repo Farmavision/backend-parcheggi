@@ -368,4 +368,12 @@ app.get("/api/beta/feedback", (req, res) => {
 
 require('./admin_backoffice')(app, { useSupabase, supabase, getSystemSettings, processExpiredReleaseVerifications, logAuditEvent, logCreditLedger, betaFeedbacks });
 
+const registerAdminRoutes = require('./admin_routes');
+registerAdminRoutes(app, {
+  useSupabase,
+  supabase,
+  db: typeof db !== 'undefined' ? db : null,
+  getSystemSettings,
+});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server ParkNow! attivo sulla porta ${PORT}`));
