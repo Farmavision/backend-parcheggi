@@ -235,6 +235,13 @@ th{background:#f8fafc;font-weight:700}
 .b-occ{background:#455a64}.b-leav{background:#ef6c00}.b-free{background:#2e7d32}.b-susp{background:#c62828}.b-beta{background:#1565c0}
 .pos{color:#2e7d32;font-weight:700}.neg{color:#c62828;font-weight:700}
 .mono{font-family:ui-monospace,monospace;font-size:12px;color:#475569;word-break:break-word}
+.param-sec{margin-top:18px;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid #e2e8f0;color:#1b5e20;font-size:16px;font-weight:800}
+.param-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.param-box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;display:flex;flex-direction:column;justify-content:space-between}
+.param-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:6px}
+.param-title{font-size:14px;font-weight:700;color:#0f172a}
+.param-meta{font-size:11px;font-weight:700;color:#1565c0;background:#e3f2fd;padding:2px 7px;border-radius:10px;white-space:nowrap}
+.param-desc{font-size:12px;line-height:1.45;color:#475569;margin:0 0 10px}
 @media(max-width:640px){.kpis{grid-template-columns:repeat(2,1fr)}}
 </style></head><body>
 <h1>ParkNow! — Hub Amministratore Web</h1>
@@ -332,14 +339,55 @@ th{background:#f8fafc;font-weight:700}
   <div id="tab_params" style="display:none">
     <div class="card"><h2>Limitazione Zone Geografiche</h2><label><input type="checkbox" id="geofence_enabled"> Attiva funzionamento SOLO nelle zone abilitate</label>
     <div id="zonesList"></div><hr><div class="grid"><div><label>Nome Zona</label><input id="zName" type="text" placeholder="Es. Roma - Tuscolano"></div><div><label>Raggio (km)</label><input id="zRad" type="number" step="0.1" value="1.5"></div><div><label>Latitudine</label><input id="zLat" type="number" step="0.00001"></div><div><label>Longitudine</label><input id="zLon" type="number" step="0.00001"></div></div><br><button class="sec" onclick="addZone()">+ Aggiungi Zona</button></div>
-    <div class="card"><h2>Parametri Operativi &amp; Algoritmo</h2><div class="grid" id="paramsGrid"></div></div>
+    <div class="card"><h2>Parametri Operativi &amp; Algoritmo</h2><p style="margin-top:0;font-size:13px;color:#475569">Ogni modifica viene salvata su database e applicata al backend e all\'app. I badge blu indicano default e range consigliato.</p><div id="paramsGrid"></div></div>
     <button onclick="saveAll()" style="width:100%;font-size:16px">Salva Tutte le Impostazioni</button>
   </div>
 </div>
 
 <script>
 let PIN='', CFG={params:{},zones:[]}, ACTIVE_UID='';
-const LABELS={initial_credits:'Crediti iniziali',search_fee:'Costo prenotazione (crediti)',release_reward:'Premio rilascio (crediti)',cancellation_penalty:'Penale annullamento',release_delta_minutes:'Preavviso uscita (min)',reservation_hold_minutes:'Max attesa prenotazione (min)',free_spot_ttl_minutes:'Durata stallo libero (min)',polling_interval_seconds:'Polling stato (sec)',search_radius_meters:'Raggio ricerca (m)',arrival_verification_meters:'Tolleranza GPS arrivo (m)',self_booking_block_enabled:'Blocco auto-prenotazione (1=Sì, 0=No)',geofence_radius_m:'Rgeofence — Raggio Geofence auto (m)',delta_gps_m:'DeltaGps — Margine GPS alta precisione (m)',t_grazia_min:'Tgrazia — Tempo di grazia riarmo geofence (min)',t_countdown_sec:'Tcountdown — Countdown ripartenza In Auto (s)',t_stallo_libero_sec:'Tstallo_libero — Durata P verde lampeggiante (s)',t_stallo_forselibero_sec:'Tstallo_forselibero — Durata icona rossa ? (s)',n_passi:'Npassi — Soglia passi uscita Casa/Lavoro senza Wi-Fi',t0_passi_sec:'T0passi — Reset contatore passi Casa/Lavoro (sec)'};
+const PARAM_SECTIONS=[
+  {
+    title:'1. Algoritmo Rilascio, Geofence & Stato In Auto',
+    items:[
+      {k:'n_passi',title:'Npassi — Soglia passi uscita Casa/Lavoro',meta:'Default: 50 | Range: 5–500',desc:'Numero di passi consecutivi necessari, quando il Wi-Fi Casa/Lavoro è scollegato, per sbloccare lo stato stazionario in "In Movimento" e attivare il Trigger 1 di richiesta rilascio.'},
+      {k:'t0_passi_sec',title:'T0passi — Reset contatore passi ancorati (s)',meta:'Default: 30s | Range: 5–300s',desc:'Tempo di inattività dopo il quale il contatore dei passi ancorati a Casa/Lavoro (Npassi) si azzera automaticamente se l\'utente smette di camminare.'},
+      {k:'geofence_radius_m',title:'Rgeofence — Raggio Geofence auto (m)',meta:'Default: 100m | Range: 20–2000m',desc:'Raggio circolare attorno allo stallo parcheggiato entro cui scatta il Trigger 2 di richiesta rilascio (e rete di sicurezza se la 1ª notifica da Casa è stata ignorata).'},
+      {k:'delta_gps_m',title:'DeltaGps — Fascia radar GPS alta precisione (m)',meta:'Default: 150m | Range: 50–500m',desc:'Margine esterno al Geofence (Rgeofence + DeltaGps) entro cui il servizio passa dal GPS a risparmio energetico al GPS ad alta precisione (Mode 2) per rilevare l\'ingresso e aggiornare i minuti live.'},
+      {k:'t_grazia_min',title:'Tgrazia — Tempo di grazia riarmo Geofence (min)',meta:'Default: 5m | Range: 1–60m',desc:'Pausa sul Trigger 2 dopo un nuovo parcheggio o dopo un rifiuto ("Non parto"). Evita notifiche ripetute se resti vicino all\'auto; si riarma in anticipo se esci oltre Rgeofence + 50m o rientri sotto Wi-Fi fisso per 30s.'},
+      {k:'t_countdown_sec',title:'Tcountdown — Countdown ripartenza In Auto (s)',meta:'Default: 30s | Range: 5–120s',desc:'Durata dell\'avviso full-screen "Il sistema ha rilevato la ripartenza" (solo tasto NEGA) quando entra lo stato In Auto (Bluetooth, Ricarica USB/Qi/12V o GPS). A 0 conferma e libera lo stallo in FREE.'}
+    ]
+  },
+  {
+    title:'2. Ciclo Icone Mappa (Stallo Liberato FREE)',
+    items:[
+      {k:'t_stallo_libero_sec',title:'Tstallo_libero — Durata P verde lampeggiante (s)',meta:'Default: 60s | Range: 10–600s',desc:'Secondi durante i quali lo stallo appena liberato (FREE) appare sulla mappa come segnaposto "P" verde lampeggiante (alta probabilità che sia ancora disponibile).'},
+      {k:'t_stallo_forselibero_sec',title:'Tstallo_forselibero — Durata icona rossa ? (s)',meta:'Default: 120s | Range: 10–900s',desc:'Secondi successivi a Tstallo_libero in cui lo stallo passa a icona rossa con "?" (forse occupato da terzi non iscritti). Scaduta la somma dei due tempi, lo stallo viene rimosso dalla mappa.'}
+    ]
+  },
+  {
+    title:'3. Ricerca, Prenotazione & Verifiche Server',
+    items:[
+      {k:'search_radius_meters',title:'Raggio ricerca parcheggi (m)',meta:'Default: 500m',desc:'Distanza massima predefinita attorno alla posizione dell\'utente usata da "Cerca Parcheggio" per mostrare stalli in rilascio o liberi.'},
+      {k:'release_delta_minutes',title:'Preavviso uscita / Verifica rilascio (min)',meta:'Default: 5m',desc:'Finestra massima (verification_deadline) concessa allo stallo in stato LEAVING_SOON prima che il sistema consideri scaduto il mancato rilascio.'},
+      {k:'reservation_hold_minutes',title:'Max attesa prenotazione (min)',meta:'Default: 10m',desc:'Tempo massimo in cui una prenotazione stallo rimane bloccata a favore dell\'utente che ha prenotato prima di decadere automaticamente.'},
+      {k:'arrival_verification_meters',title:'Tolleranza GPS arrivo allo stallo (m)',meta:'Default: 35m',desc:'Distanza GPS entro la quale il sistema considera confermato l\'arrivo dell\'utente prenotante sul posto auto.'},
+      {k:'polling_interval_seconds',title:'Intervallo polling stato (s)',meta:'Default: 15s',desc:'Frequenza di aggiornamento periodico dello stato stalli tra app e backend.'},
+      {k:'free_spot_ttl_minutes',title:'TTL pulizia stalli liberi backoffice (min)',meta:'Default: 15m',desc:'Soglia di sicurezza usata dalla pulizia periodica del database per rimuovere eventuali record FREE residui.'}
+    ]
+  },
+  {
+    title:'4. Economia, Crediti & Regole Antifrode',
+    items:[
+      {k:'initial_credits',title:'Crediti iniziali nuovo utente',meta:'Default: 50 cr',desc:'Saldo crediti assegnato automaticamente alla prima creazione del profilo di un nuovo utente.'},
+      {k:'search_fee',title:'Costo prenotazione stallo (crediti)',meta:'Default: 5 cr',desc:'Crediti scalati all\'utente quando conferma la prenotazione di un parcheggio su "Cerca Parcheggio".'},
+      {k:'release_reward',title:'Premio rilascio stallo (crediti)',meta:'Default: 4–10 cr',desc:'Crediti accreditati all\'utente che libera effettivamente lo stallo (passaggio a FREE confermato).'},
+      {k:'cancellation_penalty',title:'Penale annullamento / falso rilascio (crediti)',meta:'Default: 15 cr',desc:'Crediti detratti in caso di annullamento tardivo o mancata liberazione dello stallo oltre la scadenza di verifica.'},
+      {k:'self_booking_block_enabled',title:'Blocco auto-prenotazione (1 = Sì, 0 = No)',meta:'Default: 1',desc:'Se impostato a 1 impedisce a un utente di prenotare il proprio stesso stallo; impostare a 0 solo durante i test con un singolo dispositivo.'}
+    ]
+  }
+];
+const ALL_PARAM_KEYS=PARAM_SECTIONS.flatMap(sec=>sec.items.map(it=>it.k));
 
 function esc(v){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function fmtDate(iso){if(!iso)return '-';try{return new Date(iso).toLocaleString('it-IT');}catch(_){return String(iso);}}
@@ -370,8 +418,14 @@ async function loadConfig(){
   CFG=await r.json();
   document.getElementById('geofence_enabled').checked=Number(CFG.params.geofence_enabled)===1;
   const g=document.getElementById('paramsGrid');g.innerHTML='';
-  for(const[k,lbl]of Object.entries(LABELS)){
-    g.innerHTML+='<div><label>'+lbl+'</label><input type="number" id="p_'+k+'" value="'+(CFG.params[k]??0)+'"></div>';
+  for(const sec of PARAM_SECTIONS){
+    let h='<div class="param-sec">'+esc(sec.title)+'</div><div class="param-grid">';
+    for(const it of sec.items){
+      const val=(CFG.params[it.k]??0);
+      h+='<div class="param-box"><div><div class="param-head"><span class="param-title">'+esc(it.title)+'</span><span class="param-meta">'+esc(it.meta)+'</span></div><p class="param-desc">'+esc(it.desc)+'</p></div><input type="number" id="p_'+it.k+'" value="'+val+'"></div>';
+    }
+    h+='</div>';
+    g.innerHTML+=h;
   }
   renderZones();
 }
@@ -388,7 +442,7 @@ function addZone(){
 }
 async function saveAll(){
   CFG.params.geofence_enabled=document.getElementById('geofence_enabled').checked?1:0;
-  for(const k of Object.keys(LABELS)){CFG.params[k]=Number(document.getElementById('p_'+k).value);}
+  for(const k of ALL_PARAM_KEYS){CFG.params[k]=Number(document.getElementById('p_'+k).value);}
   const r=await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json','x-admin-pin':PIN},body:JSON.stringify(CFG)});
   if(r.ok)alert('Configurazione salvata!');else alert('Errore salvataggio');
 }
