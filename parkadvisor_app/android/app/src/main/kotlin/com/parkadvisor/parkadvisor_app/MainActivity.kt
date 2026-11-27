@@ -40,6 +40,28 @@ class MainActivity : FlutterActivity() {
         startBgServiceIfPermitted()
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra("from_departure_fullscreen", false)) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setShowWhenLocked(true)
+                setTurnScreenOn(true)
+                (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.requestDismissKeyguard(this, null)
+            } else {
+                @Suppress("DEPRECATION")
+                window.addFlags(
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                )
+            }
+        }
+        val snap = FixedWifiMonitorService.instance?.refreshAndGetSnapshot()
+            ?: FixedWifiMonitorService.buildFallbackSnapshot(this)
+        bgChannel?.invokeMethod("onNativeStateUpdated", snap)
+    }
+
     override fun onResume() {
         super.onResume()
         startBgServiceIfPermitted()
@@ -107,6 +129,15 @@ class MainActivity : FlutterActivity() {
         }
         (args["t0PassiSec"] as? Number)?.let {
             ed.putInt("t0_passi_sec", it.toInt().coerceIn(5, 300))
+        }
+        (args["deltaGpsM"] as? Number)?.let {
+            ed.putInt("delta_gps_m", it.toInt().coerceIn(50, 500))
+        }
+        (args["tGraziaMin"] as? Number)?.let {
+            ed.putInt("t_grazia_min", it.toInt().coerceIn(1, 60))
+        }
+        (args["tCountdownSec"] as? Number)?.let {
+            ed.putInt("t_countdown_sec", it.toInt().coerceIn(5, 120))
         }
         if (args.containsKey("parkedLat") && args.containsKey("parkedLon")) {
             val lat = (args["parkedLat"] as? Number)?.toDouble()

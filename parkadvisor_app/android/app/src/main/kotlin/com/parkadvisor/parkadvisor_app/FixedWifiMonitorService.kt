@@ -30,6 +30,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -58,6 +59,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         const val PREFS_NAME = "parknow_native_store"
         const val CHANNEL_FG = "parknow_fg_service_v1"
         const val CHANNEL_ALERT = "parknow_urgent_alarm_v4"
+        const val CHANNEL_DEPARTURE_FS = "parknow_departure_fullscreen_v1"
         const val FG_NOTIF_ID = 4101
         const val PROMPT_NOTIF_ID = 4102
         const val IN_CAR_PROMPT_NOTIF_ID = 4103
@@ -107,7 +109,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 "onFixedWifi" to false,
                 "anchoredSteps" to 0,
                 "nPassi" to p.getInt("n_passi", 50).coerceIn(5, 500),
-                "t0PassiSec" to p.getInt("t0_passi_sec", 30).coerceIn(5, 300)
+                "t0PassiSec" to p.getInt("t0_passi_sec", 30).coerceIn(5, 300),
+                "tCountdownSec" to p.getInt("t_countdown_sec", 30).coerceIn(5, 120),
+                "isCharging" to false,
+                "departureCountdownActive" to false,
+                "departureCountdownSec" to 0,
+                "departureTriggerSource" to "" 
             )
         }
     }
@@ -180,7 +187,17 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var currentSpeedKmh = 0f
     private val gpsWindowSamples = mutableListOf<NativeGpsSample>()
 
+    // [IN_CAR_BLINDATA_V1]
     private var isCarBtConnected = false
+    private var btDeniedUntilDisconnect = false
+    private var isDeviceCharging = false
+    private var chargingIgnoredUntilUnplug = false
+    private var chargingSessionHandled = false
+    private var departureCountdownRemainingSec = 0
+    private var departureTriggerSource = ""
+    private var inCarDepartureConfirmedForSession = false
+    private var departureCountdownRunnable: Runnable? = null
+    private var powerUnplugDebounceRunnable: Runnable? = null
     private var passedThroughStall = false
     private var lastGeofenceCoords: Pair<Double, Double>? = null
     private var lastGeofenceRadiusMeters: Float = -1f
@@ -228,7 +245,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == WifiManager.WIFI_STATE_CHANGED_ACTION) {
+            val action = intent?.action ?: return
+            if (action == WifiManager.WIFI_STATE_CHANGED_ACTION) {
                 val wifiState = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, WifiManager.WIFI_STATE_UNKNOWN)
                 if (wifiState == WifiManager.WIFI_STATE_DISABLED || wifiState == WifiManager.WIFI_STATE_DISABLING) {
                     activeWifiIsFixed = false
@@ -244,23 +262,35 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 return
             }
 
-            val dev: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            if (action == Intent.ACTION_POWER_CONNECTED ||
+                action == Intent.ACTION_POWER_DISCONNECTED ||
+                action == Intent.ACTION_BATTERY_CHANGED) {
+                handleBatteryOrPowerIntent(intent)
+                return
             }
-            val targetMac = prefs.getString("car_bt_mac", null)?.uppercase()
-            if (targetMac.isNullOrEmpty() || dev?.address?.uppercase() != targetMac) return
 
-            when (intent?.action) {
-                BluetoothDevice.ACTION_ACL_CONNECTED -> {
-                    isCarBtConnected = true
-                    onCarBluetoothConnected()
+            if (action == BluetoothDevice.ACTION_ACL_CONNECTED || action == BluetoothDevice.ACTION_ACL_DISCONNECTED) {
+                val dev: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
                 }
-                BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
-                    isCarBtConnected = false
-                    onCarBluetoothDisconnected()
+                val devMac = dev?.address?.trim()?.uppercase() ?: return
+                val savedMacs = splitCsv(prefs.getString("car_bt_mac", null)).map { it.uppercase() }
+                if (savedMacs.none { it == devMac }) return
+
+                when (action) {
+                    BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                        isCarBtConnected = true
+                        btDeniedUntilDisconnect = false
+                        onCarBluetoothConnected()
+                    }
+                    BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                        isCarBtConnected = false
+                        btDeniedUntilDisconnect = false
+                        onCarBluetoothDisconnected()
+                    }
                 }
             }
         }
@@ -284,6 +314,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         startForegroundCompat()
 
         checkInitialBluetoothConnection()
+        checkInitialPowerState()
         registerStepSensors()
         registerReceivers()
         registerWifiNetworkCallback()
@@ -314,6 +345,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         anchoredStepResetRunnable?.let { handler.removeCallbacks(it) }
         geofenceWatchdogRunnable?.let { handler.removeCallbacks(it) }
         homeRearmRunnable?.let { handler.removeCallbacks(it) }
+        stopDepartureCountdown(clearNotif = false)
+        powerUnplugDebounceRunnable?.let { handler.removeCallbacks(it) }
         try {
             sensorManager?.unregisterListener(this)
             unregisterReceiver(internalReceiver)
@@ -375,7 +408,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             "nPassi" to getNPassi(),
             "t0PassiSec" to getT0PassiSec(),
             "deltaGpsM" to getDeltaGpsMeters().toInt(),
-            "tGraziaMin" to getTGraziaMin()
+            "tGraziaMin" to getTGraziaMin(),
+            "tCountdownSec" to getTCountdownSec(),
+            "isCharging" to isDeviceCharging,
+            "departureCountdownActive" to (departureCountdownRemainingSec > 0),
+            "departureCountdownSec" to departureCountdownRemainingSec,
+            "departureTriggerSource" to departureTriggerSource
         )
     }
 
@@ -408,6 +446,11 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }
         (args["deltaGpsM"] as? Number)?.toInt()?.let { ed.putInt("delta_gps_m", it.coerceIn(50, 500)) }
         (args["tGraziaMin"] as? Number)?.toInt()?.let { ed.putInt("t_grazia_min", it.coerceIn(1, 60)) }
+        (args["tCountdownSec"] as? Number)?.toInt()?.let { ed.putInt("t_countdown_sec", it.coerceIn(5, 120)) }
+        if (args["triggerCarBtConnected"] == true) {
+            isCarBtConnected = true
+            btDeniedUntilDisconnect = false
+        }
         if (args.containsKey("ignoredWifis")) {
             val rawList = args["ignoredWifis"] as? List<*>
             val cleanSet = rawList?.mapNotNull { (it as? String)?.replace("\"", "")?.trim()?.takeIf { s -> s.isNotEmpty() } }?.toSet() ?: emptySet()
@@ -520,6 +563,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             anchoredStationaryState = null
             gpsRestingAfterAnalysis = true
             stopNoStepGpsWindow()
+            stopDepartureCountdown(clearNotif = true)
+            inCarDepartureConfirmedForSession = false
+            if (isDeviceCharging) {
+                chargingIgnoredUntilUnplug = true
+                chargingSessionHandled = true
+            }
             updateDynamicAccelerometerRegistration(shouldListen = false)
             userActivityState = STATE_IN_CAR
             persistAndBroadcastState(forceNotification = true)
@@ -541,6 +590,164 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun getT0PassiSec(): Int = prefs.getInt("t0_passi_sec", 30).coerceIn(5, 300)
     private fun getDeltaGpsMeters(): Float = prefs.getInt("delta_gps_m", 150).coerceIn(50, 500).toFloat()
     private fun getTGraziaMin(): Int = prefs.getInt("t_grazia_min", 5).coerceIn(1, 60)
+    private fun getTCountdownSec(): Int = prefs.getInt("t_countdown_sec", 30).coerceIn(5, 120)
+
+    private fun readRawChargingStatus(intent: Intent?): Boolean {
+        val batt = if (intent?.action == Intent.ACTION_BATTERY_CHANGED) {
+            intent
+        } else {
+            try { registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) } catch (_: Exception) { null }
+        }
+        if (batt == null) {
+            return when (intent?.action) {
+                Intent.ACTION_POWER_CONNECTED -> true
+                Intent.ACTION_POWER_DISCONNECTED -> false
+                else -> isDeviceCharging
+            }
+        }
+        val plugged = batt.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+        val status = batt.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val hasPlug = (plugged and (BatteryManager.BATTERY_PLUGGED_USB or
+            BatteryManager.BATTERY_PLUGGED_WIRELESS or
+            BatteryManager.BATTERY_PLUGGED_AC)) != 0
+        return hasPlug && (status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL ||
+            intent?.action == Intent.ACTION_POWER_CONNECTED)
+    }
+
+    private fun checkInitialPowerState() {
+        val raw = readRawChargingStatus(null)
+        isDeviceCharging = raw
+        if (raw) {
+            val startAtFixedPlace = isOnFixedWifi() ||
+                userActivityState == STATE_AT_HOME ||
+                userActivityState == STATE_AT_WORK
+            if (startAtFixedPlace) {
+                chargingIgnoredUntilUnplug = true
+                chargingSessionHandled = true
+            }
+        }
+    }
+
+    private fun handleBatteryOrPowerIntent(intent: Intent) {
+        val rawCharging = if (intent.action == Intent.ACTION_POWER_DISCONNECTED) {
+            false
+        } else if (intent.action == Intent.ACTION_POWER_CONNECTED) {
+            true
+        } else {
+            readRawChargingStatus(intent)
+        }
+
+        if (rawCharging) {
+            powerUnplugDebounceRunnable?.let {
+                handler.removeCallbacks(it)
+                powerUnplugDebounceRunnable = null
+            }
+            val wasChargingBefore = isDeviceCharging
+            isDeviceCharging = true
+
+            if (!wasChargingBefore) {
+                chargingSessionHandled = false
+                if (isOnFixedWifi() || isAnchoredWithoutFixedWifi() || isWalking) {
+                    chargingIgnoredUntilUnplug = true
+                    chargingSessionHandled = true
+                } else {
+                    chargingIgnoredUntilUnplug = false
+                }
+            }
+
+            if (!isOnFixedWifi() && !chargingIgnoredUntilUnplug && !chargingSessionHandled && !isWalking && !isAnchoredWithoutFixedWifi()) {
+                chargingSessionHandled = true
+                enterInCarWithDepartureCountdown(source = "charging")
+            } else {
+                if (gpsHighAccuracyActive) {
+                    stopNoStepGpsWindow()
+                }
+                persistAndBroadcastState(forceNotification = false)
+            }
+        } else {
+            if (!isDeviceCharging && powerUnplugDebounceRunnable == null) return
+            if (powerUnplugDebounceRunnable == null) {
+                powerUnplugDebounceRunnable = Runnable {
+                    powerUnplugDebounceRunnable = null
+                    if (!readRawChargingStatus(null)) {
+                        isDeviceCharging = false
+                        chargingIgnoredUntilUnplug = false
+                        chargingSessionHandled = false
+                        onCarPowerDisconnected()
+                    }
+                }
+                handler.postDelayed(powerUnplugDebounceRunnable!!, 8_000L)
+            }
+        }
+    }
+
+    private fun stopDepartureCountdown(clearNotif: Boolean = true) {
+        departureCountdownRunnable?.let { handler.removeCallbacks(it) }
+        departureCountdownRunnable = null
+        departureCountdownRemainingSec = 0
+        departureTriggerSource = ""
+        prefs.edit().putBoolean("prompt_in_car", false).apply()
+        if (clearNotif) {
+            cancelInCarPromptNotification()
+        }
+    }
+
+    private fun enterInCarWithDepartureCountdown(source: String) {
+        if (isOnFixedWifi()) return
+        resetAnchoredStepsCounter()
+        anchoredStationaryState = null
+        noStepGpsCycleCount = 0
+        gpsRestingAfterAnalysis = true
+        stopNoStepGpsWindow()
+        stopGeofenceApproachMonitor()
+        updateDynamicAccelerometerRegistration(shouldListen = false)
+        cancelPromptNotification()
+        prefs.edit().putBoolean("prompt_release", false).apply()
+
+        transitionUserState(STATE_IN_CAR)
+
+        if (inCarDepartureConfirmedForSession || departureCountdownRemainingSec > 0) {
+            persistAndBroadcastState(forceNotification = false)
+            return
+        }
+
+        departureTriggerSource = source
+        departureCountdownRemainingSec = getTCountdownSec()
+        showDepartureCountdownNotification(departureCountdownRemainingSec, isInitial = true)
+        persistAndBroadcastState(forceNotification = true)
+
+        departureCountdownRunnable = object : Runnable {
+            override fun run() {
+                if (isOnFixedWifi()) {
+                    stopDepartureCountdown(clearNotif = true)
+                    evaluateConnectedWifiState()
+                    return
+                }
+                departureCountdownRemainingSec--
+                if (departureCountdownRemainingSec <= 0) {
+                    completeDepartureCountdownAutoAccept()
+                } else {
+                    showDepartureCountdownNotification(departureCountdownRemainingSec, isInitial = false)
+                    persistAndBroadcastState(forceNotification = false)
+                    handler.postDelayed(this, 1000L)
+                }
+            }
+        }
+        handler.postDelayed(departureCountdownRunnable!!, 1000L)
+    }
+
+    private fun completeDepartureCountdownAutoAccept() {
+        stopDepartureCountdown(clearNotif = true)
+        inCarDepartureConfirmedForSession = true
+        gpsRestingAfterAnalysis = true
+        userActivityState = STATE_IN_CAR
+        if (hasActiveParking()) {
+            completeAutomaticVehicleDeparture()
+        } else {
+            persistAndBroadcastState(forceNotification = true)
+        }
+    }
 
     private fun splitCsv(raw: String?): MutableList<String> {
         if (raw.isNullOrBlank()) return mutableListOf()
@@ -626,8 +833,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun checkInitialBluetoothConnection() {
-        val targetMac = prefs.getString("car_bt_mac", null)?.uppercase() ?: return
-        if (targetMac.isEmpty()) return
+        val savedMacs = splitCsv(prefs.getString("car_bt_mac", null)).map { it.uppercase() }
+        if (savedMacs.isEmpty()) return
         try {
             val hasBtPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
@@ -636,17 +843,24 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             }
             if (!hasBtPerm) return
             val bm = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
-            val gattConnected = bm.getConnectedDevices(BluetoothProfile.GATT).any { it.address?.uppercase() == targetMac }
+            val gattConnected = bm.getConnectedDevices(BluetoothProfile.GATT).any { dev ->
+                val m = dev.address?.uppercase() ?: ""
+                savedMacs.any { it == m }
+            }
             if (gattConnected) {
                 isCarBtConnected = true
                 return
             }
             val adapter: BluetoothAdapter? = bm.adapter
-            val bonded = adapter?.bondedDevices?.firstOrNull { it.address?.uppercase() == targetMac }
-            if (bonded != null) {
+            val bondedMatches = adapter?.bondedDevices?.filter { dev ->
+                val m = dev.address?.uppercase() ?: ""
+                savedMacs.any { it == m }
+            } ?: emptyList()
+            for (bonded in bondedMatches) {
                 val m = bonded.javaClass.getMethod("isConnected")
                 if (m.invoke(bonded) == true) {
                     isCarBtConnected = true
+                    break
                 }
             }
         } catch (_: Exception) {}
@@ -845,7 +1059,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun handleAccelerometerSample(ax: Float, ay: Float, az: Float) {
-        if (isOnFixedWifi() || isWalking || gpsHighAccuracyActive || userActivityState == STATE_IN_CAR || !gpsRestingAfterAnalysis) {
+        if (isOnFixedWifi() || isCarBtConnected || isDeviceCharging || isWalking || gpsHighAccuracyActive || userActivityState == STATE_IN_CAR || !gpsRestingAfterAnalysis) {
             return
         }
         if (isAnchoredWithoutFixedWifi() && (System.currentTimeMillis() - lastStepTimestampMs) < 3_000L) {
@@ -982,6 +1196,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             recentWindowSteps = 0
             currentSpeedKmh = 0f
             stopNoStepGpsWindow()
+            stopDepartureCountdown(clearNotif = true)
+            inCarDepartureConfirmedForSession = false
+            if (isDeviceCharging) {
+                chargingIgnoredUntilUnplug = true
+                chargingSessionHandled = true
+            }
             updateDynamicAccelerometerRegistration(shouldListen = false)
             prefs.edit().putBoolean("prompt_release", false).apply()
             cancelReleasePromptNotification()
@@ -1030,21 +1250,45 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (isOnFixedWifi()) return
 
         if (isCarBtConnected) {
-            resetAnchoredStepsCounter()
-            anchoredStationaryState = null
-            stopNoStepGpsWindow()
-            updateDynamicAccelerometerRegistration(shouldListen = false)
-            transitionUserState(STATE_IN_CAR)
+            if (!btDeniedUntilDisconnect) {
+                enterInCarWithDepartureCountdown(source = "bt")
+            } else {
+                stopNoStepGpsWindow()
+                updateDynamicAccelerometerRegistration(shouldListen = false)
+                val target = anchoredStationaryState ?: STATE_STILL
+                if (userActivityState != target) transitionUserState(target)
+            }
             return
         }
 
         if (isWalking) {
+            if (isDeviceCharging && !chargingSessionHandled) {
+                chargingIgnoredUntilUnplug = true
+                chargingSessionHandled = true
+            }
             anchoredStationaryState = null
             noStepGpsCycleCount = 0
             gpsRestingAfterAnalysis = false
             stopNoStepGpsWindow()
             updateDynamicAccelerometerRegistration(shouldListen = false)
             transitionUserState(STATE_MOVING)
+            return
+        }
+
+        if (isDeviceCharging) {
+            if (!chargingIgnoredUntilUnplug && !isAnchoredWithoutFixedWifi()) {
+                chargingSessionHandled = true
+                enterInCarWithDepartureCountdown(source = "charging")
+            } else {
+                stopNoStepGpsWindow()
+                updateDynamicAccelerometerRegistration(shouldListen = false)
+                val stationaryTarget = anchoredStationaryState ?: STATE_STILL
+                if (userActivityState != stationaryTarget) {
+                    transitionUserState(stationaryTarget)
+                } else {
+                    persistAndBroadcastState(forceNotification = false)
+                }
+            }
             return
         }
 
@@ -1055,6 +1299,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             return
         }
 
+        // Canale 2 Sensori: no Wi-Fi, no Bluetooth, no Ricarica, no Passi -> finestra precisione GPS (Tgps_senzapasso)
         val stationaryTarget = anchoredStationaryState ?: STATE_STILL
         if (userActivityState != stationaryTarget) {
             transitionUserState(stationaryTarget)
@@ -1081,9 +1326,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             lastMovingStateMs = System.currentTimeMillis()
         }
 
-        if (newState == STATE_IN_CAR && isCarBtConnected && hasActiveParking()) {
+        if (newState == STATE_IN_CAR) {
             stopGeofenceApproachMonitor()
-            completeAutomaticVehicleDeparture()
         } else if (newState == STATE_MOVING && !isOnFixedWifi() && hasActiveParking()) {
             updateGeofenceApproachMonitor(triggerImmediateCheck = true)
         } else {
@@ -1094,7 +1338,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun startNoStepGpsWindow(cycleIndex: Int) {
-        if (isOnFixedWifi() || isWalking || userActivityState == STATE_IN_CAR) return
+        if (isOnFixedWifi() || isCarBtConnected || isDeviceCharging || isWalking || userActivityState == STATE_IN_CAR) return
         val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!hasFine && !hasCoarse) {
@@ -1118,7 +1362,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
         gpsWindowTickRunnable = object : Runnable {
             override fun run() {
-                if (isOnFixedWifi() || isWalking || userActivityState == STATE_IN_CAR) {
+                if (isOnFixedWifi() || isCarBtConnected || isDeviceCharging || isWalking || userActivityState == STATE_IN_CAR) {
                     stopNoStepGpsWindow()
                     evaluateConnectedWifiState()
                     return
@@ -1139,6 +1383,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun evaluateNoStepGpsWindowResult() {
         var vMedia = 0f
         var vIst = currentSpeedKmh
+        var netMeters = 0f
+        var minReliableDisp = 25f
 
         if (gpsWindowSamples.size >= 2) {
             val first = gpsWindowSamples.first()
@@ -1146,10 +1392,10 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             val elapsedSec = max(1L, (last.timestampMs - first.timestampMs) / 1000L)
             val distArr = FloatArray(1)
             Location.distanceBetween(first.lat, first.lon, last.lat, last.lon, distArr)
-            val netMeters = distArr[0]
+            netMeters = distArr[0]
             val netAvgKmh = (netMeters / elapsedSec) * 3.6f
             val dopplerAvgKmh = gpsWindowSamples.map { it.speedKmh }.average().toFloat()
-            val minReliableDisp = max(25f, first.accuracy + last.accuracy)
+            minReliableDisp = max(25f, first.accuracy + last.accuracy)
             vMedia = if (netMeters > minReliableDisp) max(netAvgKmh, dopplerAvgKmh) else dopplerAvgKmh
 
             val tail = gpsWindowSamples.takeLast(2)
@@ -1161,7 +1407,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
         currentSpeedKmh = vIst
 
-        if (vMedia <= 1.0f) {
+        if (vMedia <= 1.5f || (gpsWindowSamples.size >= 2 && netMeters <= minReliableDisp && vIst <= 10.0f)) {
             val stationaryTarget = anchoredStationaryState ?: STATE_STILL
             stopNoStepGpsWindow()
             noStepGpsCycleCount = 0
@@ -1176,39 +1422,30 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         resetAnchoredStepsCounter()
         anchoredStationaryState = null
 
-        if (vIst <= 10.0f) {
-            transitionUserState(STATE_MOVING)
-            if (noStepGpsCycleCount == 0) {
-                startNoStepGpsWindow(cycleIndex = 1)
+        val reliableVehicleMotion = netMeters > minReliableDisp && vIst > 10.0f && (vMedia > 10.0f || noStepGpsCycleCount >= 1)
+        if (reliableVehicleMotion) {
+            stopNoStepGpsWindow()
+            noStepGpsCycleCount = 0
+            if (!carPromptShownInCurrentBout) {
+                carPromptShownInCurrentBout = true
+                enterInCarWithDepartureCountdown(source = "gps")
             } else {
-                stopNoStepGpsWindow()
-                noStepGpsCycleCount = 0
                 gpsRestingAfterAnalysis = true
                 updateDynamicAccelerometerRegistration(shouldListen = true)
-                persistAndBroadcastState(forceNotification = true)
+                transitionUserState(STATE_MOVING)
             }
             return
         }
 
-        stopNoStepGpsWindow()
-        noStepGpsCycleCount = 0
-        gpsRestingAfterAnalysis = true
-
-        if (isCarBtConnected) {
-            updateDynamicAccelerometerRegistration(shouldListen = false)
-            transitionUserState(STATE_IN_CAR)
-            if (hasActiveParking()) {
-                completeAutomaticVehicleDeparture()
-            }
+        if (noStepGpsCycleCount < 1) {
+            transitionUserState(STATE_MOVING)
+            startNoStepGpsWindow(cycleIndex = 1)
         } else {
+            stopNoStepGpsWindow()
+            noStepGpsCycleCount = 0
+            gpsRestingAfterAnalysis = true
             updateDynamicAccelerometerRegistration(shouldListen = true)
             transitionUserState(STATE_MOVING)
-            if (!carPromptShownInCurrentBout) {
-                carPromptShownInCurrentBout = true
-                prefs.edit().putBoolean("prompt_in_car", true).apply()
-                showAreYouInCarNotification()
-                persistAndBroadcastState(forceNotification = true)
-            }
         }
     }
 
@@ -1233,6 +1470,22 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         if (gpsHighAccuracyActive) {
             if (loc.accuracy <= 35f || gpsWindowSamples.isEmpty()) {
                 gpsWindowSamples.add(NativeGpsSample(System.currentTimeMillis(), loc.latitude, loc.longitude, instKmh, loc.accuracy))
+            }
+            if (!carPromptShownInCurrentBout && gpsWindowSamples.size >= 6 && instKmh >= 18f && loc.accuracy <= 22f) {
+                val first = gpsWindowSamples.first()
+                val last = gpsWindowSamples.last()
+                val distArr = FloatArray(1)
+                Location.distanceBetween(first.lat, first.lon, last.lat, last.lon, distArr)
+                val recentFast = gpsWindowSamples.takeLast(3).all { it.speedKmh >= 15f && it.accuracy <= 25f }
+                if (recentFast && distArr[0] >= max(60f, first.accuracy + last.accuracy + 20f)) {
+                    resetAnchoredStepsCounter()
+                    anchoredStationaryState = null
+                    stopNoStepGpsWindow()
+                    noStepGpsCycleCount = 0
+                    carPromptShownInCurrentBout = true
+                    enterInCarWithDepartureCountdown(source = "gps")
+                    return
+                }
             }
             persistAndBroadcastState(forceNotification = false)
         }
@@ -1364,17 +1617,35 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
 
     private fun onCarBluetoothConnected() {
         if (isOnFixedWifi()) return
-        anchoredStationaryState = null
-        gpsRestingAfterAnalysis = true
-        stopNoStepGpsWindow()
-        updateDynamicAccelerometerRegistration(shouldListen = false)
-        transitionUserState(STATE_IN_CAR)
-        if (hasActiveParking()) {
-            completeAutomaticVehicleDeparture()
-        }
+        btDeniedUntilDisconnect = false
+        enterInCarWithDepartureCountdown(source = "bt")
     }
 
     private fun onCarBluetoothDisconnected() {
+        btDeniedUntilDisconnect = false
+        if (isDeviceCharging) {
+            chargingIgnoredUntilUnplug = true
+            chargingSessionHandled = true
+        }
+        stopDepartureCountdown(clearNotif = true)
+        inCarDepartureConfirmedForSession = false
+        gpsRestingAfterAnalysis = false
+        carPromptShownInCurrentBout = false
+        boutStepsSinceStationary = 0
+        recentWindowSteps = 0
+        if (userActivityState == STATE_IN_CAR) {
+            userActivityState = STATE_STILL
+        }
+        evaluateConnectedWifiState()
+    }
+
+    private fun onCarPowerDisconnected() {
+        if (isCarBtConnected && !btDeniedUntilDisconnect) {
+            persistAndBroadcastState(forceNotification = false)
+            return
+        }
+        stopDepartureCountdown(clearNotif = true)
+        inCarDepartureConfirmedForSession = false
         gpsRestingAfterAnalysis = false
         carPromptShownInCurrentBout = false
         boutStepsSinceStationary = 0
@@ -1466,23 +1737,26 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun handleUserConfirmInCarFromNotif() {
-        cancelInCarPromptNotification()
-        anchoredStationaryState = null
-        prefs.edit().putBoolean("prompt_in_car", false).apply()
-        gpsRestingAfterAnalysis = true
-        stopNoStepGpsWindow()
-        updateDynamicAccelerometerRegistration(shouldListen = false)
-        userActivityState = STATE_IN_CAR
-        persistAndBroadcastState(forceNotification = true)
-        if (hasActiveParking()) {
-            showReleasePromptNotification()
-        }
+        completeDepartureCountdownAutoAccept()
     }
 
     private fun handleUserDenyInCarFromNotif() {
-        cancelInCarPromptNotification()
-        prefs.edit().putBoolean("prompt_in_car", false).apply()
-        persistAndBroadcastState(forceNotification = false)
+        if (isCarBtConnected) {
+            btDeniedUntilDisconnect = true
+        }
+        if (isDeviceCharging) {
+            chargingIgnoredUntilUnplug = true
+            chargingSessionHandled = true
+        }
+        carPromptShownInCurrentBout = true
+        inCarDepartureConfirmedForSession = false
+        stopDepartureCountdown(clearNotif = true)
+        gpsRestingAfterAnalysis = true
+        stopNoStepGpsWindow()
+        val fallbackState = anchoredStationaryState ?: STATE_STILL
+        userActivityState = fallbackState
+        updateDynamicAccelerometerRegistration(shouldListen = (!isCarBtConnected && !isDeviceCharging))
+        persistAndBroadcastState(forceNotification = true)
     }
 
     private fun completeAutomaticVehicleDeparture() {
@@ -1833,6 +2107,51 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         }.start()
     }
 
+    private fun showDepartureCountdownNotification(remainingSec: Int, isInitial: Boolean) {
+        try {
+            val fsIntent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("from_departure_fullscreen", true)
+            }
+            val fullScreenPi = PendingIntent.getActivity(
+                this,
+                45,
+                fsIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val denyPi = PendingIntent.getBroadcast(
+                this,
+                46,
+                Intent(ACTION_DENY_IN_CAR).setPackage(packageName),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val builder = NotificationCompat.Builder(this, CHANNEL_DEPARTURE_FS)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle("Il sistema ha rilevato la ripartenza")
+                .setContentText("Conferma automatica tra ${remainingSec}s • Premi NEGA per annullare")
+                .setStyle(
+                    NotificationCompat.BigTextStyle().bigText(
+                        "Stato In Auto rilevato. Tra ${remainingSec} secondi la ripartenza verrà confermata automaticamente. Premi NEGA se non sei in auto."
+                    )
+                )
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setOnlyAlertOnce(!isInitial)
+                .setContentIntent(fullScreenPi)
+                .addAction(0, "NEGA", denyPi)
+
+            if (isInitial) {
+                builder.setFullScreenIntent(fullScreenPi, true)
+            }
+
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .notify(IN_CAR_PROMPT_NOTIF_ID, builder.build())
+        } catch (_: Exception) {}
+    }
+
     private fun registerReceivers() {
         val internalFilter = IntentFilter().apply {
             addAction(ACTION_CONFIRM_RELEASE)
@@ -1850,12 +2169,34 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
             addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(Intent.ACTION_BATTERY_CHANGED)
         }
         ContextCompat.registerReceiver(this, systemReceiver, sysFilter, ContextCompat.RECEIVER_EXPORTED)
     }
 
     private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val depSound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                    ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                val depAttr = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+                val depCh = NotificationChannel(
+                    CHANNEL_DEPARTURE_FS,
+                    "Avviso Ripartenza In Auto",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Notifica a schermo intero per rilevamento ripartenza in auto"
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    enableVibration(true)
+                    if (depSound != null) setSound(depSound, depAttr)
+                }
+                (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(depCh)
+            } catch (_: Exception) {}
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val fgChannel = NotificationChannel(CHANNEL_FG, "Monitoraggio Stato Utente", NotificationManager.IMPORTANCE_LOW)
             nm.createNotificationChannel(fgChannel)
