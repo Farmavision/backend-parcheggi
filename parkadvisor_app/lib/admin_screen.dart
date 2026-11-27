@@ -43,6 +43,7 @@ class _AdminScreenState extends State<AdminScreen> {
   final _geofenceRadiusMCtrl = TextEditingController(text: '100');
   final _deltaGpsMCtrl = TextEditingController(text: '150');
   final _tGraziaMinCtrl = TextEditingController(text: '5');
+  final _tCountdownSecCtrl = TextEditingController(text: '30');
   final _deltaCtrl = TextEditingController(text: '5');
   final _autoReleaseDelayCtrl = TextEditingController(text: '60');
 
@@ -111,7 +112,8 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           _t0PassiSecCtrl.text = (data['t0_passi_sec'] ?? spLoad.getInt('t0_passi_sec') ?? 30).toString();
           _geofenceRadiusMCtrl.text = (data['geofence_radius_m'] ?? spLoad.getInt('geofence_radius_m') ?? 100).toString();
           _deltaGpsMCtrl.text = (data['delta_gps_m'] ?? spLoad.getInt('delta_gps_m') ?? 150).toString();
-          _tGraziaMinCtrl.text = (data['t_grazia_min'] ?? spLoad.getInt('t_grazia_min') ?? 5).toString(); });
+          _tGraziaMinCtrl.text = (data['t_grazia_min'] ?? spLoad.getInt('t_grazia_min') ?? 5).toString();
+          _tCountdownSecCtrl.text = (data['t_countdown_sec'] ?? spLoad.getInt('t_countdown_sec') ?? 30).toString(); });
           if (data['auto_release_delay_s'] != null) {
             _autoReleaseDelayCtrl.text = data['auto_release_delay_s'].toString();
             final val = int.tryParse(_autoReleaseDelayCtrl.text);
@@ -133,12 +135,14 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       final geoRadVal = (int.tryParse(_geofenceRadiusMCtrl.text) ?? 100).clamp(20, 2000);
       final deltaGpsVal = (int.tryParse(_deltaGpsMCtrl.text) ?? 150).clamp(50, 500);
       final tGraziaVal = (int.tryParse(_tGraziaMinCtrl.text) ?? 5).clamp(1, 60);
+      final tCountdownVal = (int.tryParse(_tCountdownSecCtrl.text) ?? 30).clamp(5, 120);
       await prefs.setInt('tgps_senzapasso_sec', (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180));
       await prefs.setInt('n_passi', nPassiVal);
       await prefs.setInt('t0_passi_sec', t0PassiVal);
       await prefs.setInt('geofence_radius_m', geoRadVal);
       await prefs.setInt('delta_gps_m', deltaGpsVal);
       await prefs.setInt('t_grazia_min', tGraziaVal);
+      await prefs.setInt('t_countdown_sec', tCountdownVal);
       try {
         await const MethodChannel('parknow/bg_service').invokeMethod('syncConfigToNative', {
           'tGpsNoStepSec': (int.tryParse(_tGpsSenzaPassoCtrl.text) ?? 30).clamp(10, 180),
@@ -147,6 +151,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           'geofenceRadiusM': geoRadVal,
           'deltaGpsM': deltaGpsVal,
           'tGraziaMin': tGraziaVal,
+          'tCountdownSec': tCountdownVal,
         });
       } catch (_) {}
 
@@ -166,6 +171,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
       'geofence_radius_m': geoRadVal,
       'delta_gps_m': deltaGpsVal,
       't_grazia_min': tGraziaVal,
+      't_countdown_sec': tCountdownVal,
       'release_delta_minutes': int.tryParse(_deltaCtrl.text) ?? 5,
         'auto_release_delay_s': delayVal,
       });
@@ -227,6 +233,7 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
     _geofenceRadiusMCtrl.dispose();
     _deltaGpsMCtrl.dispose();
     _tGraziaMinCtrl.dispose();
+    _tCountdownSecCtrl.dispose();
     _deltaCtrl.dispose();
     _autoReleaseDelayCtrl.dispose();
     super.dispose();
@@ -410,6 +417,16 @@ final ritNot = int.tryParse(_xtRitNotSecCtrl.text) ?? 15;
           decoration: const InputDecoration(
             labelText: 'Tgrazia — Tempo di grazia riarmo geofence (minuti)',
             helperText: 'Default: 5 min (1-60m). Attesa prima di richiedere il rilascio se resti dentro il geofence dopo il parcheggio o un rifiuto.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _tCountdownSecCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Tcountdown — Conto alla rovescia ripartenza In Auto (secondi)',
+            helperText: 'Default: 30s (5-120s). Durata avviso a schermo intero (solo tasto Nega) prima della conferma automatica.',
             border: OutlineInputBorder(),
           ),
         ),

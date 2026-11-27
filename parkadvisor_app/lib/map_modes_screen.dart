@@ -563,6 +563,7 @@ class _FindMyCarScreenState extends State<FindMyCarScreen> {
     final pLat = widget.sensorEngine.parkedLat;
     final pLon = widget.sensorEngine.parkedLon;
     if (pLat != null && pLon != null) _carPos = LatLng(pLat, pLon);
+    else _carPos = null;
     final uLat = widget.sensorEngine.currentUserLat;
     final uLon = widget.sensorEngine.currentUserLon;
     if (uLat != null && uLon != null) _userPos = LatLng(uLat, uLon);

@@ -62,7 +62,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       onPromptAreYouInCar: _promptAreYouInCar,
     );
     _sensorEngine.addListener(() {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      setState(() {});
+      _syncDepartureFullScreenAlert();
     });
     _initApp();
     _antiFraudWatchTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkPendingReleaseExpiration());
@@ -169,6 +171,185 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  bool _isDepartureAlertOpen = false;
+  BuildContext? _departureAlertCtx;
+
+  String _departureSourceLabel(String src) {
+    switch (src) {
+      case 'bt':
+        return 'Connessione Bluetooth Auto rilevata';
+      case 'charging':
+        return 'Ricarica in auto (USB / Induttiva) rilevata';
+      case 'gps':
+        return 'Movimento veicolare GPS rilevato';
+      default:
+        return 'Ingresso in auto rilevato';
+    }
+  }
+
+  void _syncDepartureFullScreenAlert() {
+    if (!mounted) return;
+    if (_sensorEngine.departureCountdownActive && !_isDepartureAlertOpen) {
+      _isDepartureAlertOpen = true;
+      SystemSound.play(SystemSoundType.alert);
+      HapticFeedback.heavyImpact();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_sensorEngine.departureCountdownActive) {
+          _isDepartureAlertOpen = false;
+          return;
+        }
+        showGeneralDialog(
+          context: context,
+          barrierDismissible: false,
+          barrierColor: const Color(0xF2121629),
+          transitionDuration: const Duration(milliseconds: 220),
+          pageBuilder: (dlgCtx, _, __) {
+            _departureAlertCtx = dlgCtx;
+            return PopScope(
+              canPop: false,
+              child: Scaffold(
+                backgroundColor: const Color(0xFF121629),
+                body: SafeArea(
+                  child: AnimatedBuilder(
+                    animation: _sensorEngine,
+                    builder: (context, _) {
+                      final total = _sensorEngine.tCountdownSec > 0 ? _sensorEngine.tCountdownSec : 30;
+                      final rem = _sensorEngine.departureCountdownSec.clamp(0, total);
+                      final progress = total > 0 ? rem / total : 0.0;
+                      final srcLabel = _departureSourceLabel(_sensorEngine.departureTriggerSource);
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Column(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: Colors.indigoAccent.withOpacity(0.22),
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(color: Colors.indigoAccent.withOpacity(0.6)),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(Icons.directions_car_filled, color: Colors.amberAccent, size: 18),
+                                      const SizedBox(width: 8),
+                                      Flexible(
+                                        child: Text(
+                                          srcLabel,
+                                          style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                                          textAlign: TextAlign.center,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 28),
+                                const Text(
+                                  'Il sistema ha rilevato la ripartenza',
+                                  style: TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold, height: 1.2),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 12),
+                                Text(
+                                  _sensorEngine.isCarParked
+                                      ? 'Stato impostato su In Auto. Allo scadere del conto alla rovescia il parcheggio verrà rilasciato automaticamente.'
+                                      : 'Stato impostato su In Auto. Allo scadere del conto alla rovescia la ripartenza sarà confermata automaticamente.',
+                                  style: const TextStyle(color: Colors.white70, fontSize: 15, height: 1.4),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ],
+                            ),
+                            SizedBox(
+                              width: 190,
+                              height: 190,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: 190,
+                                    height: 190,
+                                    child: CircularProgressIndicator(
+                                      value: progress,
+                                      strokeWidth: 12,
+                                      backgroundColor: Colors.white12,
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                        rem <= 10 ? Colors.redAccent : Colors.amberAccent,
+                                      ),
+                                    ),
+                                  ),
+                                  Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        '$rem',
+                                        style: const TextStyle(color: Colors.white, fontSize: 64, fontWeight: FontWeight.w900),
+                                      ),
+                                      const Text(
+                                        'secondi',
+                                        style: TextStyle(color: Colors.white60, fontSize: 15, letterSpacing: 1.1),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Column(
+                              children: [
+                                const Text(
+                                  'Non sei in auto? Premi il tasto qui sotto per annullare:',
+                                  style: TextStyle(color: Colors.white60, fontSize: 13),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 14),
+                                SizedBox(
+                                  width: double.infinity,
+                                  height: 62,
+                                  child: ElevatedButton.icon(
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.red.shade600,
+                                      foregroundColor: Colors.white,
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                                      elevation: 6,
+                                    ),
+                                    onPressed: () async {
+                                      await _sensorEngine.denyDepartureCountdown();
+                                    },
+                                    icon: const Icon(Icons.close_rounded, size: 28),
+                                    label: const Text(
+                                      'NEGA',
+                                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, letterSpacing: 1.5),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            );
+          },
+        ).whenComplete(() {
+          _isDepartureAlertOpen = false;
+          _departureAlertCtx = null;
+        });
+      });
+    } else if (!_sensorEngine.departureCountdownActive && _isDepartureAlertOpen) {
+      final ctx = _departureAlertCtx;
+      _departureAlertCtx = null;
+      _isDepartureAlertOpen = false;
+      if (ctx != null && ctx.mounted) {
+        Navigator.of(ctx).pop();
+      }
+    }
   }
 
   void _promptAreYouInCar() {
@@ -300,7 +481,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (res.statusCode == 200 && mounted) {
         final data = json.decode(res.body);
         final newBal = (data['newBalance'] as num?)?.toInt();
-        final awarded = (data['creditsAwarded'] as num?)?.toInt() ?? 10;
+        final alreadyFree = data['alreadyFree'] == true;
+        final awarded = (data['creditsAwarded'] as num?)?.toInt() ?? (alreadyFree ? 0 : 10);
         if (newBal != null) {
           final prefs = await SharedPreferences.getInstance();
           await prefs.setInt('credits_balance', newBal);
@@ -309,7 +491,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             backgroundColor: Colors.green.shade700,
-            content: Text('Stallo liberato con successo! +$awarded crediti guadagnati.'),
+            content: Text(
+              awarded > 0
+                  ? 'Stallo liberato con successo! +$awarded crediti guadagnati.'
+                  : 'Stallo liberato sulla mappa! Saldo crediti aggiornato.',
+            ),
           ),
         );
       }

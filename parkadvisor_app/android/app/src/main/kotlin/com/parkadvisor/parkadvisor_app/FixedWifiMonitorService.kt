@@ -205,7 +205,9 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private var lastKnownUserLocation: Location? = null
     private var approachMonitorMode: Int = 0
     private var lastMovingStateMs: Long = 0L
+    // [RELEASE_CONFLICT_FIX_V1]
     private var lastRemoteSpotSyncMs: Long = 0L
+    private var lastLocalReleaseMs: Long = 0L
     private var activeRingtone: android.media.Ringtone? = null
 
     private var gpsWindowTickRunnable: Runnable? = null
@@ -523,6 +525,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                 ed.remove("parked_lon")
                 ed.remove("parked_source")
                 ed.putBoolean("prompt_release", false)
+                lastLocalReleaseMs = System.currentTimeMillis()
                 lastDistanceFromCarMeters = null
                 cancelGracePeriodRearm()
                 promptShownForCurrentSession = false
@@ -1717,8 +1720,12 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     private fun handleUserConfirmRelease() {
         prefs.edit().putBoolean("prompt_release", false).apply()
         cancelPromptNotification()
+        cancelGracePeriodRearm()
+        promptShownForCurrentSession = true
+        homeExitPromptShownForSession = true
+        awaitingGeofenceExitBeforeTrigger2 = false
+        stopGeofenceApproachMonitor()
         triggerServerRelease(2)
-        resetSessionFlagsAndClearParking()
         persistAndBroadcastState(forceNotification = true)
     }
 
@@ -1769,6 +1776,7 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
     }
 
     private fun resetSessionFlagsAndClearParking() {
+        lastLocalReleaseMs = System.currentTimeMillis()
         prefs.edit()
             .remove("parked_lat")
             .remove("parked_lon")
@@ -2035,7 +2043,8 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
                     handler.post {
                         val src = prefs.getString("parked_source", "") ?: ""
                         val prev = getParkedLatLon()
-                        val allowRemoteOverwrite = (prev == null) || (src == "remote")
+                        val recentlyReleased = (System.currentTimeMillis() - lastLocalReleaseMs) < 20_000L
+                        val allowRemoteOverwrite = !recentlyReleased && ((prev == null) || (src == "remote"))
                         if (spot != null && status == "OCCUPIED" && !lat.isNaN() && !lon.isNaN()) {
                             if (allowRemoteOverwrite) {
                                 val ch = prev == null || kotlin.math.abs(prev.first - lat) > 0.00015 || kotlin.math.abs(prev.second - lon) > 0.00015
@@ -2089,20 +2098,47 @@ class FixedWifiMonitorService : Service(), SensorEventListener {
         } catch (_: Exception) { lastGeofenceCoords = null }
     }
 
+    private fun resolveActiveUserId(): String {
+        val direct = prefs.getString("user_id", null)?.trim()
+        if (!direct.isNullOrEmpty()) return direct
+        return try {
+            val fsp = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            fsp.getString("flutter.user_id", null)?.trim()?.takeIf { it.isNotEmpty() } ?: "USER-001"
+        } catch (_: Exception) {
+            "USER-001"
+        }
+    }
+
     private fun triggerServerRelease(minutes: Int) {
+        val uid = resolveActiveUserId()
         Thread {
             try {
-                val url = URL("https://parknow-api.onrender.com/api/parking/leaving")
+                val endpoint = if (minutes <= 0) {
+                    "https://parknow-api.onrender.com/api/parking/release"
+                } else {
+                    "https://parknow-api.onrender.com/api/parking/confirm-release"
+                }
+                val url = URL(endpoint)
                 val conn = url.openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
                 conn.setRequestProperty("Content-Type", "application/json")
                 conn.doOutput = true
-                val body = JSONObject().apply {
-                    put("userId", "USER-001")
-                    put("estimatedMinutes", minutes)
-                }.toString()
+                val body = if (minutes <= 0) {
+                    JSONObject().apply {
+                        put("userId", uid)
+                        put("triggerSource", "NATIVE_AUTO_DEPARTURE")
+                    }.toString()
+                } else {
+                    JSONObject().apply {
+                        put("userId", uid)
+                        put("availableInMinutes", minutes)
+                    }.toString()
+                }
                 conn.outputStream.use { it.write(body.toByteArray()) }
                 conn.responseCode
+                conn.disconnect()
             } catch (_: Exception) {}
         }.start()
     }

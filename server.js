@@ -196,7 +196,7 @@ app.post('/api/parking/confirm-release', async (req, res) => {
       const { data, error } = await supabase.from('parking_spots').update({
         status: 'LEAVING_SOON', available_in_minutes: availableInMinutes,
         confirmed_at: now.toISOString(), verification_deadline: deadline, updated_at: now.toISOString()
-      }).eq('user_id', userId).select();
+      }).eq('user_id', userId).in('status', ['OCCUPIED', 'LEAVING_SOON']).select();
       if (error) throw error;
       if (!data || data.length === 0) return res.status(404).json({ error: 'Nessuna auto parcheggiata' });
     }
@@ -213,7 +213,7 @@ app.post('/api/parking/leaving', async (req, res) => {
     if (useSupabase && userId) {
       await supabase.from('parking_spots').update({
         status: 'LEAVING_SOON', available_in_minutes: availableInMinutes, updated_at: new Date().toISOString()
-      }).eq('user_id', userId);
+      }).eq('user_id', userId).in('status', ['OCCUPIED', 'LEAVING_SOON']);
     }
     res.json({ success: true, status: 'LEAVING_SOON', availableInMinutes });
   } catch (err) {
@@ -232,9 +232,12 @@ app.post('/api/parking/release', async (req, res) => {
     if (useSupabase) {
       const { data, error } = await supabase.from('parking_spots').update({
         status: 'FREE', available_in_minutes: 0, confirmed_at: null, verification_deadline: null, updated_at: new Date().toISOString()
-      }).eq('user_id', userId).select();
+      }).eq('user_id', userId).in('status', ['OCCUPIED', 'LEAVING_SOON']).select();
       if (error) throw error;
-      if (!data || data.length === 0) return res.status(404).json({ error: 'Nessuno stallo da liberare' });
+      if (!data || data.length === 0) {
+        const { data: uRow } = await supabase.from('users').select('credits_balance').eq('external_user_id', userId).maybeSingle();
+        return res.json({ success: true, status: 'FREE', alreadyFree: true, creditsAwarded: 0, newBalance: uRow ? uRow.credits_balance : null });
+      }
       spotId = data[0].id;
     }
     const newBalance = await ensureAndAdjustUserCredits(userId, reward, 'RELEASE_REWARD', spotId);

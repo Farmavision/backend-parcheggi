@@ -56,6 +56,11 @@ class SensorFusionEngine extends ChangeNotifier {
   int t0PassiSec = 30;
   int deltaGpsMeters = 150;
   int tGraziaMin = 5;
+  int tCountdownSec = 30;
+  bool isDeviceCharging = false;
+  bool departureCountdownActive = false;
+  int departureCountdownSec = 0;
+  String departureTriggerSource = '';
   int anchoredPendingSteps = 0;
   bool isHighAccuracyGpsActive = false;
   int gpsWindowRemainingSec = 0;
@@ -255,6 +260,11 @@ class SensorFusionEngine extends ChangeNotifier {
     if (snap['geofenceRadiusM'] != null) geofenceRadiusMeters = (snap['geofenceRadiusM'] as num).toDouble();
     if (snap['deltaGpsM'] != null) deltaGpsMeters = (snap['deltaGpsM'] as num).toInt();
     if (snap['tGraziaMin'] != null) tGraziaMin = (snap['tGraziaMin'] as num).toInt();
+    if (snap['tCountdownSec'] != null) tCountdownSec = (snap['tCountdownSec'] as num).toInt();
+    if (snap['isCharging'] != null) isDeviceCharging = snap['isCharging'] == true;
+    departureCountdownActive = snap['departureCountdownActive'] == true;
+    departureCountdownSec = (snap['departureCountdownSec'] as num?)?.toInt() ?? 0;
+    departureTriggerSource = (snap['departureTriggerSource'] as String?) ?? '';
     final nativeDist = (snap['distanceFromCarM'] as num?)?.toDouble();
     if (nativeDist != null) distanceFromCarMeters = nativeDist;
     else if (snap['hasParked'] == false) distanceFromCarMeters = null;
@@ -283,10 +293,20 @@ class SensorFusionEngine extends ChangeNotifier {
         currentState = VehicleState.parked;
       }
     } else if (snap.containsKey('hasParked')) {
+      final hadLocalParked = parkedLat != null || parkedLon != null || _manualReleaseConfirmed;
       parkedLat = null;
       parkedLon = null;
-      if (currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
+      distanceFromCarMeters = null;
+      _manualReleaseConfirmed = false;
+      if (hadLocalParked) {
+        SharedPreferences.getInstance().then((p) {
+          p.remove('parked_lat');
+          p.remove('parked_lon');
+        });
+      }
+      if (hadLocalParked || currentState == VehicleState.parked || currentState == VehicleState.leavingSoon) {
         currentState = isOnKnownPrivateWifi ? VehicleState.stayAtHome : VehicleState.driving;
+        unawaited(onCarReleased());
       }
     }
 
@@ -309,7 +329,7 @@ class SensorFusionEngine extends ChangeNotifier {
     }
   }
 
-  Future<void> _pushConfigToNative({String? forceUserState, bool isSimulation = false}) async {
+  Future<void> _pushConfigToNative({String? forceUserState, bool isSimulation = false, bool skipRemoteSync = false}) async {
     try {
       final rawRes = await _bgServiceChannel.invokeMethod('syncConfigToNative', {
         'homeWifiSsid': homeWifiSsid ?? '',
@@ -322,11 +342,12 @@ class SensorFusionEngine extends ChangeNotifier {
         'geofenceRadiusM': geofenceRadiusMeters.round(),
         'deltaGpsM': deltaGpsMeters,
         'tGraziaMin': tGraziaMin,
+        'tCountdownSec': tCountdownSec,
         'ignoredWifis': _ignoredWifis,
         'parkedLat': parkedLat,
         'parkedLon': parkedLon,
         if (isSimulation) 'isSimulation': true,
-        if (!isSimulation) 'syncRemoteSpot': true,
+        if (!isSimulation && !skipRemoteSync) 'syncRemoteSpot': true,
         if (forceUserState != null) 'forceUserState': forceUserState,
       });
       if (rawRes is Map) {
@@ -382,6 +403,7 @@ class SensorFusionEngine extends ChangeNotifier {
       geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
       deltaGpsMeters = (prefs.getInt('delta_gps_m') ?? 150).clamp(50, 500);
       tGraziaMin = (prefs.getInt('t_grazia_min') ?? 5).clamp(1, 60);
+      tCountdownSec = (prefs.getInt('t_countdown_sec') ?? 30).clamp(5, 120);
       _ignoredWifis = prefs.getStringList('ignored_wifis') ?? [];
       _ignoredBtMacs = prefs.getStringList('ignored_bt_macs') ?? [];
       if (parkedLat != null && parkedLon != null) currentState = VehicleState.parked;
@@ -432,6 +454,9 @@ class SensorFusionEngine extends ChangeNotifier {
     nPassi = (prefs.getInt('n_passi') ?? 50).clamp(5, 500);
     t0PassiSec = (prefs.getInt('t0_passi_sec') ?? 30).clamp(5, 300);
     geofenceRadiusMeters = (prefs.getInt('geofence_radius_m') ?? 100).toDouble();
+    deltaGpsMeters = (prefs.getInt('delta_gps_m') ?? 150).clamp(50, 500);
+    tGraziaMin = (prefs.getInt('t_grazia_min') ?? 5).clamp(1, 60);
+    tCountdownSec = (prefs.getInt('t_countdown_sec') ?? 30).clamp(5, 120);
     await _pushConfigToNative();
     await syncFromNativeBackgroundService();
   }
@@ -453,11 +478,13 @@ class SensorFusionEngine extends ChangeNotifier {
   }
 
   Future<void> confirmParkingLeftFromPrompt() async {
-    await confirmUserInCarFromPrompt();
-    if (isCarParked) {
-      await _triggerCarReleased();
+    final hadParking = isCarParked || _manualReleaseConfirmed || currentState == VehicleState.leavingSoon;
+    userActivityState = UserActivityState.inCar;
+    isHighAccuracyGpsActive = false;
+    if (hadParking) {
+      await _triggerCarReleased(forceUserState: 'inCar');
     } else {
-      notifyListeners();
+      await confirmUserInCarFromPrompt();
     }
   }
 
@@ -469,6 +496,17 @@ class SensorFusionEngine extends ChangeNotifier {
     _bgServiceChannel.invokeMethod('syncConfigToNative', {'dismissReleaseNotif': true});
     final eta = customMinutes ?? estimatedMinutesToRelease;
     if (onManualReleaseConfirmed != null) await onManualReleaseConfirmed!(eta);
+    notifyListeners();
+  }
+
+  Future<void> denyDepartureCountdown() async {
+    departureCountdownActive = false;
+    departureCountdownSec = 0;
+    notifyListeners();
+    try {
+      await _bgServiceChannel.invokeMethod('denyInCar');
+    } catch (_) {}
+    await syncFromNativeBackgroundService();
     notifyListeners();
   }
 
@@ -502,12 +540,15 @@ class SensorFusionEngine extends ChangeNotifier {
       if (name.trim().isNotEmpty) names[upper] = name.trim();
       await prefs.setString('car_bt_names_json', json.encode(names));
     } catch (_) {}
-    await _pushConfigToNative(forceUserState: 'inCar');
-    if (isCarParked) {
-      await _triggerCarReleased();
-    } else {
-      currentState = VehicleState.driving;
-    }
+    try {
+      final rawRes = await _bgServiceChannel.invokeMethod('syncConfigToNative', {
+        'carBtMac': targetCarBluetoothMac ?? '',
+        'triggerCarBtConnected': true,
+      });
+      if (rawRes is Map) {
+        _applyNativeSnapshotMap(Map<String, dynamic>.from(rawRes));
+      }
+    } catch (_) {}
     notifyListeners();
   }
 
@@ -721,7 +762,7 @@ class SensorFusionEngine extends ChangeNotifier {
     unawaited(onCarParked(parkedLat!, parkedLon!, method));
   }
 
-  Future<void> _triggerCarReleased() async {
+  Future<void> _triggerCarReleased({String? forceUserState}) async {
     _autoReleaseManager.cancelCountdown();
     parkedLat = null;
     parkedLon = null;
@@ -733,8 +774,8 @@ class SensorFusionEngine extends ChangeNotifier {
     await prefs.remove('parked_lat');
     await prefs.remove('parked_lon');
 
-    await _pushConfigToNative();
     await onCarReleased();
+    await _pushConfigToNative(forceUserState: forceUserState, skipRemoteSync: true);
     notifyListeners();
   }
 
